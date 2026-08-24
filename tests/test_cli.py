@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
 
-from bps_agent.cli import _apply_bps_overrides, _parser
-from bps_agent.models import AppConfig
+from bps_agent.cli import (
+    _apply_bps_overrides,
+    _configure_logging,
+    _parser,
+    _verdict_console_fields,
+)
+from bps_agent.models import AppConfig, AttemptRecord, VerdictDocument, VerdictValue
 
 
 @pytest.mark.parametrize(
@@ -76,3 +82,30 @@ def test_resume_rejects_bps_overrides(app_config: AppConfig) -> None:
             ports=None,
             resume_id="evaluation-id",
         )
+
+
+def test_console_verdict_contains_summary_and_observations_only() -> None:
+    attempt = AttemptRecord(
+        number=1,
+        started_at="2026-08-24T00:00:00+00:00",
+        verdict=VerdictDocument(
+            verdict=VerdictValue.PASS,
+            summary="test passed",
+            observations=["BPS criteria passed", "DUT remained healthy"],
+            confidence=0.95,
+        ),
+    )
+
+    selected = _verdict_console_fields({"attempts": [attempt.model_dump(mode="json")]})
+
+    assert selected == {
+        "summary": "test passed",
+        "observations": ["BPS criteria passed", "DUT remained healthy"],
+    }
+
+
+def test_cli_suppresses_http_client_info_logs() -> None:
+    _configure_logging(verbose=True)
+
+    assert logging.getLogger("httpx").level == logging.WARNING
+    assert logging.getLogger("httpcore").level == logging.WARNING

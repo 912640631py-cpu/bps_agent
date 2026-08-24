@@ -125,6 +125,25 @@ def _has_unsafe_reservation(result: dict[str, Any]) -> bool:
         return True
 
 
+def _verdict_console_fields(result: dict[str, Any]) -> dict[str, Any] | None:
+    attempts = result.get("attempts")
+    if not isinstance(attempts, list) or not attempts:
+        return None
+    try:
+        verdict = AttemptRecord.model_validate(attempts[-1]).verdict
+    except ValueError:
+        return None
+    if verdict is None:
+        return None
+    document = verdict.model_dump(mode="json")
+    selected = {
+        name: document[name]
+        for name in ("summary", "observations")
+        if document.get(name) is not None
+    }
+    return selected or None
+
+
 def _apply_bps_overrides(
     config: AppConfig,
     *,
@@ -270,6 +289,9 @@ def run_live(
                 return 0
         outcome = str(result["outcome"])
         print(json.dumps({"evaluation_id": evaluation_id, "outcome": outcome}, ensure_ascii=False))
+        verdict_fields = _verdict_console_fields(result)
+        if verdict_fields is not None:
+            print(json.dumps(verdict_fields, ensure_ascii=False, indent=2))
         if result.get("final_artifact"):
             print(f"Audit result: {result['final_artifact']}")
         return EXIT_CODES.get(outcome, 4)
@@ -398,12 +420,18 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    arguments = _parser().parse_args(argv)
+def _configure_logging(verbose: bool) -> None:
     logging.basicConfig(
-        level=logging.DEBUG if arguments.verbose else logging.INFO,
+        level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = _parser().parse_args(argv)
+    _configure_logging(arguments.verbose)
     try:
         if arguments.command == "credentials":
             return manage_credentials(arguments, CredentialStore())

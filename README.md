@@ -82,6 +82,8 @@ python -m bps_agent run --stop-before-llm
 
 CLI 启动时先验证所选 DeepSeek 接口是否接受 JSON mode、thinking enabled 和 `reasoning_effort=max`，随后才登录 BPS/DUT 和执行真实打流。
 
+命令行默认隐藏 `httpx` 的逐请求 INFO 日志，只显示项目流程、告警和错误。LLM 判定完成后会显示 Verdict 中的 `summary` 和 `observations`，完整响应仍保存在 `verdict.json`。
+
 DUT 的 CPU、内存、会话和接口流量在每次 BPS Run 结束并冷却后各读取一次。Agent 使用打流前后系统时间校准 DUT 时钟，保留打流开始前 `baseline_seconds`（默认 600 秒）、打流期间和可用的恢复期数据点；没有新的恢复点不视为证据不完整。Evidence 将每个资源的原始响应元数据保留一次，并按资源组织 baseline、during、recovery 数据点，避免三个阶段重复响应外壳。接口状态、硬件健康和系统摘要仍在打流前后各读取一次。打流期间每隔 `keepalive_interval_seconds`（默认 60 秒）只读请求一次系统摘要以保持 DUT 会话；保活结果不写入 Evidence，单次失败只记录 Attempt 告警且不中断 BPS。`dut.period` 可在确认设备支持的取值后限制历史查询范围；省略时使用 DUT 默认范围。
 
 进程输出 Evaluation Run ID。恢复已有 checkpoint：
