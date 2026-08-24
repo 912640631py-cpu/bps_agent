@@ -21,6 +21,11 @@ from bps_agent.adapters.deepseek import DeepSeekJudge
 from bps_agent.adapters.dut import DutClient
 from bps_agent.artifacts import ArtifactStore
 from bps_agent.config import load_config
+from bps_agent.credentials import (
+    SECRET_CREDENTIALS,
+    SUPPORTED_CREDENTIALS,
+    CredentialStore,
+)
 from bps_agent.graph import EvaluationServices, SystemClock, build_graph, initial_state
 from bps_agent.locking import PortGroupLock
 from bps_agent.models import AppConfig, AttemptRecord, EvaluationOutcome, EvidenceBundle
@@ -34,17 +39,24 @@ EXIT_CODES = {
 }
 
 
-def _secret(env_name: str, prompt: str) -> str:
-    value = os.environ.get(env_name) or getpass.getpass(prompt)
+def _credential(
+    store: CredentialStore,
+    name: str,
+    prompt: str,
+    *,
+    secret: bool,
+) -> str:
+    value = os.environ.get(name)
+    if value:
+        return value
+    value = store.get(name)
+    if value:
+        return value
+    value = getpass.getpass(prompt) if secret else input(prompt).strip()
     if not value:
-        raise ValueError(f"{env_name} is required")
-    return value
-
-
-def _username(env_name: str, prompt: str) -> str:
-    value = os.environ.get(env_name) or input(prompt).strip()
-    if not value:
-        raise ValueError(f"{env_name} is required")
+        raise ValueError(f"{name} is required")
+    store.set(name, value)
+    print(f"Saved {name} in the system keyring.")
     return value
 
 
@@ -80,10 +92,15 @@ def _captcha_reader(image: bytes, media_type: str) -> str:
             path.unlink(missing_ok=True)
 
 
-def _provider(config: AppConfig) -> tuple[str, Any, str]:
+def _provider(config: AppConfig, store: CredentialStore) -> tuple[str, Any, str]:
     name = config.llm.provider
     selected = config.llm.selected
-    token = _secret(selected.token_env, f"{name} DeepSeek Bearer token: ")
+    token = _credential(
+        store,
+        selected.token_env,
+        f"{name} DeepSeek Bearer token: ",
+        secret=True,
+    )
     return name, selected, token
 
 
@@ -97,8 +114,13 @@ def _has_unsafe_reservation(result: dict[str, Any]) -> bool:
         return True
 
 
-def run_live(config_path: Path, resume_id: str | None) -> int:
+def run_live(
+    config_path: Path,
+    resume_id: str | None,
+    credential_store: CredentialStore | None = None,
+) -> int:
     config = load_config(config_path)
+    store = credential_store or CredentialStore()
     evaluation_id = resume_id or str(uuid4())
     artifacts = ArtifactStore(config.storage.artifact_dir)
     lock = PortGroupLock(
@@ -114,21 +136,21 @@ def run_live(config_path: Path, resume_id: str | None) -> int:
     dut: DutClient | None = None
     result: dict[str, Any] | None = None
     try:
-        provider_name, provider_config, token = _provider(config)
+        provider_name, provider_config, token = _provider(config, store)
         judge = DeepSeekJudge(provider_name, provider_config, token=token)
         print(f"Checking {provider_name} provider compatibility with reasoning_effort=max...")
         judge.validate_compatibility()
         bps = BpsClient(
             config.bps,
-            username=_username("BPS_USERNAME", "BPS username: "),
-            password=_secret("BPS_PASSWORD", "BPS password: "),
+            username=_credential(store, "BPS_USERNAME", "BPS username: ", secret=False),
+            password=_credential(store, "BPS_PASSWORD", "BPS password: ", secret=True),
         )
         print("Authenticating to BPS...")
         bps.authenticate()
         dut = DutClient(
             config.dut,
-            username=_username("DUT_USERNAME", "DUT username: "),
-            password=_secret("DUT_PASSWORD", "DUT password: "),
+            username=_credential(store, "DUT_USERNAME", "DUT username: ", secret=False),
+            password=_credential(store, "DUT_PASSWORD", "DUT password: ", secret=True),
             captcha_reader=_captcha_reader,
         )
         print("Authenticating to DUT (CAPTCHA required)...")
@@ -196,10 +218,15 @@ def run_live(config_path: Path, resume_id: str | None) -> int:
             judge.close()
 
 
-def replay(config_path: Path, evidence_path: Path) -> int:
+def replay(
+    config_path: Path,
+    evidence_path: Path,
+    credential_store: CredentialStore | None = None,
+) -> int:
     config = load_config(config_path)
+    store = credential_store or CredentialStore()
     evidence = EvidenceBundle.model_validate(json.loads(evidence_path.read_text(encoding="utf-8")))
-    provider_name, provider_config, token = _provider(config)
+    provider_name, provider_config, token = _provider(config, store)
     judge = DeepSeekJudge(provider_name, provider_config, token=token)
     try:
         verdict, raw = judge.adjudicate(evidence)
@@ -220,6 +247,36 @@ def replay(config_path: Path, evidence_path: Path) -> int:
         judge.close()
 
 
+def manage_credentials(arguments: argparse.Namespace, store: CredentialStore) -> int:
+    command = arguments.credential_command
+    if command == "status":
+        for name, saved in store.status().items():
+            environment = "set" if os.environ.get(name) else "unset"
+            keyring_status = "stored" if saved else "missing"
+            print(f"{name}: keyring={keyring_status}, environment={environment}")
+        return 0
+
+    names = (
+        tuple(CredentialStore.validate_name(name) for name in arguments.names)
+        or SUPPORTED_CREDENTIALS
+    )
+    if command == "set":
+        for name in names:
+            prompt = f"{name}: "
+            value = getpass.getpass(prompt) if name in SECRET_CREDENTIALS else input(prompt).strip()
+            store.set(name, value)
+            print(f"Saved {name} in the system keyring.")
+        return 0
+
+    if command == "delete":
+        for name in names:
+            deleted = store.delete(name)
+            print(f"{name}: {'deleted' if deleted else 'not stored'}")
+        return 0
+
+    raise ValueError(f"unsupported credentials command: {command}")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="LangGraph BPS performance-test agent")
     parser.add_argument("--verbose", action="store_true")
@@ -230,6 +287,15 @@ def _parser() -> argparse.ArgumentParser:
     replay_parser = subparsers.add_parser("replay", help="re-adjudicate saved evidence")
     replay_parser.add_argument("--config", type=Path, required=True)
     replay_parser.add_argument("--evidence", type=Path, required=True)
+    credentials = subparsers.add_parser(
+        "credentials", help="manage credentials in the operating-system keyring"
+    )
+    credential_commands = credentials.add_subparsers(dest="credential_command", required=True)
+    credential_commands.add_parser("status", help="show presence without revealing values")
+    set_credentials = credential_commands.add_parser("set", help="save credentials")
+    set_credentials.add_argument("names", nargs="*")
+    delete_credentials = credential_commands.add_parser("delete", help="delete saved credentials")
+    delete_credentials.add_argument("names", nargs="*")
     return parser
 
 
@@ -240,6 +306,8 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     try:
+        if arguments.command == "credentials":
+            return manage_credentials(arguments, CredentialStore())
         if arguments.command == "run":
             return run_live(arguments.config, arguments.resume)
         return replay(arguments.config, arguments.evidence)

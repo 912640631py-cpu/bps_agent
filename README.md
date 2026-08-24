@@ -23,14 +23,42 @@ $taskPython = 'E:\program1\anaconda3\envs\shixi\python.exe'
 
 复制并修改 `config/demo.yaml`。配置中只保存设备地址、模板、端口、接口、时序和模型名称；不要写入密码或 token。
 
-支持的环境变量：
+以下 6 个条目保存在 Windows Credential Manager（Python `keyring` 服务名为 `nsfocus-bps-evaluation-agent`）：
 
 - `BPS_USERNAME`、`BPS_PASSWORD`
 - `DUT_USERNAME`、`DUT_PASSWORD`
 - 公司中转：`COMPANY_DEEPSEEK_API_KEY`
 - DeepSeek 官方：`DEEPSEEK_API_KEY`
 
-缺少用户名、密码或 token 时，CLI 会交互询问。DUT CAPTCHA 始终由操作者查看并输入。认证材料不会进入 LangGraph checkpoint、日志或审计文件。
+一次性录入全部条目：
+
+```powershell
+$taskPython = 'E:\program1\anaconda3\envs\shixi\python.exe'
+& $taskPython -m bps_agent credentials set
+```
+
+也可以只录入本次需要的条目：
+
+```powershell
+& $taskPython -m bps_agent credentials set `
+  BPS_USERNAME BPS_PASSWORD DUT_USERNAME DUT_PASSWORD `
+  COMPANY_DEEPSEEK_API_KEY
+```
+
+检查保存状态，不会显示实际值：
+
+```powershell
+& $taskPython -m bps_agent credentials status
+```
+
+删除指定条目或全部条目：
+
+```powershell
+& $taskPython -m bps_agent credentials delete BPS_PASSWORD
+& $taskPython -m bps_agent credentials delete
+```
+
+运行时查找顺序为当前进程环境变量、Windows keyring、交互输入。交互输入的新值会自动写入 keyring；环境变量只作临时覆盖，不会自动复制进 keyring。DUT CAPTCHA 始终由操作者查看并输入，不会保存。认证材料不会进入 LangGraph checkpoint、日志或审计文件。
 
 ## 真实运行
 
