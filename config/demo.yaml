@@ -58,8 +58,9 @@ dut:
   endpoint: https://10.66.246.133
   interfaces: [T1/1, T1/2]
   verify_tls: false
-  sample_interval_seconds: 10
   cooldown_seconds: 10
+  keepalive_interval_seconds: 60
+  baseline_seconds: 600
   read_attempts: 3
   read_retry_backoff_seconds: 0.5
 
@@ -71,7 +72,7 @@ assessment:
     - 只依据给定证据判断，不臆造缺失指标
 
 llm:
-  provider: company
+  provider: official
   company:
     base_url: https://aigw.inone.nsfocus.com/deepseek/v1
     model: deepseek-v4-flash-0731

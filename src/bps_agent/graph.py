@@ -14,10 +14,10 @@ from bps_agent.artifacts import ArtifactStore
 from bps_agent.models import (
     AppConfig,
     AttemptRecord,
+    DutObservations,
     EvaluationOutcome,
     EvidenceBundle,
     ObservationPhase,
-    ResourceObservation,
     SupplementalSnapshot,
     VerdictValue,
     utc_now,
@@ -81,15 +81,20 @@ def _append_error(attempt: AttemptRecord, message: str) -> AttemptRecord:
     return attempt.model_copy(update={"errors": (*attempt.errors, message)})
 
 
-def _complete_observation(
-    observations: tuple[ResourceObservation, ...],
-    phase: ObservationPhase,
-    interfaces: tuple[str, ...],
-) -> bool:
-    return any(item.phase == phase and item.is_complete(interfaces) for item in observations)
+def _has_minimum_monitoring(observations: DutObservations) -> bool:
+    return bool(
+        observations.populated_series(ObservationPhase.BASELINE).intersection(
+            observations.populated_series(ObservationPhase.DURING)
+        )
+    )
 
 
-def build_graph(services: EvaluationServices, checkpointer: Any | None = None) -> Any:
+def build_graph(
+    services: EvaluationServices,
+    checkpointer: Any | None = None,
+    *,
+    interrupt_before: list[str] | None = None,
+) -> Any:
     cfg = services.config
 
     def initialize(state: EvaluationState) -> dict[str, Any]:
@@ -111,18 +116,18 @@ def build_graph(services: EvaluationServices, checkpointer: Any | None = None) -
         attempt = AttemptRecord(number=attempt_number, started_at=utc_now())
         reserved = False
         try:
-            baseline = services.dut.collect_resources(ObservationPhase.BASELINE.value)
             before = services.dut.collect_supplemental()
-            if not baseline.is_complete(cfg.dut.interfaces) or not before.is_complete:
+            if not before.is_complete:
                 raise RuntimeError("required pre-traffic DUT evidence is incomplete")
             services.bps.reserve_ports()
             reserved = True
             run_id = services.bps.start_run()
+            traffic_started_at = utc_now()
             attempt = attempt.model_copy(
                 update={
                     "bps_run_id": run_id,
+                    "traffic_started_at": traffic_started_at,
                     "bps_template_metadata": state["template_metadata"],
-                    "dut_observations": (baseline,),
                     "dut_before": before,
                     "ports_reserved": True,
                 }
@@ -146,41 +151,43 @@ def build_graph(services: EvaluationServices, checkpointer: Any | None = None) -
     def monitor_attempt(state: EvaluationState) -> dict[str, Any]:
         attempt = _attempts(state)[-1]
         assert attempt.bps_run_id is not None
-        observations = list(attempt.dut_observations)
-        immediate = services.dut.collect_resources(ObservationPhase.DURING.value)
-        observations.append(immediate)
-        next_sample = services.clock.monotonic() + cfg.dut.sample_interval_seconds
+        next_keepalive = services.clock.monotonic() + cfg.dut.keepalive_interval_seconds
+        keepalive_errors: list[str] = []
 
-        def sample_when_due() -> None:
-            nonlocal next_sample
-            now = services.clock.monotonic()
-            if now < next_sample:
+        def keepalive_if_due() -> None:
+            nonlocal next_keepalive
+            if services.clock.monotonic() < next_keepalive:
                 return
-            observation = services.dut.collect_resources(ObservationPhase.DURING.value)
-            observations.append(observation)
-            services.artifacts.write_attempt_json(
-                state["evaluation_id"], attempt.number, "dut-observations.json", observations
-            )
-            next_sample = now + cfg.dut.sample_interval_seconds
+            try:
+                services.dut.keepalive()
+            except Exception as exc:
+                message = f"DUT keepalive failed: {exc}"
+                keepalive_errors.append(message)
+                LOGGER.warning(
+                    "Attempt %s DUT keepalive failed while BPS run %s remained active: %s",
+                    attempt.number,
+                    attempt.bps_run_id,
+                    exc,
+                )
+            finally:
+                next_keepalive = services.clock.monotonic() + cfg.dut.keepalive_interval_seconds
 
         try:
-            completion = services.bps.wait_for_completion(attempt.bps_run_id, sample_when_due)
+            completion = services.bps.wait_for_completion(attempt.bps_run_id, keepalive_if_due)
             if not completion.terminal:
                 raise RuntimeError("BPS adapter did not confirm a terminal run state")
+            traffic_finished_at = utc_now()
             services.bps.release_ports()
             attempt = attempt.model_copy(
                 update={
-                    "dut_observations": tuple(observations),
+                    "traffic_finished_at": traffic_finished_at,
                     "bps_run_details": completion.details,
                     "terminal_confirmed": True,
                     "ports_reserved": False,
                 }
             )
         except Exception as exc:
-            attempt = _append_error(
-                attempt.model_copy(update={"dut_observations": tuple(observations)}),
-                f"BPS monitoring failed: {exc}",
-            )
+            attempt = _append_error(attempt, f"BPS monitoring failed: {exc}")
             run_id = attempt.bps_run_id
             assert run_id is not None
             try:
@@ -188,9 +195,11 @@ def build_graph(services: EvaluationServices, checkpointer: Any | None = None) -
                 completion = services.bps.wait_for_completion(run_id, lambda: None)
                 if not completion.terminal:
                     raise RuntimeError("stopped run did not reach a confirmed terminal state")
+                traffic_finished_at = utc_now()
                 services.bps.release_ports()
                 attempt = attempt.model_copy(
                     update={
+                        "traffic_finished_at": traffic_finished_at,
                         "terminal_confirmed": True,
                         "ports_reserved": False,
                         "bps_run_details": completion.details,
@@ -198,6 +207,8 @@ def build_graph(services: EvaluationServices, checkpointer: Any | None = None) -
                 )
             except Exception as recovery_exc:
                 attempt = _append_error(attempt, f"manual recovery required: {recovery_exc}")
+                for message in keepalive_errors:
+                    attempt = _append_error(attempt, message)
                 attempts = _replace_last(state, attempt)
                 services.artifacts.write_attempt_json(
                     state["evaluation_id"], attempt.number, "attempt.json", attempt
@@ -208,9 +219,8 @@ def build_graph(services: EvaluationServices, checkpointer: Any | None = None) -
                     "error": attempt.errors[-1],
                 }
 
-        services.artifacts.write_attempt_json(
-            state["evaluation_id"], attempt.number, "dut-observations.json", observations
-        )
+        for message in keepalive_errors:
+            attempt = _append_error(attempt, message)
         services.artifacts.write_attempt_json(
             state["evaluation_id"], attempt.number, "attempt.json", attempt
         )
@@ -220,14 +230,35 @@ def build_graph(services: EvaluationServices, checkpointer: Any | None = None) -
         attempt = _attempts(state)[-1]
         assert attempt.bps_run_id is not None
         observations = list(attempt.dut_observations)
+        compact_observations: DutObservations | None = None
         report_text = ""
         report_toc: Any = None
         after: SupplementalSnapshot | None = None
         try:
             services.clock.sleep(cfg.dut.cooldown_seconds)
-            recovery = services.dut.collect_resources(ObservationPhase.RECOVERY.value)
-            observations.append(recovery)
+            before = attempt.dut_before
+            if before is None or not before.is_complete:
+                raise RuntimeError("required pre-traffic DUT evidence is incomplete")
             after = services.dut.collect_supplemental()
+            if not after.is_complete:
+                raise RuntimeError("required post-traffic DUT evidence is incomplete")
+            if not attempt.traffic_started_at or not attempt.traffic_finished_at:
+                raise RuntimeError("BPS traffic time window is incomplete")
+            observations = list(
+                services.dut.collect_monitoring_window(
+                    attempt.traffic_started_at,
+                    attempt.traffic_finished_at,
+                    before,
+                    after,
+                )
+            )
+            compact_observations = DutObservations.from_resource_observations(tuple(observations))
+            services.artifacts.write_attempt_json(
+                state["evaluation_id"],
+                attempt.number,
+                "dut-observations.json",
+                compact_observations,
+            )
             report_toc = services.bps.wait_for_report(attempt.bps_run_id)
             destination = (
                 services.artifacts.attempt_dir(state["evaluation_id"], attempt.number)
@@ -263,21 +294,18 @@ def build_graph(services: EvaluationServices, checkpointer: Any | None = None) -
             and attempt.dut_before.is_complete
             and after
             and after.is_complete
-            and _complete_observation(
-                tuple(observations), ObservationPhase.BASELINE, cfg.dut.interfaces
-            )
-            and _complete_observation(
-                tuple(observations), ObservationPhase.DURING, cfg.dut.interfaces
-            )
-            and _complete_observation(
-                tuple(observations), ObservationPhase.RECOVERY, cfg.dut.interfaces
-            )
+            and compact_observations
+            and _has_minimum_monitoring(compact_observations)
         )
         attempt = attempt.model_copy(update={"evidence_complete": complete})
         if complete:
             assert attempt.dut_before is not None and after is not None
+            assert compact_observations is not None
             run_id = attempt.bps_run_id
             assert run_id is not None
+            traffic_started_at = attempt.traffic_started_at
+            traffic_finished_at = attempt.traffic_finished_at
+            assert traffic_started_at is not None and traffic_finished_at is not None
             evidence = EvidenceBundle(
                 evaluation_id=state["evaluation_id"],
                 attempt_number=attempt.number,
@@ -286,11 +314,12 @@ def build_graph(services: EvaluationServices, checkpointer: Any | None = None) -
                 bps_template_metadata=attempt.bps_template_metadata,
                 bps_run_details=attempt.bps_run_details,
                 bps_report=report_text,
-                bps_report_toc=report_toc,
                 assessment=cfg.assessment,
                 dut_endpoint=cfg.dut.endpoint,
                 dut_interfaces=cfg.dut.interfaces,
-                dut_observations=tuple(observations),
+                traffic_started_at=traffic_started_at,
+                traffic_finished_at=traffic_finished_at,
+                dut_observations=compact_observations,
                 dut_before=attempt.dut_before,
                 dut_after=after,
             )
@@ -304,7 +333,15 @@ def build_graph(services: EvaluationServices, checkpointer: Any | None = None) -
         services.artifacts.write_attempt_json(
             state["evaluation_id"], attempt.number, "attempt.json", attempt
         )
-        return {"attempts": _replace_last(state, attempt)}
+        update: dict[str, Any] = {"attempts": _replace_last(state, attempt)}
+        if not complete:
+            update.update(
+                {
+                    "outcome": EvaluationOutcome.INCONCLUSIVE.value,
+                    "error": attempt.errors[-1],
+                }
+            )
+        return update
 
     def adjudicate(state: EvaluationState) -> dict[str, Any]:
         attempt = _attempts(state)[-1]
@@ -341,6 +378,11 @@ def build_graph(services: EvaluationServices, checkpointer: Any | None = None) -
     ) -> Literal["start_attempt", "finalize"]:
         return "finalize" if state["outcome"] else "start_attempt"
 
+    def route_after_start(
+        state: EvaluationState,
+    ) -> Literal["monitor_attempt", "finalize"]:
+        return "finalize" if state["outcome"] else "monitor_attempt"
+
     def route_after_monitor(
         state: EvaluationState,
     ) -> Literal["collect_evidence", "finalize"]:
@@ -348,13 +390,9 @@ def build_graph(services: EvaluationServices, checkpointer: Any | None = None) -
 
     def route_after_evidence(
         state: EvaluationState,
-    ) -> Literal["adjudicate", "start_attempt", "finalize"]:
+    ) -> Literal["adjudicate", "finalize"]:
         attempt = _attempts(state)[-1]
-        if attempt.evidence_complete:
-            return "adjudicate"
-        if len(state["attempts"]) < cfg.evaluation.max_attempts:
-            return "start_attempt"
-        return "finalize"
+        return "adjudicate" if attempt.evidence_complete else "finalize"
 
     def route_after_verdict(
         state: EvaluationState,
@@ -403,9 +441,9 @@ def build_graph(services: EvaluationServices, checkpointer: Any | None = None) -
     graph.add_node("finalize", finalize)
     graph.add_edge(START, "initialize")
     graph.add_conditional_edges("initialize", route_after_initialize)
-    graph.add_edge("start_attempt", "monitor_attempt")
+    graph.add_conditional_edges("start_attempt", route_after_start)
     graph.add_conditional_edges("monitor_attempt", route_after_monitor)
     graph.add_conditional_edges("collect_evidence", route_after_evidence)
     graph.add_conditional_edges("adjudicate", route_after_verdict)
     graph.add_edge("finalize", END)
-    return graph.compile(checkpointer=checkpointer)
+    return graph.compile(checkpointer=checkpointer, interrupt_before=interrupt_before)

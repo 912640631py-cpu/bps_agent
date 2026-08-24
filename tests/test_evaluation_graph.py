@@ -11,6 +11,7 @@ from bps_agent.graph import EvaluationServices, build_graph, initial_state
 from bps_agent.models import (
     AppConfig,
     EvaluationOutcome,
+    EvidenceBundle,
     ObservationPhase,
     ResourceObservation,
     RunCompletion,
@@ -78,29 +79,56 @@ class FakeBps:
 
 
 class FakeDut:
-    def __init__(self, *, incomplete_recovery: bool = False) -> None:
-        self.incomplete_recovery = incomplete_recovery
-        self.resource_calls: list[ObservationPhase] = []
+    def __init__(
+        self,
+        *,
+        empty_recovery: bool = False,
+        missing_monitoring: bool = False,
+        keepalive_failure: bool = False,
+    ) -> None:
+        self.empty_recovery = empty_recovery
+        self.missing_monitoring = missing_monitoring
+        self.keepalive_failure = keepalive_failure
+        self.keepalive_calls = 0
+        self.monitoring_calls = 0
         self.supplemental_calls = 0
 
-    def collect_resources(self, phase: str) -> ResourceObservation:
-        observation_phase = ObservationPhase(phase)
-        self.resource_calls.append(observation_phase)
-        resources: dict[str, Any] = {
-            "cpu": {"code": 0, "data": [{"percent": 20}]},
-            "memory": {"code": 0, "data": [{"percent": 30}]},
-            "new_sessions": {"code": 0, "data": [{"count": 10}]},
-            "concurrent_sessions": {"code": 0, "data": [{"count": 100}]},
-            "traffic": {"T1/1": {"code": 0}, "T1/2": {"code": 0}},
-        }
-        if self.incomplete_recovery and observation_phase == ObservationPhase.RECOVERY:
-            resources.pop("cpu")
-        return ResourceObservation(
-            phase=observation_phase,
-            started_at="2026-08-24T00:00:00+00:00",
-            finished_at="2026-08-24T00:00:01+00:00",
-            resources=resources,
-        )
+    def keepalive(self) -> None:
+        self.keepalive_calls += 1
+        if self.keepalive_failure:
+            raise RuntimeError("fixture keepalive failed")
+
+    def collect_monitoring_window(
+        self,
+        traffic_started_at: str,
+        traffic_finished_at: str,
+        before: SupplementalSnapshot,
+        after: SupplementalSnapshot,
+    ) -> tuple[ResourceObservation, ...]:
+        self.monitoring_calls += 1
+        assert traffic_started_at < traffic_finished_at
+        assert before.is_complete and after.is_complete
+        observations: list[ResourceObservation] = []
+        for phase in ObservationPhase:
+            has_points = not self.missing_monitoring and not (
+                self.empty_recovery and phase == ObservationPhase.RECOVERY
+            )
+            observations.append(
+                ResourceObservation(
+                    phase=phase,
+                    started_at="2026-08-24T00:00:00+00:00",
+                    finished_at="2026-08-24T00:00:01+00:00",
+                    resources={
+                        "cpu": {
+                            "code": 0,
+                            "data": [{"time": "08-24 00:00:00", "percent": 20}]
+                            if has_points
+                            else [],
+                        }
+                    },
+                )
+            )
+        return tuple(observations)
 
     def collect_supplemental(self) -> SupplementalSnapshot:
         self.supplemental_calls += 1
@@ -158,8 +186,70 @@ def test_passes_on_first_complete_attempt(app_config: AppConfig) -> None:
     assert result["outcome"] == EvaluationOutcome.PASSED.value
     assert bps.run_count == 1
     assert bps.reserve_count == bps.release_count == 1
+    assert dut.monitoring_calls == 1
+    assert dut.supplemental_calls == 2
+    assert dut.keepalive_calls == 1
     assert judge.calls == 1
     assert Path(result["final_artifact"]).exists()
+
+
+def test_can_stop_after_evidence_without_calling_the_llm(app_config: AppConfig) -> None:
+    clock = FakeClock()
+    bps = FakeBps(clock)
+    dut = FakeDut()
+    judge = FakeJudge([VerdictValue.PASS])
+    graph = build_graph(
+        EvaluationServices(
+            config=app_config,
+            bps=bps,
+            dut=dut,
+            judge=judge,
+            artifacts=ArtifactStore(app_config.storage.artifact_dir),
+            clock=clock,
+        ),
+        interrupt_before=["adjudicate"],
+    )
+
+    result = graph.invoke(initial_state("evidence-only", app_config))
+
+    assert result["outcome"] is None
+    assert result["attempts"][0]["evidence_complete"] is True
+    evidence_path = Path(result["attempts"][0]["evidence_path"])
+    evidence = ArtifactStore.read_json(evidence_path)
+    assert "bps_report_toc" not in evidence
+    observations = evidence["dut_observations"]
+    assert observations["resources"]["cpu"]["metadata"] == {"code": 0}
+    assert len(observations["resources"]["cpu"]["points"]["baseline"]) == 1
+    assert len(observations["resources"]["cpu"]["points"]["during"]) == 1
+    assert ArtifactStore.read_json(evidence_path.parent / "dut-observations.json") == observations
+    legacy_evidence = EvidenceBundle.model_validate(
+        {
+            **evidence,
+            "bps_report_toc": [{"legacy": True}],
+            "dut_observations": result["attempts"][0]["dut_observations"],
+        }
+    )
+    upgraded = legacy_evidence.model_dump(mode="json")
+    assert "bps_report_toc" not in upgraded
+    assert isinstance(upgraded["dut_observations"], dict)
+    assert Path(result["attempts"][0]["report_toc_path"]).exists()
+    assert judge.calls == 0
+
+
+def test_dut_keepalive_failure_is_a_non_fatal_attempt_warning(
+    app_config: AppConfig,
+) -> None:
+    clock = FakeClock()
+    bps = FakeBps(clock)
+    dut = FakeDut(keepalive_failure=True)
+    judge = FakeJudge([VerdictValue.PASS])
+
+    result = run_graph(app_config, bps, dut, judge, clock)
+
+    assert result["outcome"] == EvaluationOutcome.PASSED.value
+    assert dut.keepalive_calls == 1
+    assert bps.stop_count == 0
+    assert any("DUT keepalive failed" in error for error in result["attempts"][0]["errors"])
 
 
 def test_three_retry_verdicts_end_not_passed(app_config: AppConfig) -> None:
@@ -176,18 +266,30 @@ def test_three_retry_verdicts_end_not_passed(app_config: AppConfig) -> None:
     assert len(result["attempts"]) == 3
 
 
-def test_incomplete_evidence_uses_three_attempts_without_calling_llm(
+def test_missing_monitoring_is_inconclusive_without_another_bps_run(
     app_config: AppConfig,
 ) -> None:
     clock = FakeClock()
     bps = FakeBps(clock)
     judge = FakeJudge([VerdictValue.PASS])
 
-    result = run_graph(app_config, bps, FakeDut(incomplete_recovery=True), judge, clock)
+    result = run_graph(app_config, bps, FakeDut(missing_monitoring=True), judge, clock)
 
     assert result["outcome"] == EvaluationOutcome.INCONCLUSIVE.value
-    assert bps.run_count == 3
+    assert bps.run_count == 1
     assert judge.calls == 0
+
+
+def test_missing_recovery_points_do_not_block_adjudication(app_config: AppConfig) -> None:
+    clock = FakeClock()
+    bps = FakeBps(clock)
+    judge = FakeJudge([VerdictValue.PASS])
+
+    result = run_graph(app_config, bps, FakeDut(empty_recovery=True), judge, clock)
+
+    assert result["outcome"] == EvaluationOutcome.PASSED.value
+    assert bps.run_count == 1
+    assert judge.calls == 1
 
 
 def test_llm_failure_does_not_launch_another_bps_run(app_config: AppConfig) -> None:

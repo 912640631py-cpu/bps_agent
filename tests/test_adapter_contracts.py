@@ -8,7 +8,13 @@ import httpx
 from bps_agent.adapters.bps import BpsClient
 from bps_agent.adapters.deepseek import DeepSeekJudge
 from bps_agent.adapters.dut import DutClient
-from bps_agent.models import BpsConfig, DutConfig, ObservationPhase, ProviderConfig
+from bps_agent.models import (
+    BpsConfig,
+    DutConfig,
+    ObservationPhase,
+    ProviderConfig,
+    SupplementalSnapshot,
+)
 
 
 def test_bps_run_contract_never_forces_reservation() -> None:
@@ -54,10 +60,21 @@ def test_bps_run_contract_never_forces_reservation() -> None:
     assert json.loads(reserve.content)["force"] is False
 
 
-def test_dut_contract_collects_five_resources_and_three_snapshots() -> None:
+def test_dut_contract_reads_history_once_and_filters_the_traffic_window() -> None:
     paths: list[str] = []
+    requests: list[httpx.Request] = []
+
+    points = [
+        {"time": "08-24 09:49:59", "value": 1},
+        {"time": "08-24 09:50:00", "value": 2},
+        {"time": "08-24 09:59:59", "value": 3},
+        {"time": "08-24 10:00:00", "value": 4},
+        {"time": "08-24 10:05:00", "value": 5},
+        {"time": "08-24 10:05:10", "value": 6},
+    ]
 
     def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
         paths.append(request.url.path)
         if request.url.path.endswith("/login/checkLoginAuth"):
             return httpx.Response(200, json={})
@@ -68,6 +85,13 @@ def test_dut_contract_collects_five_resources_and_three_snapshots() -> None:
                 200,
                 json={"code": 0, "data": {"apiKey": "api", "securityKey": "security"}},
             )
+        if request.url.path.endswith(("/cpu", "/mem", "/traffic")):
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"data": points, "metadata": "preserved"}},
+            )
+        if request.url.path.endswith(("/newSess", "/concurrentSess")):
+            return httpx.Response(200, json={"code": 0, "data": points})
         return httpx.Response(200, json={"code": 0, "data": {}})
 
     http = httpx.Client(transport=httpx.MockTransport(handler))
@@ -75,6 +99,7 @@ def test_dut_contract_collects_five_resources_and_three_snapshots() -> None:
         DutConfig(
             endpoint="https://dut.example.test",
             interfaces=("T1/1", "T1/2"),
+            period="three-hour-fixture",
             read_retry_backoff_seconds=0,
         ),
         username="user",
@@ -84,15 +109,64 @@ def test_dut_contract_collects_five_resources_and_three_snapshots() -> None:
     )
 
     client.authenticate()
-    resources = client.collect_resources(ObservationPhase.BASELINE.value)
-    supplemental = client.collect_supplemental()
+    client.keepalive()
+    before = SupplementalSnapshot(
+        captured_at="2026-08-24T01:59:52+00:00",
+        values={
+            "interfaces": {},
+            "hardware": {},
+            "system": {"data": {"current_time": "2026-08-24 10:00:00,Asia@Shanghai"}},
+        },
+    )
+    after = SupplementalSnapshot(
+        captured_at="2026-08-24T02:05:02+00:00",
+        values={
+            "interfaces": {},
+            "hardware": {},
+            "system": {"data": {"current_time": "2026-08-24 10:05:10,Asia@Shanghai"}},
+        },
+    )
 
-    assert resources.is_complete(("T1/1", "T1/2"))
-    assert supplemental.is_complete
+    observations = client.collect_monitoring_window(
+        "2026-08-24T01:59:52+00:00",
+        "2026-08-24T02:04:52+00:00",
+        before,
+        after,
+    )
+
+    assert [item.phase for item in observations] == [
+        ObservationPhase.BASELINE,
+        ObservationPhase.DURING,
+        ObservationPhase.RECOVERY,
+    ]
+    assert [point["value"] for point in observations[0].resources["cpu"]["data"]["data"]] == [2, 3]
+    assert [point["value"] for point in observations[1].resources["cpu"]["data"]["data"]] == [4, 5]
+    assert [point["value"] for point in observations[2].resources["cpu"]["data"]["data"]] == [6]
+    assert observations[1].resources["cpu"]["data"]["metadata"] == "preserved"
+    assert paths.count("/api/dashboards/system/cpu") == 1
+    assert paths.count("/api/dashboards/system/mem") == 1
+    assert paths.count("/api/dashboards/system/newSess") == 1
+    assert paths.count("/api/dashboards/system/concurrentSess") == 1
     assert paths.count("/api/dashboards/system/traffic") == 2
-    assert "/api/dashboards/system/interface" in paths
-    assert "/api/dashboards/system/hardware" in paths
-    assert "/api/dashboards/system/systemInfo" in paths
+    keepalive_request = next(
+        request for request in requests if request.url.path == "/api/dashboards/system/systemInfo"
+    )
+    assert "period" not in keepalive_request.url.params
+    resource_requests = [
+        request
+        for request in requests
+        if request.url.path
+        in {
+            "/api/dashboards/system/cpu",
+            "/api/dashboards/system/mem",
+            "/api/dashboards/system/newSess",
+            "/api/dashboards/system/concurrentSess",
+            "/api/dashboards/system/traffic",
+        }
+    ]
+    assert all(
+        request.url.params["period"] == "three-hour-fixture" for request in resource_requests
+    )
 
 
 def test_deepseek_contract_sends_json_and_max_reasoning() -> None:

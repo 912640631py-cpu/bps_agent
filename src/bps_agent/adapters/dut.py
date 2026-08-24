@@ -7,9 +7,11 @@ import json
 import secrets
 import time
 from collections.abc import Callable
-from datetime import UTC, datetime
+from copy import deepcopy
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -31,6 +33,100 @@ _RSA_MODULUS = int(
 _RSA_CHUNK_SIZE = 2 * ((_RSA_MODULUS.bit_length() - 1) // 16)
 _SUCCESS_CODES = {0, 2000}
 _RETRYABLE_STATUS = {429, 502, 503, 504}
+
+
+def _aware_datetime(value: str, label: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        raise ValueError(f"{label} must include a timezone")
+    return parsed
+
+
+def _snapshot_device_time(snapshot: SupplementalSnapshot) -> datetime:
+    system = snapshot.values.get("system")
+    if not isinstance(system, dict) or not isinstance(system.get("data"), dict):
+        raise ValueError("DUT system summary omitted data.current_time")
+    current_time = system["data"].get("current_time")
+    if not isinstance(current_time, str) or not current_time:
+        raise ValueError("DUT system summary omitted data.current_time")
+    time_text, separator, zone_text = current_time.partition(",")
+    if not separator or not zone_text:
+        raise ValueError("DUT system current_time omitted its timezone")
+    timezone = ZoneInfo(zone_text.replace("@", "/", 1))
+    return datetime.strptime(time_text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone)
+
+
+def _clock_offset(
+    before: SupplementalSnapshot, after: SupplementalSnapshot
+) -> tuple[timedelta, datetime]:
+    device_before = _snapshot_device_time(before)
+    device_after = _snapshot_device_time(after)
+    local_before = _aware_datetime(before.captured_at, "DUT before captured_at")
+    local_after = _aware_datetime(after.captured_at, "DUT after captured_at")
+    before_offset = device_before.astimezone(UTC) - local_before.astimezone(UTC)
+    after_offset = device_after.astimezone(UTC) - local_after.astimezone(UTC)
+    average = (before_offset + after_offset) / 2
+    return average, device_after
+
+
+def _point_time(point: dict[str, Any], reference: datetime) -> datetime | None:
+    timestamp = point.get("timestamp")
+    if isinstance(timestamp, (str, int, float)) and not isinstance(timestamp, bool):
+        try:
+            return datetime.fromtimestamp(float(timestamp), UTC).astimezone(reference.tzinfo)
+        except (OSError, OverflowError, ValueError):
+            pass
+    value = point.get("time")
+    if not isinstance(value, str) or not value:
+        return None
+    for date_format in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(value, date_format).replace(tzinfo=reference.tzinfo)
+        except ValueError:
+            pass
+    for date_format in ("%m-%d %H:%M:%S", "%m-%d %H:%M"):
+        try:
+            partial = datetime.strptime(value, date_format)
+        except ValueError:
+            continue
+        candidates = [
+            partial.replace(year=reference.year + year_delta, tzinfo=reference.tzinfo)
+            for year_delta in (-1, 0, 1)
+        ]
+        return min(candidates, key=lambda candidate: abs(candidate - reference))
+    return None
+
+
+def _filtered_document(
+    document: dict[str, Any],
+    *,
+    start: datetime,
+    finish: datetime,
+    include_start: bool,
+    include_finish: bool,
+    reference: datetime,
+) -> tuple[dict[str, Any], int]:
+    filtered = deepcopy(document)
+    data = filtered.get("data")
+    if isinstance(data, list):
+        container = filtered
+    elif isinstance(data, dict) and isinstance(data.get("data"), list):
+        container = data
+    else:
+        raise ValueError("DUT resource response omitted a supported time-series data array")
+    points: list[Any] = []
+    for point in container["data"]:
+        if not isinstance(point, dict):
+            continue
+        captured_at = _point_time(point, reference)
+        if captured_at is None:
+            continue
+        after_start = captured_at >= start if include_start else captured_at > start
+        before_finish = captured_at <= finish if include_finish else captured_at < finish
+        if after_start and before_finish:
+            points.append(point)
+    container["data"] = points
+    return filtered, len(points)
 
 
 def encrypt_login_password(password: str) -> str:
@@ -167,12 +263,18 @@ class DutClient:
             "time": str(timestamp_ms),
         }
 
-    def _get(self, path: str, parameters: dict[str, str | int] | None = None) -> Any:
+    def _get(
+        self,
+        path: str,
+        parameters: dict[str, str | int] | None = None,
+        *,
+        include_period: bool = False,
+    ) -> Any:
         last_error: Exception | None = None
         for attempt in range(self.config.read_attempts):
             timestamp = self._timestamp_ms()
             query: dict[str, str | int] = {"t": timestamp}
-            if self.config.period is not None:
+            if include_period and self.config.period is not None:
                 query["period"] = self.config.period
             if parameters:
                 query.update(parameters)
@@ -198,11 +300,19 @@ class DutClient:
             raise last_error
         raise RuntimeError(f"DUT GET {path} exhausted retries")
 
-    def collect_resources(self, phase: str) -> ResourceObservation:
-        observation_phase = ObservationPhase(phase)
+    def keepalive(self) -> None:
+        self._get("/api/dashboards/system/systemInfo")
+
+    def collect_monitoring_window(
+        self,
+        traffic_started_at: str,
+        traffic_finished_at: str,
+        before: SupplementalSnapshot,
+        after: SupplementalSnapshot,
+    ) -> tuple[ResourceObservation, ...]:
         started = datetime.now(UTC).isoformat()
-        resources: dict[str, Any] = {}
-        errors: dict[str, str] = {}
+        documents: dict[str, Any] = {}
+        read_errors: dict[str, str] = {}
         endpoints = {
             "cpu": "/api/dashboards/system/cpu",
             "memory": "/api/dashboards/system/mem",
@@ -211,25 +321,87 @@ class DutClient:
         }
         for name, path in endpoints.items():
             try:
-                resources[name] = self._get(path)
+                documents[name] = self._get(path, include_period=True)
             except Exception as exc:
-                errors[name] = str(exc)
-        traffic: dict[str, Any] = {}
+                read_errors[name] = str(exc)
+        traffic_documents: dict[str, Any] = {}
         for interface in self.config.interfaces:
             try:
-                traffic[interface] = self._get(
-                    "/api/dashboards/system/traffic", {"interface": interface}
+                traffic_documents[interface] = self._get(
+                    "/api/dashboards/system/traffic",
+                    {"interface": interface},
+                    include_period=True,
                 )
             except Exception as exc:
-                errors[f"traffic.{interface}"] = str(exc)
-        resources["traffic"] = traffic
-        return ResourceObservation(
-            phase=observation_phase,
-            started_at=started,
-            finished_at=datetime.now(UTC).isoformat(),
-            resources=resources,
-            errors=errors,
+                read_errors[f"traffic.{interface}"] = str(exc)
+
+        finished = datetime.now(UTC).isoformat()
+        offset, device_reference = _clock_offset(before, after)
+        device_capture = (
+            _aware_datetime(finished, "DUT monitoring finished_at").astimezone(UTC) + offset
+        ).astimezone(device_reference.tzinfo)
+        local_start = _aware_datetime(traffic_started_at, "traffic_started_at")
+        local_finish = _aware_datetime(traffic_finished_at, "traffic_finished_at")
+        if local_finish <= local_start:
+            raise ValueError("traffic_finished_at must be later than traffic_started_at")
+        device_start = (local_start.astimezone(UTC) + offset).astimezone(device_reference.tzinfo)
+        device_finish = (local_finish.astimezone(UTC) + offset).astimezone(device_reference.tzinfo)
+        baseline_start = device_start - timedelta(seconds=self.config.baseline_seconds)
+        phase_windows = (
+            (ObservationPhase.BASELINE, baseline_start, device_start, True, False),
+            (ObservationPhase.DURING, device_start, device_finish, True, True),
+            (ObservationPhase.RECOVERY, device_finish, device_capture, False, True),
         )
+        observations: list[ResourceObservation] = []
+        for phase, window_start, window_finish, include_start, include_finish in phase_windows:
+            resources: dict[str, Any] = {}
+            errors = dict(read_errors)
+            for name, document in documents.items():
+                try:
+                    filtered, count = _filtered_document(
+                        document,
+                        start=window_start,
+                        finish=window_finish,
+                        include_start=include_start,
+                        include_finish=include_finish,
+                        reference=device_capture,
+                    )
+                    resources[name] = filtered
+                    if count == 0 and phase != ObservationPhase.RECOVERY:
+                        errors[name] = f"no DUT samples in the {phase.value} window"
+                except ValueError as exc:
+                    errors[name] = str(exc)
+            traffic: dict[str, Any] = {}
+            for interface, document in traffic_documents.items():
+                error_name = f"traffic.{interface}"
+                try:
+                    filtered, count = _filtered_document(
+                        document,
+                        start=window_start,
+                        finish=window_finish,
+                        include_start=include_start,
+                        include_finish=include_finish,
+                        reference=device_capture,
+                    )
+                    traffic[interface] = filtered
+                    if count == 0 and phase != ObservationPhase.RECOVERY:
+                        errors[error_name] = f"no DUT samples in the {phase.value} window"
+                except ValueError as exc:
+                    errors[error_name] = str(exc)
+            resources["traffic"] = traffic
+            observations.append(
+                ResourceObservation(
+                    phase=phase,
+                    started_at=started,
+                    finished_at=finished,
+                    window_started_at=window_start.isoformat(),
+                    window_finished_at=window_finish.isoformat(),
+                    dut_clock_offset_seconds=offset.total_seconds(),
+                    resources=resources,
+                    errors=errors,
+                )
+            )
+        return tuple(observations)
 
     def collect_supplemental(self) -> SupplementalSnapshot:
         values: dict[str, Any] = {}

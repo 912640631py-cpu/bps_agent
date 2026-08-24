@@ -14,8 +14,9 @@ def test_demo_configuration_matches_real_lab_defaults() -> None:
     assert len(config.bps.report_section_ids) == 38
     assert config.dut.endpoint == "https://10.66.246.133"
     assert config.dut.interfaces == ("T1/1", "T1/2")
-    assert config.dut.sample_interval_seconds == 10
+    assert config.dut.baseline_seconds == 600
     assert config.dut.cooldown_seconds == 10
+    assert config.dut.keepalive_interval_seconds == 60
     assert config.llm.company.model == "deepseek-v4-flash-0731"
     assert config.llm.official.model == "deepseek-v4-flash"
 

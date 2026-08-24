@@ -40,7 +40,15 @@ class BpsPort(Protocol):
 
 
 class DutPort(Protocol):
-    def collect_resources(self, phase: str) -> ResourceObservation: ...
+    def keepalive(self) -> None: ...
+
+    def collect_monitoring_window(
+        self,
+        traffic_started_at: str,
+        traffic_finished_at: str,
+        before: SupplementalSnapshot,
+        after: SupplementalSnapshot,
+    ) -> tuple[ResourceObservation, ...]: ...
 
     def collect_supplemental(self) -> SupplementalSnapshot: ...
 

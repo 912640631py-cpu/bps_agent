@@ -39,6 +39,17 @@ EXIT_CODES = {
 }
 
 
+class _EvidenceOnlyJudge:
+    provider_name = "not-called"
+    model_name = "not-called"
+
+    def adjudicate(self, evidence: EvidenceBundle) -> tuple[Any, dict[str, Any]]:
+        raise RuntimeError("LLM adjudication is disabled for this evidence-only run")
+
+    def close(self) -> None:
+        return None
+
+
 def _credential(
     store: CredentialStore,
     name: str,
@@ -118,6 +129,8 @@ def run_live(
     config_path: Path,
     resume_id: str | None,
     credential_store: CredentialStore | None = None,
+    *,
+    stop_before_llm: bool = False,
 ) -> int:
     config = load_config(config_path)
     store = credential_store or CredentialStore()
@@ -131,15 +144,19 @@ def run_live(
         group=config.bps.group,
         evaluation_id=evaluation_id,
     )
-    judge: DeepSeekJudge | None = None
+    judge: DeepSeekJudge | _EvidenceOnlyJudge | None = None
     bps: BpsClient | None = None
     dut: DutClient | None = None
     result: dict[str, Any] | None = None
     try:
-        provider_name, provider_config, token = _provider(config, store)
-        judge = DeepSeekJudge(provider_name, provider_config, token=token)
-        print(f"Checking {provider_name} provider compatibility with reasoning_effort=max...")
-        judge.validate_compatibility()
+        if stop_before_llm:
+            judge = _EvidenceOnlyJudge()
+            print("Evidence-only mode: DeepSeek will not be contacted.")
+        else:
+            provider_name, provider_config, token = _provider(config, store)
+            judge = DeepSeekJudge(provider_name, provider_config, token=token)
+            print(f"Checking {provider_name} provider compatibility with reasoning_effort=max...")
+            judge.validate_compatibility()
         bps = BpsClient(
             config.bps,
             username=_credential(store, "BPS_USERNAME", "BPS username: ", secret=False),
@@ -165,7 +182,11 @@ def run_live(
                 artifacts=artifacts,
                 clock=SystemClock(),
             )
-            graph = build_graph(services, checkpointer=saver)
+            graph = build_graph(
+                services,
+                checkpointer=saver,
+                interrupt_before=["adjudicate"] if stop_before_llm else None,
+            )
             invocation_config = {"configurable": {"thread_id": evaluation_id}}
             if resume_id:
                 snapshot = graph.get_state(invocation_config)
@@ -195,6 +216,31 @@ def run_live(
                 raise
             if _has_unsafe_reservation(result):
                 lock.preserve()
+            if stop_before_llm and result.get("outcome") is None:
+                snapshot = graph.get_state(invocation_config)
+                if snapshot.next != ("adjudicate",):
+                    raise RuntimeError(
+                        "evidence-only run stopped at an unexpected graph position: "
+                        f"{snapshot.next!r}"
+                    )
+                attempts = result.get("attempts", [])
+                if not attempts:
+                    raise RuntimeError("evidence-only run stopped without an Attempt")
+                attempt = AttemptRecord.model_validate(attempts[-1])
+                if not attempt.evidence_complete or not attempt.evidence_path:
+                    raise RuntimeError("evidence-only run stopped without complete Evidence")
+                print(
+                    json.dumps(
+                        {
+                            "evaluation_id": evaluation_id,
+                            "status": "EVIDENCE_READY",
+                            "attempt": attempt.number,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                print(f"Evidence: {attempt.evidence_path}")
+                return 0
         outcome = str(result["outcome"])
         print(json.dumps({"evaluation_id": evaluation_id, "outcome": outcome}, ensure_ascii=False))
         if result.get("final_artifact"):
@@ -284,6 +330,11 @@ def _parser() -> argparse.ArgumentParser:
     live = subparsers.add_parser("run", help="run against real BPS and DUT devices")
     live.add_argument("--config", type=Path, required=True)
     live.add_argument("--resume", metavar="EVALUATION_ID")
+    live.add_argument(
+        "--stop-before-llm",
+        action="store_true",
+        help="collect complete live evidence, then stop before contacting the LLM",
+    )
     replay_parser = subparsers.add_parser("replay", help="re-adjudicate saved evidence")
     replay_parser.add_argument("--config", type=Path, required=True)
     replay_parser.add_argument("--evidence", type=Path, required=True)
@@ -309,7 +360,11 @@ def main(argv: list[str] | None = None) -> int:
         if arguments.command == "credentials":
             return manage_credentials(arguments, CredentialStore())
         if arguments.command == "run":
-            return run_live(arguments.config, arguments.resume)
+            return run_live(
+                arguments.config,
+                arguments.resume,
+                stop_before_llm=arguments.stop_before_llm,
+            )
         return replay(arguments.config, arguments.evidence)
     except Exception as exc:
         LOGGER.error("%s", exc)

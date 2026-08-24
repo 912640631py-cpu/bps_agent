@@ -26,8 +26,8 @@ def app_config(tmp_path: Path) -> AppConfig:
         "dut": {
             "endpoint": "https://dut.example.test",
             "interfaces": ["T1/1", "T1/2"],
-            "sample_interval_seconds": 10,
             "cooldown_seconds": 10,
+            "keepalive_interval_seconds": 5,
             "read_retry_backoff_seconds": 0,
         },
         "storage": {
