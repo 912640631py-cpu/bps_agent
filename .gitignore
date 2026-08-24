@@ -1,0 +1,22 @@
+# Files and directories that predate Git initialization.
+/.agents/
+/.scratch/
+/docs/
+/Example/
+/AGENTS.md
+/CONTEXT.md
+/skills-lock.json
+
+# Generated development and runtime state.
+/.venv/
+/.pytest_cache/
+/.ruff_cache/
+/.mypy_cache/
+/htmlcov/
+/.coverage
+/artifacts/
+/.state/
+/.env
+__pycache__/
+*.py[cod]
+*.egg-info/

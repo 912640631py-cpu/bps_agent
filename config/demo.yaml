@@ -1,0 +1,94 @@
+bps:
+  endpoint: https://10.66.250.104
+  template: ai_bps_puyu
+  slot: 4
+  ports: [4, 5]
+  group: 10
+  allow_malware: false
+  verify_tls: false
+  poll_interval_seconds: 5
+  run_timeout_seconds: 7200
+  registration_grace_seconds: 30
+  report_poll_interval_seconds: 10
+  report_attempts: 30
+  report_type: CSV
+  report_data_type: ALL
+  report_section_ids:
+    - "3.2"
+    - "3.3"
+    - "3.4"
+    - "5.2"
+    - "7.6"
+    - "7.7"
+    - "7.8"
+    - "7.9"
+    - "7.13"
+    - "7.14"
+    - "7.15"
+    - "7.16"
+    - "7.19"
+    - "7.20"
+    - "7.22.6"
+    - "7.22.11"
+    - "7.22.12"
+    - "7.22.13"
+    - "7.22.14"
+    - "7.22.18"
+    - "7.22.19"
+    - "7.22.20"
+    - "7.22.21"
+    - "7.22.24"
+    - "7.22.25"
+    - "7.23.6"
+    - "7.23.11"
+    - "7.23.12"
+    - "7.23.13"
+    - "7.23.14"
+    - "7.23.18"
+    - "7.23.19"
+    - "7.23.20"
+    - "7.23.21"
+    - "7.23.24"
+    - "7.23.25"
+    - "8.2"
+    - "8.3"
+  max_report_bytes: 52428800
+
+dut:
+  endpoint: https://10.66.246.133
+  interfaces: [T1/1, T1/2]
+  verify_tls: false
+  sample_interval_seconds: 10
+  cooldown_seconds: 10
+  read_attempts: 3
+  read_retry_backoff_seconds: 0.5
+
+assessment:
+  goal: 验证 DUT 在指定并发和带宽下的资源与转发表现
+  expectations:
+    - 结合 BPS 自带 Test Criteria 判断测试目标是否达成
+    - 比较 DUT 打流前基线、打流中状态和冷却后的恢复情况
+    - 只依据给定证据判断，不臆造缺失指标
+
+llm:
+  provider: company
+  company:
+    base_url: https://aigw.inone.nsfocus.com/deepseek/v1
+    model: deepseek-v4-flash-0731
+    token_env: COMPANY_DEEPSEEK_API_KEY
+    timeout_seconds: 300
+    attempts: 3
+  official:
+    base_url: https://api.deepseek.com
+    model: deepseek-v4-flash
+    token_env: DEEPSEEK_API_KEY
+    timeout_seconds: 300
+    attempts: 3
+
+storage:
+  artifact_dir: artifacts
+  checkpoint_db: .state/checkpoints.sqlite3
+  lock_dir: .state/locks
+
+evaluation:
+  max_attempts: 3
