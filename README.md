@@ -60,14 +60,24 @@ python -m bps_agent credentials delete
 
 ## 真实运行
 
+以下命令均从项目根目录 `E:\f_bps` 运行。省略 `--config` 时默认读取 `config\demo.yaml`：
+
 ```powershell
-python -m bps_agent run --config config\demo.yaml
+python -m bps_agent run
 ```
+
+临时覆盖配置中的 BPS 模板名称和端口：
+
+```powershell
+python -m bps_agent run --template other-performance-template --ports 4 5
+```
+
+`--template` 必须与 BPS 中的模板名称完全一致；`--ports` 接受一个或多个端口号。覆盖值会写入本次 Evaluation 的配置快照，并应用于所有重试 Attempt。恢复已有 Evaluation 时不能使用这两个覆盖参数。它们不会修改模板内部的并发、带宽、持续时间或协议参数。
 
 只执行实机打流与 Evidence 组装，并在调用 LLM 前停止：
 
 ```powershell
-python -m bps_agent run --config config\demo.yaml --stop-before-llm
+python -m bps_agent run --stop-before-llm
 ```
 
 CLI 启动时先验证所选 DeepSeek 接口是否接受 JSON mode、thinking enabled 和 `reasoning_effort=max`，随后才登录 BPS/DUT 和执行真实打流。
@@ -77,7 +87,7 @@ DUT 的 CPU、内存、会话和接口流量在每次 BPS Run 结束并冷却后
 进程输出 Evaluation Run ID。恢复已有 checkpoint：
 
 ```powershell
-python -m bps_agent run --config config\demo.yaml --resume <evaluation-id>
+python -m bps_agent run --resume <evaluation-id>
 ```
 
 当 BPS 运行状态或端口归属不明确时，程序保留本地端口组锁并停止自动清理。此时应先在 BPS 上人工核对运行和端口状态。
@@ -85,7 +95,7 @@ python -m bps_agent run --config config\demo.yaml --resume <evaluation-id>
 ## 离线回放
 
 ```powershell
-python -m bps_agent replay --config config\demo.yaml --evidence artifacts\<evaluation-id>\attempt-01\evidence.json
+python -m bps_agent replay --evidence artifacts\<evaluation-id>\attempt-01\evidence.json
 ```
 
 回放只读取已保存的 Evidence Bundle 并调用当前选择的 DeepSeek 接口，不访问 BPS 或 DUT。

@@ -125,14 +125,41 @@ def _has_unsafe_reservation(result: dict[str, Any]) -> bool:
         return True
 
 
+def _apply_bps_overrides(
+    config: AppConfig,
+    *,
+    template: str | None,
+    ports: tuple[int, ...] | None,
+    resume_id: str | None,
+) -> AppConfig:
+    if resume_id and (template is not None or ports is not None):
+        raise ValueError("--template and --ports cannot be used with --resume")
+    document = config.model_dump(mode="python")
+    if template is not None:
+        cleaned = template.strip()
+        if not cleaned:
+            raise ValueError("--template must not be empty")
+        document["bps"]["template"] = cleaned
+    if ports is not None:
+        document["bps"]["ports"] = ports
+    return AppConfig.model_validate(document)
+
+
 def run_live(
     config_path: Path,
     resume_id: str | None,
     credential_store: CredentialStore | None = None,
     *,
     stop_before_llm: bool = False,
+    template: str | None = None,
+    ports: tuple[int, ...] | None = None,
 ) -> int:
-    config = load_config(config_path)
+    config = _apply_bps_overrides(
+        load_config(config_path),
+        template=template,
+        ports=ports,
+        resume_id=resume_id,
+    )
     store = credential_store or CredentialStore()
     evaluation_id = resume_id or str(uuid4())
     artifacts = ArtifactStore(config.storage.artifact_dir)
@@ -328,15 +355,36 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--verbose", action="store_true")
     subparsers = parser.add_subparsers(dest="command", required=True)
     live = subparsers.add_parser("run", help="run against real BPS and DUT devices")
-    live.add_argument("--config", type=Path, required=True)
+    live.add_argument(
+        "--config",
+        type=Path,
+        default=Path("config/demo.yaml"),
+        help="configuration file (default: config/demo.yaml)",
+    )
     live.add_argument("--resume", metavar="EVALUATION_ID")
+    live.add_argument(
+        "--template",
+        help="override the exact BPS template name from the configuration",
+    )
+    live.add_argument(
+        "--ports",
+        type=int,
+        nargs="+",
+        metavar="PORT",
+        help="override the BPS port numbers from the configuration",
+    )
     live.add_argument(
         "--stop-before-llm",
         action="store_true",
         help="collect complete live evidence, then stop before contacting the LLM",
     )
     replay_parser = subparsers.add_parser("replay", help="re-adjudicate saved evidence")
-    replay_parser.add_argument("--config", type=Path, required=True)
+    replay_parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("config/demo.yaml"),
+        help="configuration file (default: config/demo.yaml)",
+    )
     replay_parser.add_argument("--evidence", type=Path, required=True)
     credentials = subparsers.add_parser(
         "credentials", help="manage credentials in the operating-system keyring"
@@ -364,6 +412,8 @@ def main(argv: list[str] | None = None) -> int:
                 arguments.config,
                 arguments.resume,
                 stop_before_llm=arguments.stop_before_llm,
+                template=arguments.template,
+                ports=tuple(arguments.ports) if arguments.ports is not None else None,
             )
         return replay(arguments.config, arguments.evidence)
     except Exception as exc:
