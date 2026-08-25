@@ -3,6 +3,7 @@ from __future__ import annotations
 from bps_agent.report_sections import (
     extract_report_sections,
     resolve_minimal_analysis_sections,
+    resolve_performance_timeseries_sections,
 )
 
 
@@ -23,6 +24,10 @@ def test_resolves_current_run_ids_by_title_and_parent_path() -> None:
             {"sectionId": "17.11", "sectionName": "Application Summary"},
             {"sectionId": "19", "sectionName": "Aggregate Stats"},
             {"sectionId": "19.4", "sectionName": "Ethernet Summary"},
+            {"sectionId": "19.8", "sectionName": "Detail"},
+            {"sectionId": "19.8.5", "sectionName": "Ethernet Data Rates"},
+            {"sectionId": "19.8.7", "sectionName": "Concurrent Flows"},
+            {"sectionId": "19.8.8", "sectionName": "Flow Rates"},
         ]
     }
 
@@ -42,6 +47,14 @@ def test_resolves_current_run_ids_by_title_and_parent_path() -> None:
     assert "10.3.7" not in selection.section_ids
     selected = selection.as_dict(toc_section_count=len(sections))["selected_sections"]
     assert selected[0]["parent_path"] == ["Report", "Synopsis"]
+
+    performance = resolve_performance_timeseries_sections(sections)
+    assert performance.required_missing == ()
+    assert performance.section_ids == ("19.8.5", "19.8.7", "19.8.8")
+
+    without_flow_rates = tuple(section for section in sections if section.title != "Flow Rates")
+    missing = resolve_performance_timeseries_sections(without_flow_rates)
+    assert "Aggregate Stats > Detail > Flow Rates" in missing.required_missing
 
 
 def test_extracts_mapping_pair_and_text_toc_shapes() -> None:

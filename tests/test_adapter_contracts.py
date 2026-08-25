@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 
 from bps_agent.adapters.bps import BpsClient
 from bps_agent.adapters.deepseek import DeepSeekJudge
@@ -30,7 +31,29 @@ def test_bps_run_contract_never_forces_reservation() -> None:
             return httpx.Response(200, json={})
         if path.endswith("/testmodel/operations/search"):
             return httpx.Response(200, json=[{"name": "template", "version": 1}])
+        if path.endswith("/tests/operations/getSharedComponentSettings"):
+            return httpx.Response(
+                200,
+                json={
+                    "result": json.dumps(
+                        {
+                            "testModelName": "template",
+                            "sharedComponentSettings": [
+                                {
+                                    "name": "totalBandwidth",
+                                    "originalValue": "800.0",
+                                    "currentValue": "400.0",
+                                    "percentage": "50",
+                                    "enabled": True,
+                                }
+                            ],
+                        }
+                    )
+                },
+            )
         if path.endswith("/topology/operations/reserve"):
+            return httpx.Response(200, json={})
+        if path.endswith("/tests/operations/setSharedComponentSettings"):
             return httpx.Response(200, json={})
         if path.endswith("/testmodel/operations/run"):
             return httpx.Response(200, json={"runId": "1873"})
@@ -51,14 +74,101 @@ def test_bps_run_contract_never_forces_reservation() -> None:
     )
 
     client.authenticate()
-    assert client.find_template("template")["version"] == 1
+    template = client.find_template("template")
+    assert template["version"] == 1
+    assert template["totalBandwidthMbps"] == 800.0
+    assert template["sharedComponentSettings"][0]["currentValue"] == "400.0"
     client.reserve_ports()
+    client.set_total_bandwidth(75.5)
     assert client.start_run() == "1873"
 
     reserve = next(
         request for request in requests if request.url.path.endswith("operations/reserve")
     )
     assert json.loads(reserve.content)["force"] is False
+    bandwidth = next(
+        request
+        for request in requests
+        if request.url.path.endswith("operations/setSharedComponentSettings")
+    )
+    assert bandwidth.url.path == "/api/v1/bps/tests/operations/setSharedComponentSettings"
+    assert json.loads(bandwidth.content) == {
+        "modelName": "template",
+        "sharedComponentSettings": [{"paramName": "totalBandwidth", "paramValue": 75.5}],
+    }
+    settings = next(
+        request
+        for request in requests
+        if request.url.path.endswith("operations/getSharedComponentSettings")
+    )
+    assert json.loads(settings.content) == {"modelName": "template"}
+    assert requests.index(bandwidth) < next(
+        index
+        for index, request in enumerate(requests)
+        if request.url.path.endswith("/testmodel/operations/run")
+    )
+
+
+def test_bps_total_bandwidth_rejects_invalid_percentage() -> None:
+    client = BpsClient(
+        BpsConfig(
+            endpoint="https://bps.example.test",
+            template="template",
+            slot=4,
+            ports=(4, 5),
+            group=10,
+        ),
+        username="user",
+        password="password",
+        client=httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(200))),
+    )
+
+    for invalid in (0.0, -1.0, 100.1):
+        with pytest.raises(ValueError, match="between 0 and 100"):
+            client.set_total_bandwidth(invalid)
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        "not-json",
+        json.dumps({"sharedComponentSettings": []}),
+        json.dumps(
+            {
+                "sharedComponentSettings": [
+                    {
+                        "name": "totalBandwidth",
+                        "originalValue": "not-a-number",
+                        "enabled": True,
+                    }
+                ]
+            }
+        ),
+    ],
+)
+def test_bps_template_preflight_rejects_unusable_bandwidth_json(result: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/testmodel/operations/search"):
+            return httpx.Response(200, json=[{"name": "template"}])
+        if request.url.path.endswith("/tests/operations/getSharedComponentSettings"):
+            return httpx.Response(200, json={"result": result})
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    client = BpsClient(
+        BpsConfig(
+            endpoint="https://bps.example.test",
+            template="template",
+            slot=4,
+            ports=(4, 5),
+            group=10,
+        ),
+        username="user",
+        password="password",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(RuntimeError):
+        client.find_template("template")
 
 
 def test_dut_contract_reads_history_once_and_filters_the_traffic_window() -> None:

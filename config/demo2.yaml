@@ -4,6 +4,7 @@ bps:
   slot: 4
   ports: [4, 5]
   group: 10
+  total_bandwidth_mbps: 400
   allow_malware: false
   verify_tls: false
   poll_interval_seconds: 5
@@ -53,4 +54,4 @@ storage:
   lock_dir: .state/locks
 
 evaluation:
-  max_attempts: 3
+  max_attempts: 5

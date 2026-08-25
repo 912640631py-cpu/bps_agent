@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import tempfile
@@ -51,6 +52,49 @@ def _normalize_list(payload: Any, names: tuple[str, ...]) -> list[dict[str, Any]
     if payload is None:
         return []
     raise BpsProtocolError("BPS returned an unrecognized list document")
+
+
+def _shared_component_settings(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise BpsProtocolError("BPS shared component settings response is not an object")
+    result = payload.get("result")
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except json.JSONDecodeError as exc:
+            raise BpsProtocolError(
+                "BPS shared component settings result is not valid JSON"
+            ) from exc
+    if not isinstance(result, dict):
+        raise BpsProtocolError("BPS shared component settings result is not an object")
+    settings = result.get("sharedComponentSettings")
+    if not isinstance(settings, list) or not all(isinstance(item, dict) for item in settings):
+        raise BpsProtocolError("BPS template omitted sharedComponentSettings")
+    return result
+
+
+def _original_total_bandwidth_mbps(settings: dict[str, Any]) -> float:
+    matches = [
+        item
+        for item in settings["sharedComponentSettings"]
+        if str(item.get("name", "")).casefold() == "totalbandwidth"
+    ]
+    if len(matches) != 1:
+        raise BpsProtocolError(
+            "BPS template must contain exactly one totalBandwidth shared setting"
+        )
+    setting = matches[0]
+    if setting.get("enabled") is False:
+        raise BpsProtocolError("BPS template totalBandwidth shared setting is disabled")
+    try:
+        value = float(setting["originalValue"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BpsProtocolError("BPS template totalBandwidth originalValue is not numeric") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise BpsProtocolError(
+            "BPS template totalBandwidth originalValue must be a positive finite number"
+        )
+    return value
 
 
 def _extract_run_id(payload: Any) -> str:
@@ -181,7 +225,21 @@ class BpsClient:
             raise BpsProtocolError(
                 f"expected exactly one BPS template named {name!r}, found {len(exact)}"
             )
-        return exact[0]
+        settings = _shared_component_settings(
+            self._checked(
+                self._request(
+                    "POST",
+                    "/api/v1/bps/tests/operations/getSharedComponentSettings",
+                    json={"modelName": name},
+                    timeout=60,
+                )
+            )
+        )
+        return {
+            **exact[0],
+            "sharedComponentSettings": settings["sharedComponentSettings"],
+            "totalBandwidthMbps": _original_total_bandwidth_mbps(settings),
+        }
 
     def reserve_ports(self) -> None:
         reservation = [
@@ -212,6 +270,30 @@ class BpsClient:
                     "unreservation": [
                         {"slot": self.config.slot, "port": port} for port in self.config.ports
                     ]
+                },
+                timeout=60,
+            )
+        )
+
+    def set_total_bandwidth(self, percentage: float) -> None:
+        numeric_percentage = float(percentage)
+        if not 0 < numeric_percentage <= 100:
+            raise ValueError("BPS total bandwidth percentage must be between 0 and 100")
+        param_value: int | float = (
+            int(numeric_percentage) if numeric_percentage.is_integer() else numeric_percentage
+        )
+        self._checked(
+            self._request(
+                "POST",
+                "/api/v1/bps/tests/operations/setSharedComponentSettings",
+                json={
+                    "modelName": self.config.template,
+                    "sharedComponentSettings": [
+                        {
+                            "paramName": "totalBandwidth",
+                            "paramValue": param_value,
+                        }
+                    ],
                 },
                 timeout=60,
             )

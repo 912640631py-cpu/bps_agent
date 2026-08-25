@@ -149,10 +149,15 @@ def _apply_bps_overrides(
     *,
     template: str | None,
     ports: tuple[int, ...] | None,
+    total_bandwidth_mbps: float | None,
     resume_id: str | None,
 ) -> AppConfig:
-    if resume_id and (template is not None or ports is not None):
-        raise ValueError("--template and --ports cannot be used with --resume")
+    if resume_id and (
+        template is not None or ports is not None or total_bandwidth_mbps is not None
+    ):
+        raise ValueError(
+            "--template, --ports, and --total-bandwidth-mbps cannot be used with --resume"
+        )
     document = config.model_dump(mode="python")
     if template is not None:
         cleaned = template.strip()
@@ -161,6 +166,8 @@ def _apply_bps_overrides(
         document["bps"]["template"] = cleaned
     if ports is not None:
         document["bps"]["ports"] = ports
+    if total_bandwidth_mbps is not None:
+        document["bps"]["total_bandwidth_mbps"] = total_bandwidth_mbps
     return AppConfig.model_validate(document)
 
 
@@ -172,11 +179,13 @@ def run_live(
     stop_before_llm: bool = False,
     template: str | None = None,
     ports: tuple[int, ...] | None = None,
+    total_bandwidth_mbps: float | None = None,
 ) -> int:
     config = _apply_bps_overrides(
         load_config(config_path),
         template=template,
         ports=ports,
+        total_bandwidth_mbps=total_bandwidth_mbps,
         resume_id=resume_id,
     )
     store = credential_store or CredentialStore()
@@ -396,6 +405,11 @@ def _parser() -> argparse.ArgumentParser:
         help="override the BPS port numbers from the configuration",
     )
     live.add_argument(
+        "--total-bandwidth-mbps",
+        type=float,
+        help="override the initial BPS Total Bandwidth target in Mbps",
+    )
+    live.add_argument(
         "--stop-before-llm",
         action="store_true",
         help="collect complete live evidence, then stop before contacting the LLM",
@@ -442,6 +456,7 @@ def main(argv: list[str] | None = None) -> int:
                 stop_before_llm=arguments.stop_before_llm,
                 template=arguments.template,
                 ports=tuple(arguments.ports) if arguments.ports is not None else None,
+                total_bandwidth_mbps=arguments.total_bandwidth_mbps,
             )
         return replay(arguments.config, arguments.evidence)
     except Exception as exc:

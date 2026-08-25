@@ -15,6 +15,12 @@ _REQUIRED_SECTION_PATHS = (
     ("Test Environment", "Interfaces"),
 )
 
+_PERFORMANCE_TIMESERIES_PATHS = (
+    ("Aggregate Stats", "Detail", "Ethernet Data Rates"),
+    ("Aggregate Stats", "Detail", "Concurrent Flows"),
+    ("Aggregate Stats", "Detail", "Flow Rates"),
+)
+
 _COMPONENT_SUMMARY_TITLES = frozenset(
     {
         "Component Results",
@@ -42,8 +48,6 @@ _AGGREGATE_SUMMARY_TITLES = frozenset(
 _UNSAFE_EXPORT_PATHS = frozenset(
     {
         ("Aggregate Stats", "Detail", "Ethernet Errors"),
-        ("Aggregate Stats", "Detail", "Concurrent Flows"),
-        ("Aggregate Stats", "Detail", "Flow Rates"),
     }
 )
 
@@ -68,9 +72,14 @@ class ReportSectionSelection:
     def section_ids(self) -> tuple[str, ...]:
         return tuple(section.section_id for section in self.sections)
 
-    def as_dict(self, *, toc_section_count: int) -> dict[str, Any]:
+    def as_dict(
+        self,
+        *,
+        toc_section_count: int,
+        mode: str = "minimal-analysis-by-title-and-parent-path",
+    ) -> dict[str, Any]:
         return {
-            "mode": "minimal-analysis-by-title-and-parent-path",
+            "mode": mode,
             "toc_section_count": toc_section_count,
             "selected_section_count": len(self.sections),
             "selected_sections": [
@@ -288,4 +297,39 @@ def resolve_minimal_analysis_sections(
         ambiguous_required=tuple(ambiguous_required),
         optional_missing_by_component=optional_missing,
         unsafe_sections_skipped=tuple(unsafe_skipped),
+    )
+
+
+def resolve_performance_timeseries_sections(
+    sections: tuple[ReportSection, ...],
+) -> ReportSectionSelection:
+    """Resolve the timestamped aggregate performance tables for a separate CSV."""
+
+    selected: dict[str, ReportSection] = {}
+    required_missing: list[str] = []
+    ambiguous_required: list[dict[str, Any]] = []
+    for path in _PERFORMANCE_TIMESERIES_PATHS:
+        matches = [section for section in sections if _path_ends_with(section.path, path)]
+        if not matches:
+            required_missing.append(" > ".join(path))
+            continue
+        if len(matches) > 1:
+            ambiguous_required.append(
+                {"path": list(path), "matches": [section.section_id for section in matches]}
+            )
+        for section in matches:
+            selected[section.section_id] = section
+
+    resolved = tuple(
+        sorted(
+            selected.values(),
+            key=lambda section: tuple(int(part) for part in section.section_id.split(".")),
+        )
+    )
+    return ReportSectionSelection(
+        sections=resolved,
+        required_missing=tuple(required_missing),
+        ambiguous_required=tuple(ambiguous_required),
+        optional_missing_by_component={},
+        unsafe_sections_skipped=(),
     )

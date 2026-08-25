@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,17 +19,22 @@ from bps_agent.models import (
     EvaluationOutcome,
     EvidenceBundle,
     ObservationPhase,
+    PerformanceTimeseriesAnalysis,
     SupplementalSnapshot,
     VerdictValue,
     utc_now,
 )
+from bps_agent.performance_timeseries import analyze_performance_timeseries
 from bps_agent.ports import BpsPort, Clock, DutPort, JudgePort
 from bps_agent.report_sections import (
     extract_report_sections,
     resolve_minimal_analysis_sections,
+    resolve_performance_timeseries_sections,
 )
 
 LOGGER = logging.getLogger(__name__)
+
+_ATTEMPT_BANDWIDTH_FACTORS = (1.0, 0.8, 0.6, 0.4, 0.2)
 
 
 class SystemClock:
@@ -93,6 +99,31 @@ def _has_minimum_monitoring(observations: DutObservations) -> bool:
     )
 
 
+def _template_total_bandwidth_mbps(metadata: dict[str, Any]) -> float:
+    value = metadata.get("totalBandwidthMbps")
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError("BPS template metadata omitted a valid totalBandwidthMbps")
+    return float(value)
+
+
+def _attempt_bandwidth_target(
+    configured_mbps: float,
+    template_total_bandwidth_mbps: float,
+    attempt_number: int,
+) -> tuple[float, float]:
+    if not 1 <= attempt_number <= len(_ATTEMPT_BANDWIDTH_FACTORS):
+        raise ValueError(f"unsupported Attempt number: {attempt_number}")
+    factor = _ATTEMPT_BANDWIDTH_FACTORS[attempt_number - 1]
+    target_mbps = round(configured_mbps * factor, 6)
+    percentage = round(target_mbps / template_total_bandwidth_mbps * 100, 6)
+    return target_mbps, percentage
+
+
 def build_graph(
     services: EvaluationServices,
     checkpointer: Any | None = None,
@@ -107,6 +138,12 @@ def build_graph(
         services.artifacts.write_evaluation_json(evaluation_id, "config.json", state["config"])
         try:
             metadata = services.bps.find_template(cfg.bps.template)
+            template_bandwidth_mbps = _template_total_bandwidth_mbps(metadata)
+            if cfg.bps.total_bandwidth_mbps > template_bandwidth_mbps:
+                raise ValueError(
+                    f"configured Total Bandwidth {cfg.bps.total_bandwidth_mbps:g} Mbps "
+                    f"exceeds template original value {template_bandwidth_mbps:g} Mbps"
+                )
         except Exception as exc:
             return {
                 "outcome": EvaluationOutcome.INCONCLUSIVE.value,
@@ -117,7 +154,19 @@ def build_graph(
 
     def start_attempt(state: EvaluationState) -> dict[str, Any]:
         attempt_number = len(state["attempts"]) + 1
-        attempt = AttemptRecord(number=attempt_number, started_at=utc_now())
+        template_bandwidth_mbps = _template_total_bandwidth_mbps(state["template_metadata"])
+        target_mbps, bandwidth_percent = _attempt_bandwidth_target(
+            cfg.bps.total_bandwidth_mbps,
+            template_bandwidth_mbps,
+            attempt_number,
+        )
+        attempt = AttemptRecord(
+            number=attempt_number,
+            started_at=utc_now(),
+            bps_template_total_bandwidth_mbps=template_bandwidth_mbps,
+            bps_total_bandwidth_mbps=target_mbps,
+            bps_total_bandwidth_percent=bandwidth_percent,
+        )
         reserved = False
         try:
             before = services.dut.collect_supplemental()
@@ -125,6 +174,7 @@ def build_graph(
                 raise RuntimeError("required pre-traffic DUT evidence is incomplete")
             services.bps.reserve_ports()
             reserved = True
+            services.bps.set_total_bandwidth(bandwidth_percent)
             run_id = services.bps.start_run()
             traffic_started_at = utc_now()
             attempt = attempt.model_copy(
@@ -139,7 +189,13 @@ def build_graph(
             services.artifacts.write_attempt_json(
                 state["evaluation_id"], attempt_number, "attempt.json", attempt
             )
-            LOGGER.info("Attempt %s started as BPS run %s", attempt_number, run_id)
+            LOGGER.info(
+                "Attempt %s started as BPS run %s at %.6g Mbps (%.6g%% total bandwidth)",
+                attempt_number,
+                run_id,
+                target_mbps,
+                bandwidth_percent,
+            )
             return {"attempts": [*state["attempts"], attempt.model_dump(mode="json")]}
         except Exception as exc:
             if reserved:
@@ -237,6 +293,7 @@ def build_graph(
         compact_observations: DutObservations | None = None
         report_text = ""
         report_toc: Any = None
+        performance_analysis: PerformanceTimeseriesAnalysis | None = None
         after: SupplementalSnapshot | None = None
         try:
             services.clock.sleep(cfg.dut.cooldown_seconds)
@@ -274,16 +331,36 @@ def build_graph(
             if not report_sections:
                 raise RuntimeError("current BPS Run TOC contains no recognizable titled sections")
             selection = resolve_minimal_analysis_sections(report_sections)
+            performance_selection = resolve_performance_timeseries_sections(report_sections)
             services.artifacts.write_attempt_json(
                 state["evaluation_id"],
                 attempt.number,
                 "bps-report-sections.json",
                 selection.as_dict(toc_section_count=len(report_sections)),
             )
+            services.artifacts.write_attempt_json(
+                state["evaluation_id"],
+                attempt.number,
+                "bps-performance-timeseries-sections.json",
+                performance_selection.as_dict(
+                    toc_section_count=len(report_sections),
+                    mode="performance-timeseries-by-title-and-parent-path",
+                ),
+            )
             if selection.required_missing:
                 raise RuntimeError(
                     "current BPS Run TOC is missing required report sections: "
                     + "; ".join(selection.required_missing)
+                )
+            if performance_selection.required_missing:
+                raise RuntimeError(
+                    "current BPS Run TOC is missing required performance time-series sections: "
+                    + "; ".join(performance_selection.required_missing)
+                )
+            if performance_selection.ambiguous_required:
+                raise RuntimeError(
+                    "current BPS Run TOC has ambiguous performance time-series sections: "
+                    f"{performance_selection.ambiguous_required}"
                 )
             if selection.ambiguous_required:
                 LOGGER.warning(
@@ -299,13 +376,25 @@ def build_graph(
                 destination,
                 selection.section_ids,
             )
+            performance_destination = destination.with_name("bps-performance-timeseries.csv")
+            performance_path = services.bps.export_report(
+                run_id,
+                performance_destination,
+                performance_selection.section_ids,
+            )
+            attempt = attempt.model_copy(
+                update={
+                    "report_path": str(report_path),
+                    "report_toc_path": str(toc_path),
+                    "performance_timeseries_path": str(performance_path),
+                }
+            )
+            performance_analysis = analyze_performance_timeseries(performance_path)
             report_text = report_path.read_text(encoding="utf-8-sig", errors="replace")
             attempt = attempt.model_copy(
                 update={
                     "dut_observations": tuple(observations),
                     "dut_after": after,
-                    "report_path": str(report_path),
-                    "report_toc_path": str(toc_path),
                 }
             )
         except Exception as exc:
@@ -321,6 +410,7 @@ def build_graph(
         complete = bool(
             attempt.bps_run_id
             and report_text
+            and performance_analysis
             and attempt.dut_before
             and attempt.dut_before.is_complete
             and after
@@ -342,9 +432,13 @@ def build_graph(
                 attempt_number=attempt.number,
                 bps_run_id=evidence_run_id,
                 bps_template=cfg.bps.template,
+                bps_template_total_bandwidth_mbps=(attempt.bps_template_total_bandwidth_mbps),
+                bps_total_bandwidth_mbps=attempt.bps_total_bandwidth_mbps,
+                bps_total_bandwidth_percent=attempt.bps_total_bandwidth_percent,
                 bps_template_metadata=attempt.bps_template_metadata,
                 bps_run_details=attempt.bps_run_details,
                 bps_report=report_text,
+                bps_performance_analysis=performance_analysis,
                 assessment=cfg.assessment,
                 dut_endpoint=cfg.dut.endpoint,
                 dut_interfaces=cfg.dut.interfaces,

@@ -38,16 +38,37 @@ class FakeClock:
         self.now += seconds
 
 
+def performance_report_csv() -> str:
+    flows = (0, 250, 500, 750, *([1000] * 9), 700, 300, 0)
+    lines = [
+        "2.1.1. Ethernet Data Rates",
+        "Timestamp,Transmit rate,Receive rate",
+        "Seconds,Megabits/s,",
+        *(f"{second + 0.45:.2f},100,100" for second in range(16)),
+        "2.1.2. Concurrent Flows",
+        "Timestamp,TCP,UDP,SCTP,Total,Super Flow",
+        "Seconds,Flows,,,,",
+        *(f"{second + 0.10:.2f},0,0,0,{total},0" for second, total in enumerate(flows)),
+        "2.1.3. Flow Rates",
+        "Timestamp,TCP rate,UDP rate,SCTP rate,Total rate,Super Flow rate",
+        "Seconds,Flows/s,,,,",
+        *(f"{second + 0.30:.2f},0,0,0,10,0" for second in range(16)),
+    ]
+    return "\n".join(lines) + "\n"
+
+
 class FakeBps:
     def __init__(
         self,
         clock: FakeClock,
         *,
         template_error: bool = False,
+        template_bandwidth_mbps: float = 400.0,
         report_toc: Any = None,
     ) -> None:
         self.clock = clock
         self.template_error = template_error
+        self.template_bandwidth_mbps = template_bandwidth_mbps
         self.report_toc = (
             report_toc
             if report_toc is not None
@@ -64,6 +85,10 @@ class FakeBps:
                     {"sectionId": "20.9", "sectionName": "UDP Summary"},
                     {"sectionId": "30", "sectionName": "Aggregate Stats"},
                     {"sectionId": "30.2", "sectionName": "Ethernet Summary"},
+                    {"sectionId": "30.4", "sectionName": "Detail"},
+                    {"sectionId": "30.4.5", "sectionName": "Ethernet Data Rates"},
+                    {"sectionId": "30.4.7", "sectionName": "Concurrent Flows"},
+                    {"sectionId": "30.4.8", "sectionName": "Flow Rates"},
                 ]
             }
         )
@@ -74,14 +99,29 @@ class FakeBps:
         self.export_section_ids: list[tuple[str, ...]] = []
         self.report_run_ids: list[str] = []
         self.export_run_ids: list[str] = []
+        self.bandwidth_percentages: list[float] = []
 
     def find_template(self, name: str) -> dict[str, Any]:
         if self.template_error:
             raise RuntimeError("missing template")
-        return {"name": name, "version": 1}
+        return {
+            "name": name,
+            "version": 1,
+            "totalBandwidthMbps": self.template_bandwidth_mbps,
+            "sharedComponentSettings": [
+                {
+                    "name": "totalBandwidth",
+                    "originalValue": str(self.template_bandwidth_mbps),
+                    "enabled": True,
+                }
+            ],
+        }
 
     def reserve_ports(self) -> None:
         self.reserve_count += 1
+
+    def set_total_bandwidth(self, percentage: float) -> None:
+        self.bandwidth_percentages.append(percentage)
 
     def start_run(self) -> str:
         self.run_count += 1
@@ -105,10 +145,11 @@ class FakeBps:
         self.export_run_ids.append(run_id)
         self.export_section_ids.append(section_ids)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(
-            f"Test Model,performance-demo\nRun ID,{run_id}\nResult,passed\n",
-            encoding="utf-8",
-        )
+        if destination.name == "bps-performance-timeseries.csv":
+            content = performance_report_csv()
+        else:
+            content = f"Test Model,performance-demo\nRun ID,{run_id}\nResult,passed\n"
+        destination.write_text(content, encoding="utf-8")
         return destination
 
     def release_ports(self) -> None:
@@ -225,13 +266,26 @@ def test_passes_on_first_complete_attempt(app_config: AppConfig) -> None:
 
     assert result["outcome"] == EvaluationOutcome.PASSED.value
     assert bps.run_count == 1
+    assert bps.bandwidth_percentages == [100.0]
     assert bps.reserve_count == bps.release_count == 1
     assert dut.monitoring_calls == 1
     assert dut.supplemental_calls == 2
     assert dut.keepalive_calls == 1
     assert judge.calls == 1
-    assert bps.report_run_ids == bps.export_run_ids == ["run-1"]
-    assert bps.export_section_ids == [("10.4", "10.5", "10.6", "12.8", "20.3", "20.9", "30.2")]
+    assert bps.report_run_ids == ["run-1"]
+    assert bps.export_run_ids == ["run-1", "run-1"]
+    assert bps.export_section_ids == [
+        (
+            "10.4",
+            "10.5",
+            "10.6",
+            "12.8",
+            "20.3",
+            "20.9",
+            "30.2",
+        ),
+        ("30.4.5", "30.4.7", "30.4.8"),
+    ]
     assert Path(result["final_artifact"]).exists()
 
 
@@ -258,7 +312,20 @@ def test_can_stop_after_evidence_without_calling_the_llm(app_config: AppConfig) 
     assert result["attempts"][0]["evidence_complete"] is True
     evidence_path = Path(result["attempts"][0]["evidence_path"])
     evidence = ArtifactStore.read_json(evidence_path)
+    serialized_evidence = evidence_path.read_text(encoding="utf-8")
     assert "bps_report_toc" not in evidence
+    assert "performance_timeseries_path" not in evidence
+    assert "bps-performance-timeseries.csv" not in serialized_evidence
+    assert "Timestamp" not in evidence["bps_report"]
+    assert evidence["bps_performance_analysis"]["assessment"] == "normal"
+    assert evidence["bps_template_total_bandwidth_mbps"] == 400.0
+    assert evidence["bps_total_bandwidth_mbps"] == 400.0
+    assert evidence["bps_total_bandwidth_percent"] == 100.0
+    assert "aligned_samples" not in evidence["bps_performance_analysis"]
+    performance_path = Path(result["attempts"][0]["performance_timeseries_path"])
+    assert performance_path.name == "bps-performance-timeseries.csv"
+    assert performance_path.exists()
+    assert "Timestamp" in performance_path.read_text(encoding="utf-8")
     observations = evidence["dut_observations"]
     assert observations["resources"]["cpu"]["metadata"] == {"code": 0}
     assert len(observations["resources"]["cpu"]["points"]["baseline"]) == 1
@@ -312,18 +379,116 @@ def test_dut_keepalive_failure_is_a_non_fatal_attempt_warning(
     assert any("DUT keepalive failed" in error for error in result["attempts"][0]["errors"])
 
 
-def test_three_retry_verdicts_end_not_passed(app_config: AppConfig) -> None:
+def test_five_retry_verdicts_reduce_bandwidth_then_end_not_passed(
+    app_config: AppConfig,
+) -> None:
     clock = FakeClock()
     bps = FakeBps(clock)
-    judge = FakeJudge([VerdictValue.RETRY] * 3)
+    judge = FakeJudge([VerdictValue.RETRY] * 5)
 
     result = run_graph(app_config, bps, FakeDut(), judge, clock)
 
     assert result["outcome"] == EvaluationOutcome.NOT_PASSED.value
+    assert bps.run_count == 5
+    assert bps.reserve_count == bps.release_count == 5
+    assert bps.bandwidth_percentages == [100.0, 80.0, 60.0, 40.0, 20.0]
+    assert judge.calls == 5
+    assert len(result["attempts"]) == 5
+    assert [attempt["bps_total_bandwidth_mbps"] for attempt in result["attempts"]] == [
+        400.0,
+        320.0,
+        240.0,
+        160.0,
+        80.0,
+    ]
+
+
+def test_retry_bandwidth_levels_are_relative_to_configured_initial_target(
+    app_config: AppConfig,
+) -> None:
+    config = app_config.model_copy(
+        update={"bps": app_config.bps.model_copy(update={"total_bandwidth_mbps": 300.0})}
+    )
+    clock = FakeClock()
+    bps = FakeBps(clock)
+
+    result = run_graph(
+        config,
+        bps,
+        FakeDut(),
+        FakeJudge([VerdictValue.RETRY] * 5),
+        clock,
+    )
+
+    assert result["outcome"] == EvaluationOutcome.NOT_PASSED.value
+    assert bps.bandwidth_percentages == [75.0, 60.0, 45.0, 30.0, 15.0]
+    assert [attempt["bps_total_bandwidth_mbps"] for attempt in result["attempts"]] == [
+        300.0,
+        240.0,
+        180.0,
+        120.0,
+        60.0,
+    ]
+
+
+def test_bandwidth_percentage_uses_template_json_original_value(
+    app_config: AppConfig,
+) -> None:
+    clock = FakeClock()
+    bps = FakeBps(clock, template_bandwidth_mbps=800.0)
+
+    result = run_graph(
+        app_config,
+        bps,
+        FakeDut(),
+        FakeJudge([VerdictValue.RETRY] * 5),
+        clock,
+    )
+
+    assert result["outcome"] == EvaluationOutcome.NOT_PASSED.value
+    assert bps.bandwidth_percentages == [50.0, 40.0, 30.0, 20.0, 10.0]
+    assert all(
+        attempt["bps_template_total_bandwidth_mbps"] == 800.0 for attempt in result["attempts"]
+    )
+
+
+def test_target_above_template_bandwidth_fails_before_reserving_ports(
+    app_config: AppConfig,
+) -> None:
+    config = app_config.model_copy(
+        update={"bps": app_config.bps.model_copy(update={"total_bandwidth_mbps": 500.0})}
+    )
+    clock = FakeClock()
+    bps = FakeBps(clock, template_bandwidth_mbps=400.0)
+
+    result = run_graph(
+        config,
+        bps,
+        FakeDut(),
+        FakeJudge([VerdictValue.PASS]),
+        clock,
+    )
+
+    assert result["outcome"] == EvaluationOutcome.INCONCLUSIVE.value
+    assert "exceeds template original value" in result["error"]
+    assert bps.reserve_count == bps.run_count == 0
+
+
+def test_pass_stops_before_remaining_bandwidth_levels(app_config: AppConfig) -> None:
+    clock = FakeClock()
+    bps = FakeBps(clock)
+
+    result = run_graph(
+        app_config,
+        bps,
+        FakeDut(),
+        FakeJudge([VerdictValue.RETRY, VerdictValue.RETRY, VerdictValue.PASS]),
+        clock,
+    )
+
+    assert result["outcome"] == EvaluationOutcome.PASSED.value
+    assert bps.bandwidth_percentages == [100.0, 80.0, 60.0]
     assert bps.run_count == 3
-    assert bps.reserve_count == bps.release_count == 3
-    assert judge.calls == 3
-    assert len(result["attempts"]) == 3
 
 
 def test_missing_monitoring_is_inconclusive_without_another_bps_run(
