@@ -295,7 +295,6 @@ def test_bps_export_report_uses_runtime_section_selection(tmp_path: Path) -> Non
             slot=4,
             ports=(4, 5),
             group=10,
-            report_section_ids=("7.22.6",),
         ),
         username="user",
         password="password",

@@ -65,7 +65,6 @@ class BpsConfig(StrictModel):
     report_attempts: int = Field(default=30, ge=1)
     report_type: Literal["CSV"] = "CSV"
     report_data_type: str = "ALL"
-    report_section_ids: tuple[str, ...] = ()
     max_report_bytes: int = Field(default=50 * 1024 * 1024, ge=1024)
 
     @field_validator("endpoint")

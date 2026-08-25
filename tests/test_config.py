@@ -11,7 +11,7 @@ def test_demo_configuration_matches_real_lab_defaults() -> None:
     assert config.bps.endpoint == "https://10.66.250.104"
     assert config.bps.template == "ai_bps_puyu"
     assert config.bps.ports == (4, 5)
-    assert len(config.bps.report_section_ids) == 38
+    assert "report_section_ids" not in config.bps.model_dump()
     assert config.dut.endpoint == "https://10.66.246.133"
     assert config.dut.interfaces == ("T1/1", "T1/2")
     assert config.dut.baseline_seconds == 600

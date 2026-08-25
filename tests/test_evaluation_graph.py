@@ -9,8 +9,6 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from bps_agent.artifacts import ArtifactStore
 from bps_agent.graph import (
     EvaluationServices,
-    _select_report_sections,
-    _toc_section_ids,
     build_graph,
     initial_state,
 )
@@ -41,14 +39,41 @@ class FakeClock:
 
 
 class FakeBps:
-    def __init__(self, clock: FakeClock, *, template_error: bool = False) -> None:
+    def __init__(
+        self,
+        clock: FakeClock,
+        *,
+        template_error: bool = False,
+        report_toc: Any = None,
+    ) -> None:
         self.clock = clock
         self.template_error = template_error
+        self.report_toc = (
+            report_toc
+            if report_toc is not None
+            else {
+                "sections": [
+                    {"sectionId": "10", "sectionName": "Synopsis"},
+                    {"sectionId": "10.4", "sectionName": "Test parameters"},
+                    {"sectionId": "10.5", "sectionName": "Test Criteria"},
+                    {"sectionId": "10.6", "sectionName": "Summary of Results"},
+                    {"sectionId": "12", "sectionName": "Test Environment"},
+                    {"sectionId": "12.8", "sectionName": "Interfaces"},
+                    {"sectionId": "20", "sectionName": "Test Results for AppSim"},
+                    {"sectionId": "20.3", "sectionName": "Component Results"},
+                    {"sectionId": "20.9", "sectionName": "UDP Summary"},
+                    {"sectionId": "30", "sectionName": "Aggregate Stats"},
+                    {"sectionId": "30.2", "sectionName": "Ethernet Summary"},
+                ]
+            }
+        )
         self.run_count = 0
         self.reserve_count = 0
         self.release_count = 0
         self.stop_count = 0
-        self.export_section_ids: list[tuple[str, ...] | None] = []
+        self.export_section_ids: list[tuple[str, ...]] = []
+        self.report_run_ids: list[str] = []
+        self.export_run_ids: list[str] = []
 
     def find_template(self, name: str) -> dict[str, Any]:
         if self.template_error:
@@ -68,14 +93,16 @@ class FakeBps:
         return RunCompletion(terminal=True, details={"run_id": run_id, "result": "complete"})
 
     def wait_for_report(self, run_id: str) -> Any:
-        return {"run_id": run_id, "sections": ["3.2"]}
+        self.report_run_ids.append(run_id)
+        return self.report_toc
 
     def export_report(
         self,
         run_id: str,
         destination: Path,
-        section_ids: tuple[str, ...] | None = None,
+        section_ids: tuple[str, ...],
     ) -> Path:
+        self.export_run_ids.append(run_id)
         self.export_section_ids.append(section_ids)
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(
@@ -188,20 +215,6 @@ def run_graph(
     return graph.invoke(initial_state("evaluation-1", config))
 
 
-def test_report_toc_section_extraction_supports_real_and_nested_shapes() -> None:
-    toc = {
-        "sections": [
-            {"Section ID": "3.2", "Section Name": "Test parameters"},
-            {"sectionId": "7.19", "sectionName": "Test results"},
-            {"nested": {"section_id": "7.20"}},
-            "8.3",
-        ]
-    }
-
-    assert _toc_section_ids(toc) == frozenset({"3.2", "7.19", "7.20", "8.3"})
-    assert _select_report_sections(("3.2", "7.22.6"), toc) == (("3.2",), ("7.22.6",))
-
-
 def test_passes_on_first_complete_attempt(app_config: AppConfig) -> None:
     clock = FakeClock()
     bps = FakeBps(clock)
@@ -217,7 +230,8 @@ def test_passes_on_first_complete_attempt(app_config: AppConfig) -> None:
     assert dut.supplemental_calls == 2
     assert dut.keepalive_calls == 1
     assert judge.calls == 1
-    assert bps.export_section_ids == [("3.2",)]
+    assert bps.report_run_ids == bps.export_run_ids == ["run-1"]
+    assert bps.export_section_ids == [("10.4", "10.5", "10.6", "12.8", "20.3", "20.9", "30.2")]
     assert Path(result["final_artifact"]).exists()
 
 
@@ -264,24 +278,22 @@ def test_can_stop_after_evidence_without_calling_the_llm(app_config: AppConfig) 
     assert judge.calls == 0
 
 
-def test_all_configured_report_sections_missing_is_inconclusive(app_config: AppConfig) -> None:
-    config = AppConfig.model_validate(
-        {
-            **app_config.model_dump(mode="python"),
-            "bps": {
-                **app_config.bps.model_dump(mode="python"),
-                "report_section_ids": ["7.22.6"],
-            },
-        }
-    )
+def test_missing_required_dynamic_report_sections_is_inconclusive(
+    app_config: AppConfig,
+) -> None:
     clock = FakeClock()
-    bps = FakeBps(clock)
+    bps = FakeBps(
+        clock,
+        report_toc={"sections": [{"sectionId": "1", "sectionName": "Appendix"}]},
+    )
 
-    result = run_graph(config, bps, FakeDut(), FakeJudge([VerdictValue.PASS]), clock)
+    result = run_graph(app_config, bps, FakeDut(), FakeJudge([VerdictValue.PASS]), clock)
 
     assert result["outcome"] == EvaluationOutcome.INCONCLUSIVE.value
     assert bps.export_section_ids == []
-    assert Path(result["attempts"][0]["report_toc_path"]).exists()
+    toc_path = Path(result["attempts"][0]["report_toc_path"])
+    assert toc_path.exists()
+    assert (toc_path.parent / "bps-report-sections.json").exists()
 
 
 def test_dut_keepalive_failure_is_a_non_fatal_attempt_warning(

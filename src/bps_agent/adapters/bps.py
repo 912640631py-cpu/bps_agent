@@ -335,9 +335,8 @@ class BpsClient:
         self,
         run_id: str,
         destination: Path,
-        section_ids: tuple[str, ...] | None = None,
+        section_ids: tuple[str, ...],
     ) -> Path:
-        selected_sections = self.config.report_section_ids if section_ids is None else section_ids
         response = self._request(
             "POST",
             "/bps/api/v2/core/reports/operations/exportReport",
@@ -345,7 +344,7 @@ class BpsClient:
                 "filepath": str(destination),
                 "runid": run_id,
                 "reportType": self.config.report_type,
-                "sectionIds": ",".join(selected_sections),
+                "sectionIds": ",".join(section_ids),
                 "dataType": self.config.report_data_type,
             },
             timeout=120,

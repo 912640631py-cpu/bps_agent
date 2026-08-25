@@ -23,74 +23,12 @@ from bps_agent.models import (
     utc_now,
 )
 from bps_agent.ports import BpsPort, Clock, DutPort, JudgePort
+from bps_agent.report_sections import (
+    extract_report_sections,
+    resolve_minimal_analysis_sections,
+)
 
 LOGGER = logging.getLogger(__name__)
-
-_TOC_SECTION_ID_KEYS = frozenset({"sectionid", "id", "number"})
-_TOC_CONTAINER_KEYS = frozenset({"section", "sections", "toc", "tableofcontents", "items"})
-
-
-def _normalized_toc_key(value: Any) -> str:
-    if not isinstance(value, str):
-        return ""
-    return "".join(character for character in value.casefold() if character.isalnum())
-
-
-def _toc_section_ids(value: Any) -> frozenset[str]:
-    """Extract section identifiers from the shapes returned by BPS report TOC APIs."""
-
-    identifiers: set[str] = set()
-
-    def add_scalar(item: Any) -> None:
-        if isinstance(item, bool):
-            return
-        if isinstance(item, (str, int)):
-            text = str(item).strip()
-            if text:
-                identifiers.add(text)
-
-    def walk(item: Any, *, allow_bare_scalars: bool = False) -> None:
-        if isinstance(item, dict):
-            for key, child in item.items():
-                normalized = _normalized_toc_key(key)
-                if normalized in _TOC_SECTION_ID_KEYS:
-                    if isinstance(child, (list, tuple)):
-                        for value_item in child:
-                            add_scalar(value_item)
-                    else:
-                        add_scalar(child)
-                elif normalized in _TOC_CONTAINER_KEYS:
-                    walk(child, allow_bare_scalars=True)
-                else:
-                    walk(child)
-        elif isinstance(item, (list, tuple)):
-            for child in item:
-                if allow_bare_scalars and isinstance(child, (str, int)):
-                    add_scalar(child)
-                else:
-                    walk(child)
-        elif allow_bare_scalars:
-            add_scalar(item)
-
-    walk(value)
-    return frozenset(identifiers)
-
-
-def _select_report_sections(
-    configured: tuple[str, ...], report_toc: Any
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Return configured sections present in this Run's TOC and those to skip."""
-
-    if not configured:
-        return (), ()
-    available = _toc_section_ids(report_toc)
-    selected = tuple(item for item in configured if item in available)
-    skipped = tuple(item for item in configured if item not in available)
-    if not selected:
-        raise RuntimeError(
-            "none of the configured BPS report sections exist in the current report TOC"
-        )
-    return selected, skipped
 
 
 class SystemClock:
@@ -332,15 +270,25 @@ def build_graph(
                 state["evaluation_id"], attempt.number, "bps-report-toc.json", report_toc
             )
             attempt = attempt.model_copy(update={"report_toc_path": str(toc_path)})
-            section_ids, skipped_sections = _select_report_sections(
-                cfg.bps.report_section_ids,
-                report_toc,
+            report_sections = extract_report_sections(report_toc)
+            if not report_sections:
+                raise RuntimeError("current BPS Run TOC contains no recognizable titled sections")
+            selection = resolve_minimal_analysis_sections(report_sections)
+            services.artifacts.write_attempt_json(
+                state["evaluation_id"],
+                attempt.number,
+                "bps-report-sections.json",
+                selection.as_dict(toc_section_count=len(report_sections)),
             )
-            if skipped_sections:
+            if selection.required_missing:
+                raise RuntimeError(
+                    "current BPS Run TOC is missing required report sections: "
+                    + "; ".join(selection.required_missing)
+                )
+            if selection.ambiguous_required:
                 LOGGER.warning(
-                    "Skipping %s BPS report sections absent from current report TOC: %s",
-                    len(skipped_sections),
-                    ", ".join(skipped_sections),
+                    "Required BPS report section paths were ambiguous: %s",
+                    selection.ambiguous_required,
                 )
             destination = (
                 services.artifacts.attempt_dir(state["evaluation_id"], attempt.number)
@@ -349,7 +297,7 @@ def build_graph(
             report_path = services.bps.export_report(
                 run_id,
                 destination,
-                section_ids,
+                selection.section_ids,
             )
             report_text = report_path.read_text(encoding="utf-8-sig", errors="replace")
             attempt = attempt.model_copy(

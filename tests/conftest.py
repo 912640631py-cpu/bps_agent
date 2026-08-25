@@ -22,7 +22,6 @@ def app_config(tmp_path: Path) -> AppConfig:
             "registration_grace_seconds": 0,
             "report_poll_interval_seconds": 0.01,
             "report_attempts": 2,
-            "report_section_ids": ["3.2", "7.22.6"],
         },
         "dut": {
             "endpoint": "https://dut.example.test",

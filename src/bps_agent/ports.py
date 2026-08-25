@@ -36,7 +36,7 @@ class BpsPort(Protocol):
         self,
         run_id: str,
         destination: Path,
-        section_ids: tuple[str, ...] | None = None,
+        section_ids: tuple[str, ...],
     ) -> Path: ...
 
     def release_ports(self) -> None: ...
