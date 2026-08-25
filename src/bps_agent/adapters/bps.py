@@ -331,7 +331,13 @@ class BpsClient:
                 return content
         raise BpsProtocolError("too many BPS report redirects")
 
-    def export_report(self, run_id: str, destination: Path) -> Path:
+    def export_report(
+        self,
+        run_id: str,
+        destination: Path,
+        section_ids: tuple[str, ...] | None = None,
+    ) -> Path:
+        selected_sections = self.config.report_section_ids if section_ids is None else section_ids
         response = self._request(
             "POST",
             "/bps/api/v2/core/reports/operations/exportReport",
@@ -339,7 +345,7 @@ class BpsClient:
                 "filepath": str(destination),
                 "runid": run_id,
                 "reportType": self.config.report_type,
-                "sectionIds": ",".join(self.config.report_section_ids),
+                "sectionIds": ",".join(selected_sections),
                 "dataType": self.config.report_data_type,
             },
             timeout=120,

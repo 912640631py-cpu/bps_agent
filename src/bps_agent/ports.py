@@ -32,7 +32,12 @@ class BpsPort(Protocol):
 
     def wait_for_report(self, run_id: str) -> Any: ...
 
-    def export_report(self, run_id: str, destination: Path) -> Path: ...
+    def export_report(
+        self,
+        run_id: str,
+        destination: Path,
+        section_ids: tuple[str, ...] | None = None,
+    ) -> Path: ...
 
     def release_ports(self) -> None: ...
 

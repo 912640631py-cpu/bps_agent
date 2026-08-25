@@ -7,7 +7,13 @@ from typing import Any
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from bps_agent.artifacts import ArtifactStore
-from bps_agent.graph import EvaluationServices, build_graph, initial_state
+from bps_agent.graph import (
+    EvaluationServices,
+    _select_report_sections,
+    _toc_section_ids,
+    build_graph,
+    initial_state,
+)
 from bps_agent.models import (
     AppConfig,
     EvaluationOutcome,
@@ -42,6 +48,7 @@ class FakeBps:
         self.reserve_count = 0
         self.release_count = 0
         self.stop_count = 0
+        self.export_section_ids: list[tuple[str, ...] | None] = []
 
     def find_template(self, name: str) -> dict[str, Any]:
         if self.template_error:
@@ -63,7 +70,13 @@ class FakeBps:
     def wait_for_report(self, run_id: str) -> Any:
         return {"run_id": run_id, "sections": ["3.2"]}
 
-    def export_report(self, run_id: str, destination: Path) -> Path:
+    def export_report(
+        self,
+        run_id: str,
+        destination: Path,
+        section_ids: tuple[str, ...] | None = None,
+    ) -> Path:
+        self.export_section_ids.append(section_ids)
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(
             f"Test Model,performance-demo\nRun ID,{run_id}\nResult,passed\n",
@@ -175,6 +188,20 @@ def run_graph(
     return graph.invoke(initial_state("evaluation-1", config))
 
 
+def test_report_toc_section_extraction_supports_real_and_nested_shapes() -> None:
+    toc = {
+        "sections": [
+            {"Section ID": "3.2", "Section Name": "Test parameters"},
+            {"sectionId": "7.19", "sectionName": "Test results"},
+            {"nested": {"section_id": "7.20"}},
+            "8.3",
+        ]
+    }
+
+    assert _toc_section_ids(toc) == frozenset({"3.2", "7.19", "7.20", "8.3"})
+    assert _select_report_sections(("3.2", "7.22.6"), toc) == (("3.2",), ("7.22.6",))
+
+
 def test_passes_on_first_complete_attempt(app_config: AppConfig) -> None:
     clock = FakeClock()
     bps = FakeBps(clock)
@@ -190,6 +217,7 @@ def test_passes_on_first_complete_attempt(app_config: AppConfig) -> None:
     assert dut.supplemental_calls == 2
     assert dut.keepalive_calls == 1
     assert judge.calls == 1
+    assert bps.export_section_ids == [("3.2",)]
     assert Path(result["final_artifact"]).exists()
 
 
@@ -234,6 +262,26 @@ def test_can_stop_after_evidence_without_calling_the_llm(app_config: AppConfig) 
     assert isinstance(upgraded["dut_observations"], dict)
     assert Path(result["attempts"][0]["report_toc_path"]).exists()
     assert judge.calls == 0
+
+
+def test_all_configured_report_sections_missing_is_inconclusive(app_config: AppConfig) -> None:
+    config = AppConfig.model_validate(
+        {
+            **app_config.model_dump(mode="python"),
+            "bps": {
+                **app_config.bps.model_dump(mode="python"),
+                "report_section_ids": ["7.22.6"],
+            },
+        }
+    )
+    clock = FakeClock()
+    bps = FakeBps(clock)
+
+    result = run_graph(config, bps, FakeDut(), FakeJudge([VerdictValue.PASS]), clock)
+
+    assert result["outcome"] == EvaluationOutcome.INCONCLUSIVE.value
+    assert bps.export_section_ids == []
+    assert Path(result["attempts"][0]["report_toc_path"]).exists()
 
 
 def test_dut_keepalive_failure_is_a_non_fatal_attempt_warning(

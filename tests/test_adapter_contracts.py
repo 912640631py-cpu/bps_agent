@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -270,3 +271,38 @@ def test_bps_completion_requires_report_when_run_was_never_observed() -> None:
     assert completion.terminal
     assert completion.details["completion"] == "report-ready-before-registration-observed"
     assert report_checks == polls == 2
+
+
+def test_bps_export_report_uses_runtime_section_selection(tmp_path: Path) -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/reports/operations/exportReport"):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"url": "/reports/export.csv"})
+        if request.url.path == "/reports/export.csv":
+            return httpx.Response(
+                200,
+                content=b"section,result\n3.2,pass\n",
+                headers={"content-type": "text/csv"},
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    client = BpsClient(
+        BpsConfig(
+            endpoint="https://bps.example.test",
+            template="template",
+            slot=4,
+            ports=(4, 5),
+            group=10,
+            report_section_ids=("7.22.6",),
+        ),
+        username="user",
+        password="password",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    destination = client.export_report("1873", tmp_path / "report.csv", ("3.2", "7.19"))
+
+    assert destination.read_text(encoding="utf-8") == "section,result\n3.2,pass\n"
+    assert captured["body"]["sectionIds"] == "3.2,7.19"
