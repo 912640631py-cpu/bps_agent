@@ -121,8 +121,9 @@ def _parse_tables(path: Path) -> dict[str, tuple[_Point, ...]]:
     return parsed
 
 
-def _nearest(points: tuple[_Point, ...], timestamp: float) -> tuple[_Point, float]:
-    timestamps = [point.timestamp for point in points]
+def _nearest(
+    points: tuple[_Point, ...], timestamps: tuple[float, ...], timestamp: float
+) -> tuple[_Point, float]:
     position = bisect.bisect_left(timestamps, timestamp)
     candidates = points[max(0, position - 1) : min(len(points), position + 1)]
     point = min(candidates, key=lambda item: (abs(item.timestamp - timestamp), item.timestamp))
@@ -139,10 +140,19 @@ def _align(
 
     expected = finish - start + 1
     aligned: list[_AlignedSample] = []
+    timestamps = {
+        title: tuple(point.timestamp for point in points) for title, points in tables.items()
+    }
     for second in range(start, finish + 1):
-        data_rate, data_distance = _nearest(tables["Ethernet Data Rates"], second)
-        concurrent, concurrent_distance = _nearest(tables["Concurrent Flows"], second)
-        flow_rate, flow_rate_distance = _nearest(tables["Flow Rates"], second)
+        data_rate, data_distance = _nearest(
+            tables["Ethernet Data Rates"], timestamps["Ethernet Data Rates"], second
+        )
+        concurrent, concurrent_distance = _nearest(
+            tables["Concurrent Flows"], timestamps["Concurrent Flows"], second
+        )
+        flow_rate, flow_rate_distance = _nearest(
+            tables["Flow Rates"], timestamps["Flow Rates"], second
+        )
         if max(data_distance, concurrent_distance, flow_rate_distance) > (
             thresholds.nearest_alignment_tolerance_seconds
         ):

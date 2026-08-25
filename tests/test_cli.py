@@ -2,16 +2,31 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any, TypedDict
 
 import pytest
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.graph import END, START, StateGraph
 
 from bps_agent.cli import (
+    EXIT_CODES,
     _apply_bps_overrides,
     _configure_logging,
+    _load_resume_config,
     _parser,
     _verdict_console_fields,
 )
-from bps_agent.models import AppConfig, AttemptRecord, VerdictDocument, VerdictValue
+from bps_agent.models import (
+    AppConfig,
+    AttemptRecord,
+    EvaluationOutcome,
+    VerdictDocument,
+    VerdictValue,
+)
+
+
+class _CheckpointConfigState(TypedDict):
+    config: dict[str, Any]
 
 
 @pytest.mark.parametrize(
@@ -127,6 +142,31 @@ def test_resume_rejects_bandwidth_override(app_config: AppConfig) -> None:
         )
 
 
+def test_resume_loads_runtime_configuration_from_checkpoint(app_config: AppConfig) -> None:
+    builder = StateGraph(_CheckpointConfigState)
+    builder.add_node("finish", lambda _state: {})
+    builder.add_edge(START, "finish")
+    builder.add_edge("finish", END)
+    invocation = {"configurable": {"thread_id": "resume-config"}}
+    with SqliteSaver.from_conn_string(str(app_config.storage.checkpoint_db)) as saver:
+        builder.compile(checkpointer=saver).invoke(
+            {"config": app_config.model_dump(mode="json")}, config=invocation
+        )
+
+    changed = app_config.model_copy(
+        update={
+            "bps": app_config.bps.model_copy(
+                update={"endpoint": "https://new-bps.example.test", "ports": (8, 9)}
+            ),
+            "dut": app_config.dut.model_copy(update={"endpoint": "https://new-dut.example.test"}),
+        }
+    )
+
+    restored = _load_resume_config(changed, "resume-config")
+
+    assert restored == app_config
+
+
 def test_console_verdict_contains_summary_and_observations_only() -> None:
     attempt = AttemptRecord(
         number=1,
@@ -152,3 +192,8 @@ def test_cli_suppresses_http_client_info_logs() -> None:
 
     assert logging.getLogger("httpx").level == logging.WARNING
     assert logging.getLogger("httpcore").level == logging.WARNING
+
+
+def test_degraded_pass_has_distinct_nonzero_exit_code() -> None:
+    assert EXIT_CODES[EvaluationOutcome.PASSED.value] == 0
+    assert EXIT_CODES[EvaluationOutcome.DEGRADED_PASS.value] == 1

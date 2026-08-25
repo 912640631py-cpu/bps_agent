@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from bps_agent.models import PerformanceAssessment
-from bps_agent.performance_timeseries import analyze_performance_timeseries
+from bps_agent.models import PerformanceAnalysisThresholds, PerformanceAssessment
+from bps_agent.performance_timeseries import _align, analyze_performance_timeseries
 
 
 def _report(
@@ -112,3 +112,35 @@ def test_flow_rate_change_alone_is_not_a_performance_anomaly(tmp_path: Path) -> 
 
     assert analysis.assessment == PerformanceAssessment.NORMAL
     assert analysis.events == ()
+
+
+def test_alignment_does_not_rescan_every_timestamp_for_each_second() -> None:
+    timestamp_accesses = 0
+
+    class CountingPoint:
+        def __init__(self, timestamp: float, values: tuple[float, ...]) -> None:
+            self._timestamp = timestamp
+            self.values = values
+
+        @property
+        def timestamp(self) -> float:
+            nonlocal timestamp_accesses
+            timestamp_accesses += 1
+            return self._timestamp
+
+    count = 200
+    tables = {
+        "Ethernet Data Rates": tuple(
+            CountingPoint(float(second), (100.0, 100.0)) for second in range(count)
+        ),
+        "Concurrent Flows": tuple(
+            CountingPoint(float(second), (1000.0,)) for second in range(count)
+        ),
+        "Flow Rates": tuple(CountingPoint(float(second), (10.0,)) for second in range(count)),
+    }
+
+    aligned, expected, coverage = _align(tables, PerformanceAnalysisThresholds())  # type: ignore[arg-type]
+
+    assert len(aligned) == expected == count
+    assert coverage == pytest.approx(1.0)
+    assert timestamp_accesses < count * 25

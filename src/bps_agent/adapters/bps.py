@@ -20,6 +20,16 @@ from bps_agent.models import BpsConfig, RunCompletion
 
 _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _RETRYABLE_REPORT_STATUSES = {404, 409, 500, 503}
+_EXPLICIT_TERMINAL_STATES = {
+    "aborted",
+    "complete",
+    "completed",
+    "done",
+    "failed",
+    "finished",
+    "passed",
+    "stopped",
+}
 
 
 class PortOccupiedError(RuntimeError):
@@ -114,6 +124,17 @@ def _run_aliases(run_id: str) -> set[str]:
     if run_id.startswith("TEST-"):
         return {run_id, run_id[5:]}
     return {run_id, f"TEST-{run_id}"}
+
+
+def _is_explicit_terminal_state(details: dict[str, Any]) -> bool:
+    completed = details.get("completed")
+    if completed is True or (isinstance(completed, str) and completed.casefold() == "true"):
+        return True
+    return any(
+        isinstance(details.get(key), str)
+        and str(details[key]).strip().casefold() in _EXPLICIT_TERMINAL_STATES
+        for key in ("state", "phase", "status")
+    )
 
 
 class BpsClient:
@@ -341,26 +362,34 @@ class BpsClient:
         deadline = time.monotonic() + self.config.run_timeout_seconds
         registration_deadline = time.monotonic() + self.config.registration_grace_seconds
         seen_running = False
-        consecutive_absent = 0
         last_details: dict[str, Any] = {}
         while True:
             running = self._running_test(run_id)
             on_poll()
             if running is not None:
                 seen_running = True
-                consecutive_absent = 0
                 last_details = running
-            else:
-                consecutive_absent += 1
-                if seen_running and consecutive_absent >= 2:
+                if _is_explicit_terminal_state(running):
                     return RunCompletion(
                         terminal=True,
-                        details={"last_running_state": last_details, "completion": "disappeared"},
+                        details={
+                            "last_running_state": last_details,
+                            "completion": "explicit-terminal-state",
+                        },
                     )
-                if not seen_running and self._report_contents(run_id) is not None:
+            else:
+                if self._report_contents(run_id) is not None:
+                    completion = (
+                        "running-test-absent-and-report-ready"
+                        if seen_running
+                        else "report-ready-before-registration-observed"
+                    )
                     return RunCompletion(
                         terminal=True,
-                        details={"completion": "report-ready-before-registration-observed"},
+                        details={
+                            "last_running_state": last_details,
+                            "completion": completion,
+                        },
                     )
                 if not seen_running and time.monotonic() < registration_deadline:
                     pass

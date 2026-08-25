@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from bps_agent.adapters.bps import BpsClient
@@ -34,6 +35,7 @@ LOGGER = logging.getLogger(__name__)
 
 EXIT_CODES = {
     EvaluationOutcome.PASSED.value: 0,
+    EvaluationOutcome.DEGRADED_PASS.value: 1,
     EvaluationOutcome.NOT_PASSED.value: 2,
     EvaluationOutcome.INCONCLUSIVE.value: 3,
 }
@@ -171,6 +173,29 @@ def _apply_bps_overrides(
     return AppConfig.model_validate(document)
 
 
+def _load_resume_config(current_config: AppConfig, resume_id: str) -> AppConfig:
+    checkpoint_db = current_config.storage.checkpoint_db
+    invocation_config: RunnableConfig = {"configurable": {"thread_id": resume_id}}
+    with SqliteSaver.from_conn_string(str(checkpoint_db)) as saver:
+        checkpoint_tuple = saver.get_tuple(invocation_config)
+    if checkpoint_tuple is None:
+        raise ValueError(f"no checkpoint exists for Evaluation Run {resume_id}")
+    channel_values = checkpoint_tuple.checkpoint.get("channel_values")
+    if not isinstance(channel_values, dict) or not isinstance(channel_values.get("config"), dict):
+        raise ValueError(f"checkpoint for Evaluation Run {resume_id} omitted its configuration")
+    try:
+        restored = AppConfig.model_validate(channel_values["config"])
+    except ValueError as exc:
+        raise ValueError(
+            f"checkpoint for Evaluation Run {resume_id} contains an invalid configuration"
+        ) from exc
+    if restored.storage.checkpoint_db.resolve() != checkpoint_db.resolve():
+        raise ValueError(
+            f"checkpoint for Evaluation Run {resume_id} refers to a different checkpoint database"
+        )
+    return restored
+
+
 def run_live(
     config_path: Path,
     resume_id: str | None,
@@ -188,6 +213,8 @@ def run_live(
         total_bandwidth_mbps=total_bandwidth_mbps,
         resume_id=resume_id,
     )
+    if resume_id:
+        config = _load_resume_config(config, resume_id)
     store = credential_store or CredentialStore()
     evaluation_id = resume_id or str(uuid4())
     artifacts = ArtifactStore(config.storage.artifact_dir)

@@ -474,7 +474,7 @@ def test_target_above_template_bandwidth_fails_before_reserving_ports(
     assert bps.reserve_count == bps.run_count == 0
 
 
-def test_pass_stops_before_remaining_bandwidth_levels(app_config: AppConfig) -> None:
+def test_pass_after_reduced_bandwidth_is_degraded_pass(app_config: AppConfig) -> None:
     clock = FakeClock()
     bps = FakeBps(clock)
 
@@ -486,7 +486,7 @@ def test_pass_stops_before_remaining_bandwidth_levels(app_config: AppConfig) -> 
         clock,
     )
 
-    assert result["outcome"] == EvaluationOutcome.PASSED.value
+    assert result["outcome"] == EvaluationOutcome.DEGRADED_PASS.value
     assert bps.bandwidth_percentages == [100.0, 80.0, 60.0]
     assert bps.run_count == 3
 

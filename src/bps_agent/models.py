@@ -35,6 +35,7 @@ def _validated_https_url(value: str, label: str) -> str:
 
 class EvaluationOutcome(StrEnum):
     PASSED = "PASSED"
+    DEGRADED_PASS = "DEGRADED_PASS"
     NOT_PASSED = "NOT_PASSED"
     INCONCLUSIVE = "INCONCLUSIVE"
 

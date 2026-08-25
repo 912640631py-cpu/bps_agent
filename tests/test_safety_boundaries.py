@@ -67,3 +67,91 @@ def test_preserved_lock_survives_context_exit(tmp_path: Path) -> None:
 
     assert lock.path.exists()
     lock.release()
+
+
+def test_port_lock_is_order_independent(tmp_path: Path) -> None:
+    first = PortGroupLock(
+        tmp_path,
+        endpoint="https://bps.example.test",
+        slot=4,
+        ports=(4, 5),
+        group=10,
+        evaluation_id="evaluation-1",
+    )
+    reversed_order = PortGroupLock(
+        tmp_path,
+        endpoint="https://bps.example.test",
+        slot=4,
+        ports=(5, 4),
+        group=10,
+        evaluation_id="evaluation-2",
+    )
+
+    first.acquire()
+    try:
+        with pytest.raises(PortGroupLockedError):
+            reversed_order.acquire()
+    finally:
+        first.release()
+
+
+def test_overlapping_port_sets_cannot_be_locked_together(tmp_path: Path) -> None:
+    first = PortGroupLock(
+        tmp_path,
+        endpoint="https://bps.example.test",
+        slot=4,
+        ports=(4, 5),
+        group=10,
+        evaluation_id="evaluation-1",
+    )
+    overlapping = PortGroupLock(
+        tmp_path,
+        endpoint="https://bps.example.test",
+        slot=4,
+        ports=(5, 6),
+        group=10,
+        evaluation_id="evaluation-2",
+    )
+
+    first.acquire()
+    try:
+        with pytest.raises(PortGroupLockedError):
+            overlapping.acquire()
+    finally:
+        first.release()
+
+
+def test_failed_multi_port_acquire_rolls_back_partial_locks(tmp_path: Path) -> None:
+    held = PortGroupLock(
+        tmp_path,
+        endpoint="https://bps.example.test",
+        slot=4,
+        ports=(5,),
+        group=10,
+        evaluation_id="evaluation-1",
+    )
+    candidate = PortGroupLock(
+        tmp_path,
+        endpoint="https://bps.example.test",
+        slot=4,
+        ports=(4, 5),
+        group=10,
+        evaluation_id="evaluation-2",
+    )
+    port_four = PortGroupLock(
+        tmp_path,
+        endpoint="https://bps.example.test",
+        slot=4,
+        ports=(4,),
+        group=10,
+        evaluation_id="evaluation-3",
+    )
+
+    held.acquire()
+    try:
+        with pytest.raises(PortGroupLockedError):
+            candidate.acquire()
+        port_four.acquire()
+        port_four.release()
+    finally:
+        held.release()

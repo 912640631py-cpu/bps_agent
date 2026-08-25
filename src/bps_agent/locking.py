@@ -25,44 +25,86 @@ class PortGroupLock:
         group: int,
         evaluation_id: str,
     ) -> None:
-        identity = f"{endpoint}|{slot}|{','.join(map(str, ports))}|{group}"
-        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
-        self.path = lock_dir / f"bps-{digest}.lock"
+        canonical_ports = tuple(sorted(ports))
+        if not canonical_ports or len(canonical_ports) != len(set(canonical_ports)):
+            raise ValueError("BPS lock ports must be non-empty and unique")
+        self.paths = tuple(
+            lock_dir
+            / (
+                "bps-port-"
+                + hashlib.sha256(f"{endpoint}|{slot}|{port}".encode()).hexdigest()[:20]
+                + ".lock"
+            )
+            for port in canonical_ports
+        )
+        self.path = self.paths[0]
         self.evaluation_id = evaluation_id
-        self._acquired = False
+        self._document = {
+            "evaluation_id": evaluation_id,
+            "pid": os.getpid(),
+            "endpoint": endpoint,
+            "slot": slot,
+            "ports": canonical_ports,
+            "group": group,
+        }
+        self._acquired_paths: list[Path] = []
         self._release_on_exit = True
 
     def acquire(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        document = {"evaluation_id": self.evaluation_id, "pid": os.getpid()}
+        acquired: list[Path] = []
         try:
-            descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
+            for path in self.paths:
+                self._acquire_path(path)
+                acquired.append(path)
+        except Exception:
+            for path in reversed(acquired):
+                self._release_path(path)
+            raise
+        self._acquired_paths = acquired
+
+    def _acquire_path(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        while True:
             try:
-                existing: Any = json.loads(self.path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                existing = {}
-            if existing.get("evaluation_id") == self.evaluation_id:
-                owner_pid = existing.get("pid")
-                if isinstance(owner_pid, int) and self._pid_is_alive(owner_pid):
-                    raise PortGroupLockedError(
-                        f"Evaluation Run {self.evaluation_id} is active in process {owner_pid}"
-                    ) from None
+                descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
                 try:
-                    self.path.unlink()
-                except OSError as exc:
-                    raise PortGroupLockedError(
-                        f"cannot take over stale lock for Evaluation Run {self.evaluation_id}"
-                    ) from exc
-                self.acquire()
-                return
-            owner = existing.get("evaluation_id", "unknown")
-            raise PortGroupLockedError(
-                f"BPS port group is locked by Evaluation Run {owner}"
-            ) from None
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(document, handle)
-        self._acquired = True
+                    existing: Any = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    existing = {}
+                if existing.get("evaluation_id") == self.evaluation_id:
+                    owner_pid = existing.get("pid")
+                    if isinstance(owner_pid, int) and self._pid_is_alive(owner_pid):
+                        raise PortGroupLockedError(
+                            f"Evaluation Run {self.evaluation_id} is active in process {owner_pid}"
+                        ) from None
+                    try:
+                        path.unlink()
+                    except OSError as exc:
+                        raise PortGroupLockedError(
+                            f"cannot take over stale lock for Evaluation Run {self.evaluation_id}"
+                        ) from exc
+                    continue
+                owner = existing.get("evaluation_id", "unknown")
+                raise PortGroupLockedError(
+                    f"BPS port is locked by Evaluation Run {owner}"
+                ) from None
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(self._document, handle)
+            return
+
+    def _release_path(self, path: Path) -> None:
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+        if existing.get("evaluation_id") == self.evaluation_id:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                raise PortGroupLockedError(
+                    f"cannot release port lock for Evaluation Run {self.evaluation_id}"
+                ) from exc
 
     @staticmethod
     def _pid_is_alive(pid: int) -> bool:
@@ -100,15 +142,12 @@ class PortGroupLock:
         return True
 
     def release(self) -> None:
-        if not self._acquired:
-            return
+        paths = tuple(self._acquired_paths)
         try:
-            existing = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            existing = {}
-        if existing.get("evaluation_id") == self.evaluation_id:
-            self.path.unlink(missing_ok=True)
-        self._acquired = False
+            for path in reversed(paths):
+                self._release_path(path)
+        finally:
+            self._acquired_paths.clear()
 
     def preserve(self) -> None:
         """Keep the lock file when live BPS state requires human recovery."""

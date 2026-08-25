@@ -538,7 +538,11 @@ def build_graph(
         if outcome is None:
             last = attempts[-1] if attempts else None
             if last and last.verdict and last.verdict.verdict == VerdictValue.PASS:
-                outcome = EvaluationOutcome.PASSED.value
+                outcome = (
+                    EvaluationOutcome.PASSED.value
+                    if last.number == 1
+                    else EvaluationOutcome.DEGRADED_PASS.value
+                )
             elif last and last.verdict and last.verdict.verdict == VerdictValue.RETRY:
                 outcome = EvaluationOutcome.NOT_PASSED.value
             else:

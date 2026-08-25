@@ -383,6 +383,87 @@ def test_bps_completion_requires_report_when_run_was_never_observed() -> None:
     assert report_checks == polls == 2
 
 
+def test_bps_temporary_disappearance_does_not_complete_without_ready_report() -> None:
+    running_responses: list[list[dict[str, Any]]] = [
+        [{"id": "TEST-1873", "completed": False}],
+        [],
+        [],
+        [{"id": "TEST-1873", "completed": True}],
+    ]
+    report_checks = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal report_checks
+        if request.url.path.endswith("/topology/runningTest"):
+            return httpx.Response(200, json=running_responses.pop(0))
+        if request.url.path.endswith("/reports/operations/getReportContents"):
+            report_checks += 1
+            return httpx.Response(503, json={"message": "not ready"})
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    client = BpsClient(
+        BpsConfig(
+            endpoint="https://bps.example.test",
+            template="template",
+            slot=4,
+            ports=(4, 5),
+            group=10,
+            poll_interval_seconds=0.001,
+            run_timeout_seconds=1,
+            registration_grace_seconds=0,
+        ),
+        username="user",
+        password="password",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    completion = client.wait_for_completion("1873", lambda: None)
+
+    assert completion.details["completion"] == "explicit-terminal-state"
+    assert report_checks == 2
+    assert running_responses == []
+
+
+def test_bps_seen_run_disappearance_requires_ready_report() -> None:
+    running_responses: list[list[dict[str, Any]]] = [
+        [{"id": "TEST-1873", "completed": False}],
+        [],
+        [],
+    ]
+    report_responses = [
+        httpx.Response(503, json={"message": "not ready"}),
+        httpx.Response(200, json={"sections": ["3.2"]}),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/topology/runningTest"):
+            return httpx.Response(200, json=running_responses.pop(0))
+        if request.url.path.endswith("/reports/operations/getReportContents"):
+            return report_responses.pop(0)
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    client = BpsClient(
+        BpsConfig(
+            endpoint="https://bps.example.test",
+            template="template",
+            slot=4,
+            ports=(4, 5),
+            group=10,
+            poll_interval_seconds=0.001,
+            run_timeout_seconds=1,
+            registration_grace_seconds=0,
+        ),
+        username="user",
+        password="password",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    completion = client.wait_for_completion("1873", lambda: None)
+
+    assert completion.details["completion"] == "running-test-absent-and-report-ready"
+    assert report_responses == []
+
+
 def test_bps_export_report_uses_runtime_section_selection(tmp_path: Path) -> None:
     captured: dict[str, Any] = {}
 

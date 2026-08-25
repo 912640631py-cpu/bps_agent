@@ -86,7 +86,8 @@ python -m bps_agent replay --evidence artifacts\EVALUATION_ID\attempt-01\evidenc
 
 最终 Outcome：
 
-- `PASSED`：某次 Attempt 被 LLM 判定为 `pass`。
+- `PASSED`：首次目标流量的 Attempt 被 LLM 判定为 `pass`。
+- `DEGRADED_PASS`：首次目标未通过，但某个降载 Attempt 被判定为 `pass`。
 - `NOT_PASSED`：五次 Attempt 均返回 `retry`。
 - `INCONCLUSIVE`：证据不完整或外部接口失败。
 
