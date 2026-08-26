@@ -379,6 +379,34 @@ def test_dut_keepalive_failure_is_a_non_fatal_attempt_warning(
     assert any("DUT keepalive failed" in error for error in result["attempts"][0]["errors"])
 
 
+def test_port_release_failure_does_not_erase_confirmed_run_terminal_state(
+    app_config: AppConfig,
+) -> None:
+    class ReleaseFailingBps(FakeBps):
+        def release_ports(self) -> None:
+            super().release_ports()
+            raise RuntimeError("release retries exhausted")
+
+    clock = FakeClock()
+    bps = ReleaseFailingBps(clock)
+
+    result = run_graph(
+        app_config,
+        bps,
+        FakeDut(keepalive_failure=True),
+        FakeJudge([VerdictValue.PASS]),
+        clock,
+    )
+
+    attempt = result["attempts"][0]
+    assert result["outcome"] == EvaluationOutcome.INCONCLUSIVE.value
+    assert attempt["terminal_confirmed"] is True
+    assert attempt["traffic_finished_at"] is not None
+    assert attempt["ports_reserved"] is True
+    assert bps.stop_count == 0
+    assert result["error"].startswith("BPS port release failed after confirmed terminal state:")
+
+
 def test_five_retry_verdicts_reduce_bandwidth_then_end_not_passed(
     app_config: AppConfig,
 ) -> None:

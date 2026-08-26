@@ -7,7 +7,7 @@ from typing import Any
 import httpx
 import pytest
 
-from bps_agent.adapters.bps import BpsClient
+from bps_agent.adapters.bps import BpsClient, PortReleaseError
 from bps_agent.adapters.deepseek import DeepSeekJudge
 from bps_agent.adapters.dut import DutClient
 from bps_agent.models import (
@@ -462,6 +462,64 @@ def test_bps_seen_run_disappearance_requires_ready_report() -> None:
 
     assert completion.details["completion"] == "running-test-absent-and-report-ready"
     assert report_responses == []
+
+
+def test_bps_port_release_retries_a_transient_bad_request() -> None:
+    statuses = [400, 204]
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(statuses.pop(0), json={"message": "run cleanup pending"})
+
+    client = BpsClient(
+        BpsConfig(
+            endpoint="https://bps.example.test",
+            template="template",
+            slot=4,
+            ports=(4, 5),
+            group=10,
+            port_release_attempts=2,
+            port_release_retry_backoff_seconds=0,
+        ),
+        username="user",
+        password="password",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    client.release_ports()
+
+    assert len(requests) == 2
+    assert statuses == []
+
+
+def test_bps_port_release_reports_retry_exhaustion_separately() -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(400, json={"message": "run cleanup pending"})
+
+    client = BpsClient(
+        BpsConfig(
+            endpoint="https://bps.example.test",
+            template="template",
+            slot=4,
+            ports=(4, 5),
+            group=10,
+            port_release_attempts=3,
+            port_release_retry_backoff_seconds=0,
+        ),
+        username="user",
+        password="password",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(PortReleaseError, match=r"after 3 attempts.*HTTP 400"):
+        client.release_ports()
+
+    assert calls == 3
 
 
 def test_bps_export_report_uses_runtime_section_selection(tmp_path: Path) -> None:

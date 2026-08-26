@@ -58,6 +58,7 @@ python -m bps_agent replay --evidence artifacts\EVALUATION_ID\attempt-01\evidenc
 ```
 
 恢复运行时不能使用模板、端口或带宽覆盖参数。DUT CAPTCHA 由操作者输入且不会保存。
+端口互斥由 BPS 的非强制预留负责；项目不再维护本地端口锁文件。
 
 ## 降载策略
 

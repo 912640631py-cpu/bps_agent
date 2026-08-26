@@ -10,6 +10,8 @@ bps:
   poll_interval_seconds: 5
   run_timeout_seconds: 7200
   registration_grace_seconds: 30
+  port_release_attempts: 6
+  port_release_retry_backoff_seconds: 5
   report_poll_interval_seconds: 10
   report_attempts: 30
   report_type: CSV
@@ -51,7 +53,6 @@ llm:
 storage:
   artifact_dir: artifacts
   checkpoint_db: .state/checkpoints.sqlite3
-  lock_dir: .state/locks
 
 evaluation:
   max_attempts: 5

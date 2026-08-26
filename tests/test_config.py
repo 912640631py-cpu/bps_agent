@@ -12,6 +12,8 @@ def test_demo_configuration_matches_real_lab_defaults() -> None:
     assert config.bps.template == "ai_bps_puyu"
     assert config.bps.ports == (4, 5)
     assert config.bps.total_bandwidth_mbps == 400.0
+    assert config.bps.port_release_attempts == 6
+    assert config.bps.port_release_retry_backoff_seconds == 5
     assert "report_section_ids" not in config.bps.model_dump()
     assert config.dut.endpoint == "https://10.66.246.133"
     assert config.dut.interfaces == ("T1/1", "T1/2")
@@ -21,6 +23,7 @@ def test_demo_configuration_matches_real_lab_defaults() -> None:
     assert config.llm.company.model == "deepseek-v4-flash-0731"
     assert config.llm.official.model == "deepseek-v4-flash"
     assert config.evaluation.max_attempts == 5
+    assert "lock_dir" not in config.storage.model_dump()
 
 
 def test_serialized_configuration_contains_no_secret_values() -> None:

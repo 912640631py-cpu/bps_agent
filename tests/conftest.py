@@ -33,7 +33,6 @@ def app_config(tmp_path: Path) -> AppConfig:
         "storage": {
             "artifact_dir": tmp_path / "artifacts",
             "checkpoint_db": tmp_path / "state.sqlite3",
-            "lock_dir": tmp_path / "locks",
         },
     }
     return AppConfig.model_validate(document)

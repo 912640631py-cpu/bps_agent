@@ -77,6 +77,8 @@ class BpsConfig(StrictModel):
     poll_interval_seconds: float = Field(default=5.0, gt=0)
     run_timeout_seconds: float = Field(default=7200.0, gt=0)
     registration_grace_seconds: float = Field(default=30.0, ge=0)
+    port_release_attempts: int = Field(default=6, ge=1)
+    port_release_retry_backoff_seconds: float = Field(default=5.0, ge=0)
     report_poll_interval_seconds: float = Field(default=10.0, gt=0)
     report_attempts: int = Field(default=30, ge=1)
     report_type: Literal["CSV"] = "CSV"
@@ -170,7 +172,6 @@ class LlmConfig(StrictModel):
 class StorageConfig(StrictModel):
     artifact_dir: Path = Path("artifacts")
     checkpoint_db: Path = Path(".state/checkpoints.sqlite3")
-    lock_dir: Path = Path(".state/locks")
 
 
 class EvaluationConfig(StrictModel):

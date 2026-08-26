@@ -236,16 +236,6 @@ def build_graph(
             completion = services.bps.wait_for_completion(attempt.bps_run_id, keepalive_if_due)
             if not completion.terminal:
                 raise RuntimeError("BPS adapter did not confirm a terminal run state")
-            traffic_finished_at = utc_now()
-            services.bps.release_ports()
-            attempt = attempt.model_copy(
-                update={
-                    "traffic_finished_at": traffic_finished_at,
-                    "bps_run_details": completion.details,
-                    "terminal_confirmed": True,
-                    "ports_reserved": False,
-                }
-            )
         except Exception as exc:
             attempt = _append_error(attempt, f"BPS monitoring failed: {exc}")
             run_id = attempt.bps_run_id
@@ -255,18 +245,9 @@ def build_graph(
                 completion = services.bps.wait_for_completion(run_id, lambda: None)
                 if not completion.terminal:
                     raise RuntimeError("stopped run did not reach a confirmed terminal state")
-                traffic_finished_at = utc_now()
-                services.bps.release_ports()
-                attempt = attempt.model_copy(
-                    update={
-                        "traffic_finished_at": traffic_finished_at,
-                        "terminal_confirmed": True,
-                        "ports_reserved": False,
-                        "bps_run_details": completion.details,
-                    }
-                )
             except Exception as recovery_exc:
-                attempt = _append_error(attempt, f"manual recovery required: {recovery_exc}")
+                recovery_error = f"manual recovery required: {recovery_exc}"
+                attempt = _append_error(attempt, recovery_error)
                 for message in keepalive_errors:
                     attempt = _append_error(attempt, message)
                 attempts = _replace_last(state, attempt)
@@ -276,8 +257,33 @@ def build_graph(
                 return {
                     "attempts": attempts,
                     "outcome": EvaluationOutcome.INCONCLUSIVE.value,
-                    "error": attempt.errors[-1],
+                    "error": recovery_error,
                 }
+
+        attempt = attempt.model_copy(
+            update={
+                "traffic_finished_at": utc_now(),
+                "bps_run_details": completion.details,
+                "terminal_confirmed": True,
+            }
+        )
+        try:
+            services.bps.release_ports()
+        except Exception as exc:
+            release_error = f"BPS port release failed after confirmed terminal state: {exc}"
+            attempt = _append_error(attempt, release_error)
+            for message in keepalive_errors:
+                attempt = _append_error(attempt, message)
+            attempts = _replace_last(state, attempt)
+            services.artifacts.write_attempt_json(
+                state["evaluation_id"], attempt.number, "attempt.json", attempt
+            )
+            return {
+                "attempts": attempts,
+                "outcome": EvaluationOutcome.INCONCLUSIVE.value,
+                "error": release_error,
+            }
+        attempt = attempt.model_copy(update={"ports_reserved": False})
 
         for message in keepalive_errors:
             attempt = _append_error(attempt, message)

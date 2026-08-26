@@ -148,10 +148,10 @@ def test_resume_loads_runtime_configuration_from_checkpoint(app_config: AppConfi
     builder.add_edge(START, "finish")
     builder.add_edge("finish", END)
     invocation = {"configurable": {"thread_id": "resume-config"}}
+    checkpoint_config = app_config.model_dump(mode="json")
+    checkpoint_config["storage"]["lock_dir"] = ".state/legacy-locks"
     with SqliteSaver.from_conn_string(str(app_config.storage.checkpoint_db)) as saver:
-        builder.compile(checkpointer=saver).invoke(
-            {"config": app_config.model_dump(mode="json")}, config=invocation
-        )
+        builder.compile(checkpointer=saver).invoke({"config": checkpoint_config}, config=invocation)
 
     changed = app_config.model_copy(
         update={
@@ -167,7 +167,7 @@ def test_resume_loads_runtime_configuration_from_checkpoint(app_config: AppConfi
     assert restored == app_config
 
 
-def test_console_verdict_contains_summary_and_observations_only() -> None:
+def test_console_verdict_contains_the_complete_parsed_document() -> None:
     attempt = AttemptRecord(
         number=1,
         started_at="2026-08-24T00:00:00+00:00",
@@ -175,6 +175,7 @@ def test_console_verdict_contains_summary_and_observations_only() -> None:
             verdict=VerdictValue.PASS,
             summary="test passed",
             observations=["BPS criteria passed", "DUT remained healthy"],
+            risks=["fixture risk"],
             confidence=0.95,
         ),
     )
@@ -182,8 +183,14 @@ def test_console_verdict_contains_summary_and_observations_only() -> None:
     selected = _verdict_console_fields({"attempts": [attempt.model_dump(mode="json")]})
 
     assert selected == {
-        "summary": "test passed",
-        "observations": ["BPS criteria passed", "DUT remained healthy"],
+        "parsed": {
+            "verdict": "pass",
+            "schema_version": "dev-1",
+            "summary": "test passed",
+            "observations": ["BPS criteria passed", "DUT remained healthy"],
+            "risks": ["fixture risk"],
+            "confidence": 0.95,
+        }
     }
 
 

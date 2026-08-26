@@ -28,7 +28,6 @@ from bps_agent.credentials import (
     CredentialStore,
 )
 from bps_agent.graph import EvaluationServices, SystemClock, build_graph, initial_state
-from bps_agent.locking import PortGroupLock
 from bps_agent.models import AppConfig, AttemptRecord, EvaluationOutcome, EvidenceBundle
 
 LOGGER = logging.getLogger(__name__)
@@ -137,13 +136,7 @@ def _verdict_console_fields(result: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if verdict is None:
         return None
-    document = verdict.model_dump(mode="json")
-    selected = {
-        name: document[name]
-        for name in ("summary", "observations")
-        if document.get(name) is not None
-    }
-    return selected or None
+    return {"parsed": verdict.model_dump(mode="json")}
 
 
 def _apply_bps_overrides(
@@ -183,8 +176,14 @@ def _load_resume_config(current_config: AppConfig, resume_id: str) -> AppConfig:
     channel_values = checkpoint_tuple.checkpoint.get("channel_values")
     if not isinstance(channel_values, dict) or not isinstance(channel_values.get("config"), dict):
         raise ValueError(f"checkpoint for Evaluation Run {resume_id} omitted its configuration")
+    checkpoint_config = dict(channel_values["config"])
+    storage = checkpoint_config.get("storage")
+    if isinstance(storage, dict) and "lock_dir" in storage:
+        checkpoint_config["storage"] = {
+            name: value for name, value in storage.items() if name != "lock_dir"
+        }
     try:
-        restored = AppConfig.model_validate(channel_values["config"])
+        restored = AppConfig.model_validate(checkpoint_config)
     except ValueError as exc:
         raise ValueError(
             f"checkpoint for Evaluation Run {resume_id} contains an invalid configuration"
@@ -218,14 +217,6 @@ def run_live(
     store = credential_store or CredentialStore()
     evaluation_id = resume_id or str(uuid4())
     artifacts = ArtifactStore(config.storage.artifact_dir)
-    lock = PortGroupLock(
-        config.storage.lock_dir,
-        endpoint=config.bps.endpoint,
-        slot=config.bps.slot,
-        ports=config.bps.ports,
-        group=config.bps.group,
-        evaluation_id=evaluation_id,
-    )
     judge: DeepSeekJudge | _EvidenceOnlyJudge | None = None
     bps: BpsClient | None = None
     dut: DutClient | None = None
@@ -255,7 +246,7 @@ def run_live(
         print("Authenticating to DUT (CAPTCHA required)...")
         dut.authenticate()
         config.storage.checkpoint_db.parent.mkdir(parents=True, exist_ok=True)
-        with lock, SqliteSaver.from_conn_string(str(config.storage.checkpoint_db)) as saver:
+        with SqliteSaver.from_conn_string(str(config.storage.checkpoint_db)) as saver:
             services = EvaluationServices(
                 config=config,
                 bps=bps,
@@ -282,7 +273,6 @@ def run_live(
                         initial_state(evaluation_id, config), config=invocation_config
                     )
             except BaseException:
-                lock.preserve()
                 with suppress(Exception):
                     snapshot = graph.get_state(invocation_config)
                     attempts = snapshot.values.get("attempts", []) if snapshot.values else []
@@ -296,8 +286,6 @@ def run_live(
                                 active.bps_run_id,
                             )
                 raise
-            if _has_unsafe_reservation(result):
-                lock.preserve()
             if stop_before_llm and result.get("outcome") is None:
                 snapshot = graph.get_state(invocation_config)
                 if snapshot.next != ("adjudicate",):
@@ -332,15 +320,15 @@ def run_live(
             print(f"Audit result: {result['final_artifact']}")
         return EXIT_CODES.get(outcome, 4)
     except KeyboardInterrupt:
-        lock.preserve()
         LOGGER.error(
-            "Interrupted. The local port-group lock was preserved; "
-            "inspect BPS state before cleanup."
+            "Interrupted. Inspect BPS run and reservation state before starting another Evaluation."
         )
         return 130
     finally:
         if result is not None and _has_unsafe_reservation(result):
-            LOGGER.error("BPS reservation state is ambiguous; local lock was preserved")
+            LOGGER.error(
+                "BPS reservation state is ambiguous; inspect BPS before starting another Evaluation"
+            )
         if dut is not None:
             dut.close()
         if bps is not None:

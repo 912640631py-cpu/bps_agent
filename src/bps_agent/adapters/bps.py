@@ -20,6 +20,7 @@ from bps_agent.models import BpsConfig, RunCompletion
 
 _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _RETRYABLE_REPORT_STATUSES = {404, 409, 500, 503}
+_RETRYABLE_PORT_RELEASE_STATUSES = {400, 409, 423, 500, 502, 503, 504}
 _EXPLICIT_TERMINAL_STATES = {
     "aborted",
     "complete",
@@ -33,6 +34,10 @@ _EXPLICIT_TERMINAL_STATES = {
 
 
 class PortOccupiedError(RuntimeError):
+    pass
+
+
+class PortReleaseError(RuntimeError):
     pass
 
 
@@ -283,18 +288,39 @@ class BpsClient:
         response.raise_for_status()
 
     def release_ports(self) -> None:
-        self._checked(
-            self._request(
-                "POST",
-                "/bps/api/v2/core/topology/operations/unreserve",
-                json={
-                    "unreservation": [
-                        {"slot": self.config.slot, "port": port} for port in self.config.ports
-                    ]
-                },
-                timeout=60,
-            )
-        )
+        attempts = self.config.port_release_attempts
+        last_failure = "unknown failure"
+        last_cause: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                response = self._request(
+                    "POST",
+                    "/bps/api/v2/core/topology/operations/unreserve",
+                    json={
+                        "unreservation": [
+                            {"slot": self.config.slot, "port": port} for port in self.config.ports
+                        ]
+                    },
+                    timeout=60,
+                )
+            except httpx.TransportError as exc:
+                last_failure = type(exc).__name__
+                last_cause = exc
+            else:
+                last_cause = None
+                if response.is_success:
+                    return
+                last_failure = f"HTTP {response.status_code}"
+                if response.status_code not in _RETRYABLE_PORT_RELEASE_STATUSES:
+                    raise PortReleaseError(
+                        f"BPS rejected port release without retry ({last_failure})"
+                    )
+            if attempt < attempts:
+                time.sleep(self.config.port_release_retry_backoff_seconds)
+        message = f"BPS port release failed after {attempts} attempts ({last_failure})"
+        if last_cause is not None:
+            raise PortReleaseError(message) from last_cause
+        raise PortReleaseError(message)
 
     def set_total_bandwidth(self, percentage: float) -> None:
         numeric_percentage = float(percentage)
