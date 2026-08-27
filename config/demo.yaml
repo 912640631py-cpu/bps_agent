@@ -19,14 +19,24 @@ bps:
   max_report_bytes: 52428800
 
 dut:
-  endpoint: https://10.66.246.133
+  collection_method: frontend_api
   interfaces: [T1/1, T1/2]
-  verify_tls: false
-  cooldown_seconds: 10
-  keepalive_interval_seconds: 60
-  baseline_seconds: 600
-  read_attempts: 3
-  read_retry_backoff_seconds: 0.5
+  backend:
+    host: 10.66.246.156
+    port: 50023
+    interval_seconds: 10
+    connect_timeout_seconds: 10
+    command_timeout_seconds: 30
+    read_attempts: 3
+    read_retry_backoff_seconds: 0.5
+  frontend:
+    endpoint: https://10.66.246.133
+    verify_tls: false
+    cooldown_seconds: 10
+    keepalive_interval_seconds: 60
+    baseline_seconds: 600
+    read_attempts: 3
+    read_retry_backoff_seconds: 0.5
 
 assessment:
   goal: 验证 DUT 在指定并发和带宽下的资源与转发表现

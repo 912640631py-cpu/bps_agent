@@ -6,7 +6,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -43,6 +43,11 @@ class EvaluationOutcome(StrEnum):
 class EvaluationMode(StrEnum):
     BPS_AND_DUT = "bps_and_dut"
     BPS_ONLY = "bps_only"
+
+
+class DutCollectionMethod(StrEnum):
+    BACKEND_SSH = "backend_ssh"
+    FRONTEND_API = "frontend_api"
 
 
 class VerdictValue(StrEnum):
@@ -107,9 +112,26 @@ class BpsConfig(StrictModel):
         return value
 
 
-class DutConfig(StrictModel):
+class DutBackendConfig(StrictModel):
+    host: str = "10.66.246.156"
+    port: int = Field(default=50023, ge=1, le=65535)
+    interval_seconds: float = Field(default=10.0, gt=0)
+    connect_timeout_seconds: float = Field(default=10.0, gt=0)
+    command_timeout_seconds: float = Field(default=30.0, gt=0)
+    read_attempts: int = Field(default=3, ge=1)
+    read_retry_backoff_seconds: float = Field(default=0.5, ge=0)
+
+    @field_validator("host")
+    @classmethod
+    def validate_host(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("DUT backend host must not be empty")
+        return value
+
+
+class DutFrontendConfig(StrictModel):
     endpoint: str
-    interfaces: tuple[str, ...]
     verify_tls: bool = False
     cooldown_seconds: float = Field(default=10.0, ge=0)
     keepalive_interval_seconds: float = Field(default=60.0, gt=0)
@@ -123,6 +145,34 @@ class DutConfig(StrictModel):
     def validate_https_endpoint(cls, value: str) -> str:
         return _validated_https_url(value, "DUT endpoint")
 
+
+class DutConfig(StrictModel):
+    collection_method: DutCollectionMethod = DutCollectionMethod.FRONTEND_API
+    interfaces: tuple[str, ...]
+    backend: DutBackendConfig = DutBackendConfig()
+    frontend: DutFrontendConfig | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def upgrade_legacy_frontend_config(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or "endpoint" not in value:
+            return value
+        document = dict(value)
+        legacy_names = {
+            "endpoint",
+            "verify_tls",
+            "cooldown_seconds",
+            "keepalive_interval_seconds",
+            "baseline_seconds",
+            "read_attempts",
+            "read_retry_backoff_seconds",
+            "period",
+        }
+        frontend = {name: document.pop(name) for name in legacy_names if name in document}
+        document.setdefault("collection_method", DutCollectionMethod.FRONTEND_API.value)
+        document.setdefault("frontend", frontend)
+        return document
+
     @field_validator("interfaces")
     @classmethod
     def validate_interfaces(cls, value: tuple[str, ...]) -> tuple[str, ...]:
@@ -132,6 +182,12 @@ class DutConfig(StrictModel):
         if len(set(cleaned)) != len(cleaned):
             raise ValueError("DUT interfaces must be unique")
         return cleaned
+
+    @model_validator(mode="after")
+    def require_selected_configuration(self) -> DutConfig:
+        if self.collection_method == DutCollectionMethod.FRONTEND_API and self.frontend is None:
+            raise ValueError("frontend_api DUT collection requires dut.frontend")
+        return self
 
 
 class AssessmentConfig(StrictModel):
@@ -418,6 +474,59 @@ class VerdictDocument(BaseModel):
     schema_version: str = "dev-1"
 
 
+class BackendDutTarget(StrictModel):
+    host: str
+    port: int
+    transport: Literal["ssh"] = "ssh"
+    backend: Literal["PHP Dashboard/SystemChart.php"] = "PHP Dashboard/SystemChart.php"
+
+
+class BackendDutEvidence(StrictModel):
+    collection_method: Literal[DutCollectionMethod.BACKEND_SSH] = DutCollectionMethod.BACKEND_SSH
+    target: BackendDutTarget
+    interfaces: tuple[str, ...]
+    traffic_started_at: str
+    traffic_finished_at: str
+    interval_seconds: float
+    successful_sample_count: int = Field(ge=0)
+    failed_sample_count: int = Field(ge=0)
+    errors: tuple[dict[str, Any], ...] = ()
+    metrics_csv: str
+
+
+class FrontendDutEvidence(StrictModel):
+    collection_method: Literal[DutCollectionMethod.FRONTEND_API] = DutCollectionMethod.FRONTEND_API
+    endpoint: str
+    interfaces: tuple[str, ...]
+    traffic_started_at: str
+    traffic_finished_at: str
+    observations: DutObservations
+    before: SupplementalSnapshot
+    after: SupplementalSnapshot
+    warnings: tuple[str, ...] = ()
+
+    @field_validator("observations", mode="before")
+    @classmethod
+    def upgrade_legacy_observations(cls, value: Any) -> Any:
+        if isinstance(value, (list, tuple)):
+            observations = tuple(ResourceObservation.model_validate(item) for item in value)
+            return DutObservations.from_resource_observations(observations)
+        return value
+
+
+DutEvidence = Annotated[
+    BackendDutEvidence | FrontendDutEvidence,
+    Field(discriminator="collection_method"),
+]
+
+
+class DutCaptureResult(StrictModel):
+    evidence: DutEvidence
+    raw_artifact_path: str | None = None
+    csv_artifact_path: str | None = None
+    warnings: tuple[str, ...] = ()
+
+
 class EvidenceBundle(StrictModel):
     evaluation_mode: EvaluationMode = EvaluationMode.BPS_AND_DUT
     evaluation_id: str
@@ -433,53 +542,52 @@ class EvidenceBundle(StrictModel):
     bps_performance_analysis: PerformanceTimeseriesAnalysis | None = None
     bps_report_toc: Any | None = Field(default=None, exclude=True)
     assessment: AssessmentConfig
-    dut_endpoint: str | None = None
-    dut_interfaces: tuple[str, ...] | None = None
     traffic_started_at: str
     traffic_finished_at: str
-    dut_observations: DutObservations | None = None
-    dut_before: SupplementalSnapshot | None = None
-    dut_after: SupplementalSnapshot | None = None
+    dut_evidence: DutEvidence | None = None
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
 
-    @field_validator("dut_observations", mode="before")
+    @model_validator(mode="before")
     @classmethod
-    def upgrade_legacy_dut_observations(cls, value: Any) -> Any:
-        if isinstance(value, (list, tuple)):
-            observations = tuple(ResourceObservation.model_validate(item) for item in value)
-            return DutObservations.from_resource_observations(observations)
-        return value
+    def upgrade_legacy_dut_evidence(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        document = dict(value)
+        legacy_names = (
+            "dut_endpoint",
+            "dut_interfaces",
+            "dut_observations",
+            "dut_before",
+            "dut_after",
+        )
+        has_legacy_evidence = all(document.get(name) is not None for name in legacy_names)
+        if "dut_evidence" not in document and has_legacy_evidence:
+            document["dut_evidence"] = {
+                "collection_method": DutCollectionMethod.FRONTEND_API.value,
+                "endpoint": document["dut_endpoint"],
+                "interfaces": document["dut_interfaces"],
+                "traffic_started_at": document.get("traffic_started_at"),
+                "traffic_finished_at": document.get("traffic_finished_at"),
+                "observations": document["dut_observations"],
+                "before": document["dut_before"],
+                "after": document["dut_after"],
+            }
+        for name in legacy_names:
+            document.pop(name, None)
+        return document
 
     @model_validator(mode="after")
     def validate_evidence_for_mode(self) -> EvidenceBundle:
-        dut_fields = (
-            self.dut_endpoint,
-            self.dut_interfaces,
-            self.dut_observations,
-            self.dut_before,
-            self.dut_after,
-        )
-        if self.evaluation_mode == EvaluationMode.BPS_AND_DUT and any(
-            value is None for value in dut_fields
-        ):
-            raise ValueError("bps_and_dut Evidence requires complete DUT fields")
-        if self.evaluation_mode == EvaluationMode.BPS_ONLY and any(
-            value is not None for value in dut_fields
-        ):
-            raise ValueError("bps_only Evidence must omit DUT fields")
+        if self.evaluation_mode == EvaluationMode.BPS_AND_DUT and self.dut_evidence is None:
+            raise ValueError("bps_and_dut Evidence requires DUT evidence")
+        if self.evaluation_mode == EvaluationMode.BPS_ONLY and self.dut_evidence is not None:
+            raise ValueError("bps_only Evidence must omit DUT evidence")
         return self
 
     def as_document(self) -> dict[str, Any]:
         document = self.model_dump(mode="json")
         if self.evaluation_mode == EvaluationMode.BPS_ONLY:
-            for name in (
-                "dut_endpoint",
-                "dut_interfaces",
-                "dut_observations",
-                "dut_before",
-                "dut_after",
-            ):
-                document.pop(name, None)
+            document.pop("dut_evidence", None)
         return document
 
 
@@ -494,9 +602,15 @@ class AttemptRecord(StrictModel):
     traffic_finished_at: str | None = None
     bps_template_metadata: dict[str, Any] = Field(default_factory=dict)
     bps_run_details: dict[str, Any] = Field(default_factory=dict)
+    # Retained only so checkpoints created by the previous frontend collector remain readable.
     dut_observations: tuple[ResourceObservation, ...] = ()
     dut_before: SupplementalSnapshot | None = None
     dut_after: SupplementalSnapshot | None = None
+    dut_collection_method: DutCollectionMethod | None = None
+    dut_raw_artifact_path: str | None = None
+    dut_csv_artifact_path: str | None = None
+    dut_successful_sample_count: int | None = None
+    dut_failed_sample_count: int | None = None
     report_path: str | None = None
     performance_timeseries_path: str | None = None
     report_toc_path: str | None = None

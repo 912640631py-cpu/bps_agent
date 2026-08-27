@@ -95,6 +95,11 @@ def test_credentials_set_without_names_selects_all_at_management_boundary() -> N
     assert arguments.names == []
 
 
+def test_backend_dut_credentials_are_managed_separately() -> None:
+    assert "DUT_BACKEND_USERNAME" in SUPPORTED_CREDENTIALS
+    assert "DUT_BACKEND_PASSWORD" in SUPPORTED_CREDENTIALS
+
+
 def test_credentials_management_rejects_unsupported_name() -> None:
     arguments = _parser().parse_args(["credentials", "delete", "UNKNOWN_CREDENTIAL"])
 

@@ -30,7 +30,8 @@ python -m pip install -e '.[dev]'
 凭据保存在 Windows Credential Manager，不写入配置或审计文件：
 
 - `BPS_USERNAME`、`BPS_PASSWORD`
-- `DUT_USERNAME`、`DUT_PASSWORD`（BPS-only 模式不需要）
+- `DUT_USERNAME`、`DUT_PASSWORD`（默认前端采集）
+- `DUT_BACKEND_USERNAME`、`DUT_BACKEND_PASSWORD`（仅 SSH 后端采集）
 - `COMPANY_DEEPSEEK_API_KEY` 或 `DEEPSEEK_API_KEY`
 
 ```powershell
@@ -48,6 +49,11 @@ python -m bps_agent run
 # 临时覆盖模板、端口和首次流量目标
 python -m bps_agent run --template TEMPLATE --ports 4 5 --total-bandwidth-mbps 300
 
+# 临时覆盖 DUT SSH 后端目标、接口和采样间隔
+python -m bps_agent run --dut-collection-method backend_ssh `
+  --dut-host 10.66.246.156 --dut-port 50023 `
+  --dut-interface T1/1 --dut-interface T1/2 --dut-interval-seconds 10
+
 # 完成实机测试和 Evidence，在调用 LLM 前停止
 python -m bps_agent run --stop-before-llm
 
@@ -61,8 +67,11 @@ python -m bps_agent run --resume EVALUATION_ID
 python -m bps_agent replay --evidence artifacts\EVALUATION_ID\attempt-01\evidence.json
 ```
 
-恢复运行时不能使用模板、端口、带宽或模式覆盖参数。DUT CAPTCHA 由操作者输入且不会保存。
+恢复运行时不能使用模板、端口、带宽、DUT 或模式覆盖参数。
 也可以在 YAML 中设置 `evaluation.mode: bps_only`；默认值为 `bps_and_dut`。
+`dut.collection_method` 默认是 `frontend_api`，CAPTCHA 由操作者输入且不会保存。
+设置为 `backend_ssh` 后，采样从 BPS 打流开始持续到流量结束，不使用固定样本数，
+也不登录 DUT 前端或请求 CAPTCHA。当前 SSH 方式不读取、校验或持久化主机密钥。
 端口互斥由 BPS 的非强制预留负责；项目不再维护本地端口锁文件。
 
 ## 降载策略
@@ -85,7 +94,9 @@ python -m bps_agent replay --evidence artifacts\EVALUATION_ID\attempt-01\evidenc
 
 - `bps-report.csv`：测试参数、判据和结果，内容进入 `evidence.json`。
 - `bps-performance-timeseries.csv`：原始秒级性能数据，不进入 `evidence.json`。
-- `evidence.json`：BPS 报告、紧凑的 `bps_performance_analysis`，以及启用时的 DUT 观测。
+- `dut-metrics.json`：使用 SSH 后端方式时，保存逐次采样的完整审计数据和失败记录，不发送给 LLM。
+- `dut-metrics.csv`：使用 SSH 后端方式时，保存打流期间的紧凑 DUT 时序，正文进入 `evidence.json` 交给 LLM。
+- `evidence.json`：BPS 报告、紧凑的 `bps_performance_analysis`，以及启用时的 DUT 证据。
 - TOC、Section 解析结果、Attempt 和 Verdict 审计文件。
 
 性能时序按最近采样点对齐到 1 秒时间轴。Stable 负载下，吞吐下降超过约 10% 且持续至少 3 秒判为性能异常；下降超过约 20% 且持续至少 2 秒判为严重异常。Ramp-down 中吞吐与 Concurrent Flows 同步下降视为正常负载变化。

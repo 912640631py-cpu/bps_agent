@@ -15,13 +15,15 @@ from bps_agent.artifacts import ArtifactStore
 from bps_agent.models import (
     AppConfig,
     AttemptRecord,
+    BackendDutEvidence,
+    DutEvidence,
     DutObservations,
     EvaluationMode,
     EvaluationOutcome,
     EvidenceBundle,
+    FrontendDutEvidence,
     ObservationPhase,
     PerformanceTimeseriesAnalysis,
-    SupplementalSnapshot,
     VerdictValue,
     utc_now,
 )
@@ -100,6 +102,18 @@ def _has_minimum_monitoring(observations: DutObservations) -> bool:
     )
 
 
+def _dut_evidence_complete(evidence: DutEvidence) -> bool:
+    if isinstance(evidence, BackendDutEvidence):
+        return evidence.successful_sample_count > 0 and bool(evidence.metrics_csv.strip())
+    if isinstance(evidence, FrontendDutEvidence):
+        return bool(
+            evidence.before.is_complete
+            and evidence.after.is_complete
+            and _has_minimum_monitoring(evidence.observations)
+        )
+    return False
+
+
 def _template_total_bandwidth_mbps(metadata: dict[str, Any]) -> float:
     value = metadata.get("totalBandwidthMbps")
     if (
@@ -172,24 +186,29 @@ def build_graph(
             bps_total_bandwidth_percent=bandwidth_percent,
         )
         reserved = False
+        run_id: str | None = None
+        dut_started = False
         try:
-            before: SupplementalSnapshot | None = None
             if dut_enabled:
                 assert services.dut is not None
-                before = services.dut.collect_supplemental()
-                if not before.is_complete:
-                    raise RuntimeError("required pre-traffic DUT evidence is incomplete")
+                services.dut.prepare_attempt(
+                    services.artifacts.attempt_dir(state["evaluation_id"], attempt_number)
+                )
             services.bps.reserve_ports()
             reserved = True
             services.bps.set_total_bandwidth(bandwidth_percent)
             run_id = services.bps.start_run()
             traffic_started_at = utc_now()
+            if dut_enabled:
+                assert services.dut is not None
+                services.dut.traffic_started(traffic_started_at)
+                dut_started = True
             attempt = attempt.model_copy(
                 update={
                     "bps_run_id": run_id,
                     "traffic_started_at": traffic_started_at,
                     "bps_template_metadata": state["template_metadata"],
-                    "dut_before": before,
+                    "dut_collection_method": cfg.dut.collection_method if dut_enabled else None,
                     "ports_reserved": True,
                 }
             )
@@ -205,6 +224,16 @@ def build_graph(
             )
             return {"attempts": [*state["attempts"], attempt.model_dump(mode="json")]}
         except Exception as exc:
+            if run_id is not None:
+                try:
+                    services.bps.stop_run(run_id)
+                    completion = services.bps.wait_for_completion(run_id, lambda: None)
+                    if not completion.terminal:
+                        raise RuntimeError("stopped run did not reach a confirmed terminal state")
+                    if dut_started and services.dut is not None:
+                        services.dut.traffic_finished(utc_now())
+                except Exception as cleanup_exc:
+                    exc = RuntimeError(f"{exc}; BPS run cleanup failed: {cleanup_exc}")
             if reserved:
                 try:
                     services.bps.release_ports()
@@ -212,37 +241,22 @@ def build_graph(
                     exc = RuntimeError(f"{exc}; pre-run port cleanup failed: {cleanup_exc}")
             return {
                 "outcome": EvaluationOutcome.INCONCLUSIVE.value,
-                "error": f"Attempt preflight failed before BPS run creation: {exc}",
+                "error": f"Attempt start failed: {exc}",
             }
 
     def monitor_attempt(state: EvaluationState) -> dict[str, Any]:
         attempt = _attempts(state)[-1]
         assert attempt.bps_run_id is not None
-        next_keepalive = services.clock.monotonic() + cfg.dut.keepalive_interval_seconds
-        keepalive_errors: list[str] = []
-
-        def keepalive_if_due() -> None:
-            nonlocal next_keepalive
-            if not dut_enabled or services.dut is None:
-                return
-            if services.clock.monotonic() < next_keepalive:
-                return
-            try:
-                services.dut.keepalive()
-            except Exception as exc:
-                message = f"DUT keepalive failed: {exc}"
-                keepalive_errors.append(message)
-                LOGGER.warning(
-                    "Attempt %s DUT keepalive failed while BPS run %s remained active: %s",
-                    attempt.number,
-                    attempt.bps_run_id,
-                    exc,
-                )
-            finally:
-                next_keepalive = services.clock.monotonic() + cfg.dut.keepalive_interval_seconds
-
         try:
-            completion = services.bps.wait_for_completion(attempt.bps_run_id, keepalive_if_due)
+            if dut_enabled:
+                assert services.dut is not None
+                assert attempt.traffic_started_at is not None
+                services.dut.restore_attempt(
+                    services.artifacts.attempt_dir(state["evaluation_id"], attempt.number),
+                    attempt.traffic_started_at,
+                    None,
+                )
+            completion = services.bps.wait_for_completion(attempt.bps_run_id, lambda: None)
             if not completion.terminal:
                 raise RuntimeError("BPS adapter did not confirm a terminal run state")
         except Exception as exc:
@@ -257,8 +271,6 @@ def build_graph(
             except Exception as recovery_exc:
                 recovery_error = f"manual recovery required: {recovery_exc}"
                 attempt = _append_error(attempt, recovery_error)
-                for message in keepalive_errors:
-                    attempt = _append_error(attempt, message)
                 attempts = _replace_last(state, attempt)
                 services.artifacts.write_attempt_json(
                     state["evaluation_id"], attempt.number, "attempt.json", attempt
@@ -269,9 +281,16 @@ def build_graph(
                     "error": recovery_error,
                 }
 
+        traffic_finished_at = utc_now()
+        if dut_enabled:
+            assert services.dut is not None
+            try:
+                services.dut.traffic_finished(traffic_finished_at)
+            except Exception as exc:
+                attempt = _append_error(attempt, f"DUT collection stop failed: {exc}")
         attempt = attempt.model_copy(
             update={
-                "traffic_finished_at": utc_now(),
+                "traffic_finished_at": traffic_finished_at,
                 "bps_run_details": completion.details,
                 "terminal_confirmed": True,
             }
@@ -281,8 +300,6 @@ def build_graph(
         except Exception as exc:
             release_error = f"BPS port release failed after confirmed terminal state: {exc}"
             attempt = _append_error(attempt, release_error)
-            for message in keepalive_errors:
-                attempt = _append_error(attempt, message)
             attempts = _replace_last(state, attempt)
             services.artifacts.write_attempt_json(
                 state["evaluation_id"], attempt.number, "attempt.json", attempt
@@ -293,9 +310,6 @@ def build_graph(
                 "error": release_error,
             }
         attempt = attempt.model_copy(update={"ports_reserved": False})
-
-        for message in keepalive_errors:
-            attempt = _append_error(attempt, message)
         services.artifacts.write_attempt_json(
             state["evaluation_id"], attempt.number, "attempt.json", attempt
         )
@@ -304,44 +318,45 @@ def build_graph(
     def collect_evidence(state: EvaluationState) -> dict[str, Any]:
         attempt = _attempts(state)[-1]
         assert attempt.bps_run_id is not None
-        observations = list(attempt.dut_observations)
-        compact_observations: DutObservations | None = None
+        dut_evidence: DutEvidence | None = None
         report_text = ""
         report_toc: Any = None
         performance_analysis: PerformanceTimeseriesAnalysis | None = None
-        after: SupplementalSnapshot | None = None
         try:
             if not attempt.traffic_started_at or not attempt.traffic_finished_at:
                 raise RuntimeError("BPS traffic time window is incomplete")
             if dut_enabled:
                 assert services.dut is not None
-                services.clock.sleep(cfg.dut.cooldown_seconds)
-                before = attempt.dut_before
-                if before is None or not before.is_complete:
-                    raise RuntimeError("required pre-traffic DUT evidence is incomplete")
-                after = services.dut.collect_supplemental()
-                if not after.is_complete:
-                    raise RuntimeError("required post-traffic DUT evidence is incomplete")
-                observations = list(
-                    services.dut.collect_monitoring_window(
-                        attempt.traffic_started_at,
-                        attempt.traffic_finished_at,
-                        before,
-                        after,
-                    )
+                services.dut.restore_attempt(
+                    services.artifacts.attempt_dir(state["evaluation_id"], attempt.number),
+                    attempt.traffic_started_at,
+                    attempt.traffic_finished_at,
                 )
-                compact_observations = DutObservations.from_resource_observations(
-                    tuple(observations)
-                )
+                capture = services.dut.finalize_attempt()
+                dut_evidence = capture.evidence
+                for warning in capture.warnings:
+                    attempt = _append_error(attempt, warning)
                 services.artifacts.write_attempt_json(
                     state["evaluation_id"],
                     attempt.number,
-                    "dut-observations.json",
-                    compact_observations,
+                    "dut-evidence.json",
+                    dut_evidence,
                 )
-            report_toc = services.bps.wait_for_report(attempt.bps_run_id)
+                sample_updates: dict[str, Any] = {
+                    "dut_raw_artifact_path": capture.raw_artifact_path,
+                    "dut_csv_artifact_path": capture.csv_artifact_path,
+                }
+                if isinstance(dut_evidence, BackendDutEvidence):
+                    sample_updates.update(
+                        {
+                            "dut_successful_sample_count": (dut_evidence.successful_sample_count),
+                            "dut_failed_sample_count": dut_evidence.failed_sample_count,
+                        }
+                    )
+                attempt = attempt.model_copy(update=sample_updates)
             run_id = attempt.bps_run_id
             assert run_id is not None
+            report_toc = services.bps.wait_for_report(run_id)
             toc_path = services.artifacts.write_attempt_json(
                 state["evaluation_id"], attempt.number, "bps-report-toc.json", report_toc
             )
@@ -410,21 +425,8 @@ def build_graph(
             )
             performance_analysis = analyze_performance_timeseries(performance_path)
             report_text = report_path.read_text(encoding="utf-8-sig", errors="replace")
-            attempt = attempt.model_copy(
-                update={
-                    "dut_observations": tuple(observations),
-                    "dut_after": after,
-                }
-            )
         except Exception as exc:
             attempt = _append_error(attempt, f"evidence collection failed: {exc}")
-
-        attempt = attempt.model_copy(
-            update={
-                "dut_observations": tuple(observations),
-                "dut_after": after,
-            }
-        )
 
         bps_complete = bool(
             attempt.bps_run_id
@@ -434,12 +436,7 @@ def build_graph(
             and performance_analysis
         )
         dut_complete = not dut_enabled or bool(
-            attempt.dut_before
-            and attempt.dut_before.is_complete
-            and after
-            and after.is_complete
-            and compact_observations
-            and _has_minimum_monitoring(compact_observations)
+            dut_evidence is not None and _dut_evidence_complete(dut_evidence)
         )
         complete = bps_complete and dut_complete
         attempt = attempt.model_copy(update={"evidence_complete": complete})
@@ -463,13 +460,9 @@ def build_graph(
                 bps_report=report_text,
                 bps_performance_analysis=performance_analysis,
                 assessment=cfg.selected_assessment,
-                dut_endpoint=cfg.dut.endpoint if dut_enabled else None,
-                dut_interfaces=cfg.dut.interfaces if dut_enabled else None,
                 traffic_started_at=traffic_started_at,
                 traffic_finished_at=traffic_finished_at,
-                dut_observations=compact_observations if dut_enabled else None,
-                dut_before=attempt.dut_before if dut_enabled else None,
-                dut_after=after if dut_enabled else None,
+                dut_evidence=dut_evidence if dut_enabled else None,
             )
             evidence_document = evidence.as_document()
             evidence_path = services.artifacts.write_attempt_json(

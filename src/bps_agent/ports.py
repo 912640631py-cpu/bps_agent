@@ -7,10 +7,9 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from bps_agent.models import (
+    DutCaptureResult,
     EvidenceBundle,
-    ResourceObservation,
     RunCompletion,
-    SupplementalSnapshot,
     VerdictDocument,
 )
 
@@ -47,17 +46,22 @@ class BpsPort(Protocol):
 
 
 class DutPort(Protocol):
-    def keepalive(self) -> None: ...
+    def prepare_attempt(self, attempt_dir: Path) -> None: ...
 
-    def collect_monitoring_window(
+    def traffic_started(self, started_at: str) -> None: ...
+
+    def restore_attempt(
         self,
-        traffic_started_at: str,
-        traffic_finished_at: str,
-        before: SupplementalSnapshot,
-        after: SupplementalSnapshot,
-    ) -> tuple[ResourceObservation, ...]: ...
+        attempt_dir: Path,
+        started_at: str,
+        finished_at: str | None,
+    ) -> None: ...
 
-    def collect_supplemental(self) -> SupplementalSnapshot: ...
+    def traffic_finished(self, finished_at: str) -> None: ...
+
+    def finalize_attempt(self) -> DutCaptureResult: ...
+
+    def close(self) -> None: ...
 
 
 class JudgePort(Protocol):

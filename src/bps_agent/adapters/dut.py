@@ -5,17 +5,28 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import threading
 import time
 from collections.abc import Callable
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import httpx
 
-from bps_agent.models import DutConfig, ObservationPhase, ResourceObservation, SupplementalSnapshot
+from bps_agent.artifacts import ArtifactStore
+from bps_agent.models import (
+    DutCaptureResult,
+    DutConfig,
+    DutObservations,
+    FrontendDutEvidence,
+    ObservationPhase,
+    ResourceObservation,
+    SupplementalSnapshot,
+)
 
 _RSA_EXPONENT = 0x10001
 _RSA_MODULUS = int(
@@ -184,11 +195,14 @@ class DutClient:
         client: httpx.Client | None = None,
     ) -> None:
         self.config = config
+        if config.frontend is None:
+            raise ValueError("frontend_api DUT collection requires dut.frontend")
+        self._frontend = config.frontend
         self.username = username
         self._password = password
         self._captcha_reader = captcha_reader
         self._client = client or httpx.Client(
-            verify=config.verify_tls,
+            verify=self._frontend.verify_tls,
             follow_redirects=False,
             timeout=httpx.Timeout(30.0, read=120.0),
             trust_env=False,
@@ -196,9 +210,16 @@ class DutClient:
         self._owns_client = client is None
         self._api_key: str | None = None
         self._security_key: str | None = None
+        self._before: SupplementalSnapshot | None = None
+        self._before_path: Path | None = None
+        self._traffic_started_at: str | None = None
+        self._traffic_finished_at: str | None = None
+        self._keepalive_stop = threading.Event()
+        self._keepalive_thread: threading.Thread | None = None
+        self._warnings: list[str] = []
 
     def _url(self, path: str) -> str:
-        return f"{self.config.endpoint}{path}"
+        return f"{self._frontend.endpoint}{path}"
 
     def authenticate(self) -> None:
         _json_object(
@@ -271,11 +292,11 @@ class DutClient:
         include_period: bool = False,
     ) -> Any:
         last_error: Exception | None = None
-        for attempt in range(self.config.read_attempts):
+        for attempt in range(self._frontend.read_attempts):
             timestamp = self._timestamp_ms()
             query: dict[str, str | int] = {"t": timestamp}
-            if include_period and self.config.period is not None:
-                query["period"] = self.config.period
+            if include_period and self._frontend.period is not None:
+                query["period"] = self._frontend.period
             if parameters:
                 query.update(parameters)
             try:
@@ -284,18 +305,18 @@ class DutClient:
                 )
                 if (
                     response.status_code in _RETRYABLE_STATUS
-                    and attempt + 1 < self.config.read_attempts
+                    and attempt + 1 < self._frontend.read_attempts
                 ):
-                    time.sleep(self.config.read_retry_backoff_seconds * (2**attempt))
+                    time.sleep(self._frontend.read_retry_backoff_seconds * (2**attempt))
                     continue
                 document = _json_object(response, f"DUT GET {path}")
                 _require_success(document, f"DUT GET {path}")
                 return document
             except (httpx.NetworkError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
                 last_error = exc
-                if attempt + 1 >= self.config.read_attempts:
+                if attempt + 1 >= self._frontend.read_attempts:
                     raise
-                time.sleep(self.config.read_retry_backoff_seconds * (2**attempt))
+                time.sleep(self._frontend.read_retry_backoff_seconds * (2**attempt))
         if last_error:
             raise last_error
         raise RuntimeError(f"DUT GET {path} exhausted retries")
@@ -346,7 +367,7 @@ class DutClient:
             raise ValueError("traffic_finished_at must be later than traffic_started_at")
         device_start = (local_start.astimezone(UTC) + offset).astimezone(device_reference.tzinfo)
         device_finish = (local_finish.astimezone(UTC) + offset).astimezone(device_reference.tzinfo)
-        baseline_start = device_start - timedelta(seconds=self.config.baseline_seconds)
+        baseline_start = device_start - timedelta(seconds=self._frontend.baseline_seconds)
         phase_windows = (
             (ObservationPhase.BASELINE, baseline_start, device_start, True, False),
             (ObservationPhase.DURING, device_start, device_finish, True, True),
@@ -420,7 +441,97 @@ class DutClient:
             captured_at=datetime.now(UTC).isoformat(), values=values, errors=errors
         )
 
+    def prepare_attempt(self, attempt_dir: Path) -> None:
+        self._stop_keepalive()
+        self._warnings = []
+        self._traffic_started_at = None
+        self._traffic_finished_at = None
+        self._before = self.collect_supplemental()
+        if not self._before.is_complete:
+            raise RuntimeError("required pre-traffic DUT evidence is incomplete")
+        self._before_path = attempt_dir / "dut-frontend-before.json"
+        ArtifactStore.write_json(self._before_path, self._before)
+
+    def traffic_started(self, started_at: str) -> None:
+        if self._before is None:
+            raise RuntimeError("DUT Attempt was not prepared")
+        self._traffic_started_at = started_at
+        self._traffic_finished_at = None
+        self._keepalive_stop.clear()
+        self._keepalive_thread = threading.Thread(
+            target=self._keepalive_loop,
+            name="dut-frontend-keepalive",
+            daemon=True,
+        )
+        self._keepalive_thread.start()
+
+    def restore_attempt(
+        self,
+        attempt_dir: Path,
+        started_at: str,
+        finished_at: str | None,
+    ) -> None:
+        if self._before is not None and self._traffic_started_at == started_at:
+            if finished_at is not None and self._traffic_finished_at is None:
+                self.traffic_finished(finished_at)
+            return
+        self._stop_keepalive()
+        self._before_path = attempt_dir / "dut-frontend-before.json"
+        if not self._before_path.is_file():
+            raise RuntimeError("resumed frontend DUT Attempt omitted its pre-traffic snapshot")
+        self._before = SupplementalSnapshot.model_validate(
+            ArtifactStore.read_json(self._before_path)
+        )
+        self._warnings = []
+        self._traffic_started_at = started_at
+        self._traffic_finished_at = finished_at
+        if finished_at is None:
+            self.traffic_started(started_at)
+
+    def _keepalive_loop(self) -> None:
+        while not self._keepalive_stop.wait(self._frontend.keepalive_interval_seconds):
+            try:
+                self.keepalive()
+            except Exception as exc:
+                self._warnings.append(f"DUT keepalive failed: {exc}")
+
+    def _stop_keepalive(self) -> None:
+        self._keepalive_stop.set()
+        thread = self._keepalive_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+        self._keepalive_thread = None
+
+    def traffic_finished(self, finished_at: str) -> None:
+        self._traffic_finished_at = finished_at
+        self._stop_keepalive()
+
+    def finalize_attempt(self) -> DutCaptureResult:
+        started_at = self._traffic_started_at
+        finished_at = self._traffic_finished_at
+        before = self._before
+        if started_at is None or finished_at is None or before is None:
+            raise RuntimeError("DUT traffic window is incomplete")
+        time.sleep(self._frontend.cooldown_seconds)
+        after = self.collect_supplemental()
+        if not after.is_complete:
+            raise RuntimeError("required post-traffic DUT evidence is incomplete")
+        observations = self.collect_monitoring_window(started_at, finished_at, before, after)
+        compact = DutObservations.from_resource_observations(observations)
+        evidence = FrontendDutEvidence(
+            endpoint=self._frontend.endpoint,
+            interfaces=self.config.interfaces,
+            traffic_started_at=started_at,
+            traffic_finished_at=finished_at,
+            observations=compact,
+            before=before,
+            after=after,
+            warnings=tuple(self._warnings),
+        )
+        return DutCaptureResult(evidence=evidence, warnings=tuple(self._warnings))
+
     def close(self) -> None:
+        self._stop_keepalive()
         self._api_key = None
         self._security_key = None
         self._password = ""

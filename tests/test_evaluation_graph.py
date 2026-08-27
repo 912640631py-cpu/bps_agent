@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -14,9 +15,15 @@ from bps_agent.graph import (
 )
 from bps_agent.models import (
     AppConfig,
+    BackendDutEvidence,
+    BackendDutTarget,
+    DutCaptureResult,
+    DutCollectionMethod,
+    DutObservations,
     EvaluationMode,
     EvaluationOutcome,
     EvidenceBundle,
+    FrontendDutEvidence,
     ObservationPhase,
     ResourceObservation,
     RunCompletion,
@@ -174,6 +181,9 @@ class FakeDut:
         self.keepalive_calls = 0
         self.monitoring_calls = 0
         self.supplemental_calls = 0
+        self.before: SupplementalSnapshot | None = None
+        self.started_at: str | None = None
+        self.finished_at: str | None = None
 
     def keepalive(self) -> None:
         self.keepalive_calls += 1
@@ -218,6 +228,104 @@ class FakeDut:
             captured_at="2026-08-24T00:00:00+00:00",
             values={"interfaces": {}, "hardware": {}, "system": {}},
         )
+
+    def prepare_attempt(self, attempt_dir: Path) -> None:
+        del attempt_dir
+        self.before = self.collect_supplemental()
+
+    def traffic_started(self, started_at: str) -> None:
+        self.started_at = started_at
+        with suppress(RuntimeError):
+            self.keepalive()
+
+    def restore_attempt(
+        self,
+        attempt_dir: Path,
+        started_at: str,
+        finished_at: str | None,
+    ) -> None:
+        del attempt_dir
+        assert self.started_at == started_at
+        if finished_at is not None:
+            self.finished_at = finished_at
+
+    def traffic_finished(self, finished_at: str) -> None:
+        self.finished_at = finished_at
+
+    def finalize_attempt(self) -> DutCaptureResult:
+        assert self.started_at is not None and self.finished_at is not None
+        assert self.before is not None
+        after = self.collect_supplemental()
+        observations = self.collect_monitoring_window(
+            self.started_at,
+            self.finished_at,
+            self.before,
+            after,
+        )
+        warnings = (
+            ("DUT keepalive failed: fixture keepalive failed",) if self.keepalive_failure else ()
+        )
+        evidence = FrontendDutEvidence(
+            endpoint="https://dut.example.test",
+            interfaces=("T1/1", "T1/2"),
+            traffic_started_at=self.started_at,
+            traffic_finished_at=self.finished_at,
+            observations=DutObservations.from_resource_observations(observations),
+            before=self.before,
+            after=after,
+            warnings=warnings,
+        )
+        return DutCaptureResult(evidence=evidence, warnings=warnings)
+
+    def close(self) -> None:
+        return None
+
+
+class FakeBackendDut:
+    def __init__(self, successful_samples: int = 1) -> None:
+        self.successful_samples = successful_samples
+        self.started_at: str | None = None
+        self.finished_at: str | None = None
+
+    def prepare_attempt(self, attempt_dir: Path) -> None:
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+
+    def traffic_started(self, started_at: str) -> None:
+        self.started_at = started_at
+
+    def restore_attempt(
+        self,
+        attempt_dir: Path,
+        started_at: str,
+        finished_at: str | None,
+    ) -> None:
+        del attempt_dir
+        assert self.started_at == started_at
+        if finished_at is not None:
+            self.finished_at = finished_at
+
+    def traffic_finished(self, finished_at: str) -> None:
+        self.finished_at = finished_at
+
+    def finalize_attempt(self) -> DutCaptureResult:
+        assert self.started_at is not None and self.finished_at is not None
+        csv_text = "sample_index,cpu_mgt_percent\n"
+        if self.successful_samples:
+            csv_text += "1,11\n"
+        evidence = BackendDutEvidence(
+            target=BackendDutTarget(host="10.66.246.156", port=50023),
+            interfaces=("T1/1", "T1/2"),
+            traffic_started_at=self.started_at,
+            traffic_finished_at=self.finished_at,
+            interval_seconds=10,
+            successful_sample_count=self.successful_samples,
+            failed_sample_count=0,
+            metrics_csv=csv_text,
+        )
+        return DutCaptureResult(evidence=evidence)
+
+    def close(self) -> None:
+        return None
 
 
 class FakeJudge:
@@ -322,6 +430,56 @@ def test_passes_on_first_complete_attempt(app_config: AppConfig) -> None:
     assert Path(result["final_artifact"]).exists()
 
 
+def test_backend_csv_is_the_only_backend_metrics_sent_to_the_judge(
+    app_config: AppConfig,
+) -> None:
+    config = app_config.model_copy(
+        update={
+            "dut": app_config.dut.model_copy(
+                update={"collection_method": DutCollectionMethod.BACKEND_SSH}
+            )
+        }
+    )
+    clock = FakeClock()
+    result = run_graph(
+        config,
+        FakeBps(clock),
+        FakeBackendDut(),
+        FakeJudge([VerdictValue.PASS]),
+        clock,
+    )
+
+    assert result["outcome"] == EvaluationOutcome.PASSED.value
+    evidence = ArtifactStore.read_json(Path(result["attempts"][0]["evidence_path"]))
+    assert evidence["dut_evidence"]["collection_method"] == "backend_ssh"
+    assert "sample_index,cpu_mgt_percent" in evidence["dut_evidence"]["metrics_csv"]
+    assert "samples" not in evidence["dut_evidence"]
+
+
+def test_backend_without_a_successful_sample_is_inconclusive(
+    app_config: AppConfig,
+) -> None:
+    config = app_config.model_copy(
+        update={
+            "dut": app_config.dut.model_copy(
+                update={"collection_method": DutCollectionMethod.BACKEND_SSH}
+            )
+        }
+    )
+    clock = FakeClock()
+    judge = FakeJudge([VerdictValue.PASS])
+    result = run_graph(
+        config,
+        FakeBps(clock),
+        FakeBackendDut(successful_samples=0),
+        judge,
+        clock,
+    )
+
+    assert result["outcome"] == EvaluationOutcome.INCONCLUSIVE.value
+    assert judge.calls == 0
+
+
 def test_can_stop_after_evidence_without_calling_the_llm(app_config: AppConfig) -> None:
     clock = FakeClock()
     bps = FakeBps(clock)
@@ -359,21 +517,28 @@ def test_can_stop_after_evidence_without_calling_the_llm(app_config: AppConfig) 
     assert performance_path.name == "bps-performance-timeseries.csv"
     assert performance_path.exists()
     assert "Timestamp" in performance_path.read_text(encoding="utf-8")
-    observations = evidence["dut_observations"]
+    dut_evidence = evidence["dut_evidence"]
+    assert dut_evidence["collection_method"] == "frontend_api"
+    observations = dut_evidence["observations"]
     assert observations["resources"]["cpu"]["metadata"] == {"code": 0}
     assert len(observations["resources"]["cpu"]["points"]["baseline"]) == 1
     assert len(observations["resources"]["cpu"]["points"]["during"]) == 1
-    assert ArtifactStore.read_json(evidence_path.parent / "dut-observations.json") == observations
-    legacy_evidence = EvidenceBundle.model_validate(
+    assert ArtifactStore.read_json(evidence_path.parent / "dut-evidence.json") == dut_evidence
+    legacy_document = {**evidence, "bps_report_toc": [{"legacy": True}]}
+    legacy_document.pop("dut_evidence")
+    legacy_document.update(
         {
-            **evidence,
-            "bps_report_toc": [{"legacy": True}],
-            "dut_observations": result["attempts"][0]["dut_observations"],
+            "dut_endpoint": dut_evidence["endpoint"],
+            "dut_interfaces": dut_evidence["interfaces"],
+            "dut_observations": observations,
+            "dut_before": dut_evidence["before"],
+            "dut_after": dut_evidence["after"],
         }
     )
+    legacy_evidence = EvidenceBundle.model_validate(legacy_document)
     upgraded = legacy_evidence.model_dump(mode="json")
     assert "bps_report_toc" not in upgraded
-    assert isinstance(upgraded["dut_observations"], dict)
+    assert isinstance(upgraded["dut_evidence"]["observations"], dict)
     assert Path(result["attempts"][0]["report_toc_path"]).exists()
     assert judge.calls == 0
 

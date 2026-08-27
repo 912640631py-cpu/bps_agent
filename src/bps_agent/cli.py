@@ -20,6 +20,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from bps_agent.adapters.bps import BpsClient
 from bps_agent.adapters.deepseek import DeepSeekJudge
 from bps_agent.adapters.dut import DutClient
+from bps_agent.adapters.dut_backend import DutBackendCollector
 from bps_agent.artifacts import ArtifactStore
 from bps_agent.config import load_config
 from bps_agent.credentials import (
@@ -31,6 +32,7 @@ from bps_agent.graph import EvaluationServices, SystemClock, build_graph, initia
 from bps_agent.models import (
     AppConfig,
     AttemptRecord,
+    DutCollectionMethod,
     EvaluationMode,
     EvaluationOutcome,
     EvidenceBundle,
@@ -153,14 +155,27 @@ def _apply_bps_overrides(
     total_bandwidth_mbps: float | None,
     resume_id: str | None,
     bps_only: bool | None = None,
+    dut_collection_method: DutCollectionMethod | None = None,
+    dut_host: str | None = None,
+    dut_port: int | None = None,
+    dut_interfaces: tuple[str, ...] | None = None,
+    dut_interval_seconds: float | None = None,
 ) -> AppConfig:
+    dut_overrides = (
+        dut_collection_method,
+        dut_host,
+        dut_port,
+        dut_interfaces,
+        dut_interval_seconds,
+    )
     if resume_id and (
-        template is not None or ports is not None or total_bandwidth_mbps is not None or bps_only
+        template is not None
+        or ports is not None
+        or total_bandwidth_mbps is not None
+        or bps_only
+        or any(value is not None for value in dut_overrides)
     ):
-        raise ValueError(
-            "--template, --ports, --total-bandwidth-mbps, and --bps-only "
-            "cannot be used with --resume"
-        )
+        raise ValueError("run configuration overrides cannot be used with --resume")
     document = config.model_dump(mode="python")
     if template is not None:
         cleaned = template.strip()
@@ -173,6 +188,16 @@ def _apply_bps_overrides(
         document["bps"]["total_bandwidth_mbps"] = total_bandwidth_mbps
     if bps_only:
         document["evaluation"]["mode"] = EvaluationMode.BPS_ONLY.value
+    if dut_collection_method is not None:
+        document["dut"]["collection_method"] = dut_collection_method.value
+    if dut_host is not None:
+        document["dut"]["backend"]["host"] = dut_host
+    if dut_port is not None:
+        document["dut"]["backend"]["port"] = dut_port
+    if dut_interfaces is not None:
+        document["dut"]["interfaces"] = dut_interfaces
+    if dut_interval_seconds is not None:
+        document["dut"]["backend"]["interval_seconds"] = dut_interval_seconds
     return AppConfig.model_validate(document)
 
 
@@ -215,6 +240,11 @@ def run_live(
     ports: tuple[int, ...] | None = None,
     total_bandwidth_mbps: float | None = None,
     bps_only: bool | None = None,
+    dut_collection_method: DutCollectionMethod | None = None,
+    dut_host: str | None = None,
+    dut_port: int | None = None,
+    dut_interfaces: tuple[str, ...] | None = None,
+    dut_interval_seconds: float | None = None,
 ) -> int:
     config = _apply_bps_overrides(
         load_config(config_path),
@@ -223,6 +253,11 @@ def run_live(
         total_bandwidth_mbps=total_bandwidth_mbps,
         resume_id=resume_id,
         bps_only=bps_only,
+        dut_collection_method=dut_collection_method,
+        dut_host=dut_host,
+        dut_port=dut_port,
+        dut_interfaces=dut_interfaces,
+        dut_interval_seconds=dut_interval_seconds,
     )
     if resume_id:
         config = _load_resume_config(config, resume_id)
@@ -231,7 +266,7 @@ def run_live(
     artifacts = ArtifactStore(config.storage.artifact_dir)
     judge: DeepSeekJudge | _EvidenceOnlyJudge | None = None
     bps: BpsClient | None = None
-    dut: DutClient | None = None
+    dut: DutClient | DutBackendCollector | None = None
     result: dict[str, Any] | None = None
     try:
         if stop_before_llm:
@@ -251,6 +286,23 @@ def run_live(
         bps.authenticate()
         if config.evaluation.mode == EvaluationMode.BPS_ONLY:
             print("BPS-only mode: DUT authentication and monitoring are disabled.")
+        elif config.dut.collection_method == DutCollectionMethod.BACKEND_SSH:
+            dut = DutBackendCollector(
+                config.dut,
+                username=_credential(
+                    store,
+                    "DUT_BACKEND_USERNAME",
+                    "DUT backend SSH username: ",
+                    secret=False,
+                ),
+                password=_credential(
+                    store,
+                    "DUT_BACKEND_PASSWORD",
+                    "DUT backend SSH password: ",
+                    secret=True,
+                ),
+            )
+            print("DUT backend SSH collection enabled (host keys are not currently verified).")
         else:
             dut = DutClient(
                 config.dut,
@@ -446,6 +498,25 @@ def _parser() -> argparse.ArgumentParser:
         help="skip DUT credentials, login, keepalive, and monitoring",
     )
     live.add_argument(
+        "--dut-collection-method",
+        type=DutCollectionMethod,
+        choices=tuple(DutCollectionMethod),
+        help="override the DUT Collection Method",
+    )
+    live.add_argument("--dut-host", help="override the DUT backend SSH host")
+    live.add_argument("--dut-port", type=int, help="override the DUT backend SSH port")
+    live.add_argument(
+        "--dut-interface",
+        action="append",
+        dest="dut_interfaces",
+        help="override a DUT interface; repeat for multiple interfaces",
+    )
+    live.add_argument(
+        "--dut-interval-seconds",
+        type=float,
+        help="override the DUT backend sampling interval",
+    )
+    live.add_argument(
         "--stop-before-llm",
         action="store_true",
         help="collect complete live evidence, then stop before contacting the LLM",
@@ -494,6 +565,15 @@ def main(argv: list[str] | None = None) -> int:
                 ports=tuple(arguments.ports) if arguments.ports is not None else None,
                 total_bandwidth_mbps=arguments.total_bandwidth_mbps,
                 bps_only=arguments.bps_only,
+                dut_collection_method=arguments.dut_collection_method,
+                dut_host=arguments.dut_host,
+                dut_port=arguments.dut_port,
+                dut_interfaces=(
+                    tuple(arguments.dut_interfaces)
+                    if arguments.dut_interfaces is not None
+                    else None
+                ),
+                dut_interval_seconds=arguments.dut_interval_seconds,
             )
         return replay(arguments.config, arguments.evidence)
     except Exception as exc:

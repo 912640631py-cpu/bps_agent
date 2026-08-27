@@ -19,6 +19,7 @@ from bps_agent.cli import (
 from bps_agent.models import (
     AppConfig,
     AttemptRecord,
+    DutCollectionMethod,
     EvaluationMode,
     EvaluationOutcome,
     VerdictDocument,
@@ -146,6 +147,62 @@ def test_cli_can_override_the_evaluation_to_bps_only(app_config: AppConfig) -> N
 
     assert overridden.evaluation.mode == EvaluationMode.BPS_ONLY
     assert app_config.evaluation.mode == EvaluationMode.BPS_AND_DUT
+
+
+def test_cli_can_override_backend_dut_parameters(app_config: AppConfig) -> None:
+    overridden = _apply_bps_overrides(
+        app_config,
+        template=None,
+        ports=None,
+        total_bandwidth_mbps=None,
+        resume_id=None,
+        dut_collection_method=DutCollectionMethod.BACKEND_SSH,
+        dut_host="10.66.246.156",
+        dut_port=50023,
+        dut_interfaces=("T1/1", "T1/2"),
+        dut_interval_seconds=10,
+    )
+
+    assert overridden.dut.collection_method == DutCollectionMethod.BACKEND_SSH
+    assert overridden.dut.backend.host == "10.66.246.156"
+    assert overridden.dut.backend.port == 50023
+    assert overridden.dut.interfaces == ("T1/1", "T1/2")
+    assert overridden.dut.backend.interval_seconds == 10
+
+
+def test_parser_accepts_repeatable_dut_backend_overrides() -> None:
+    arguments = _parser().parse_args(
+        [
+            "run",
+            "--dut-collection-method",
+            "backend_ssh",
+            "--dut-host",
+            "10.66.246.156",
+            "--dut-port",
+            "50023",
+            "--dut-interface",
+            "T1/1",
+            "--dut-interface",
+            "T1/2",
+            "--dut-interval-seconds",
+            "10",
+        ]
+    )
+
+    assert arguments.dut_collection_method == DutCollectionMethod.BACKEND_SSH
+    assert arguments.dut_interfaces == ["T1/1", "T1/2"]
+
+
+def test_resume_rejects_dut_override(app_config: AppConfig) -> None:
+    with pytest.raises(ValueError, match="cannot be used with --resume"):
+        _apply_bps_overrides(
+            app_config,
+            template=None,
+            ports=None,
+            total_bandwidth_mbps=None,
+            resume_id="evaluation-id",
+            dut_host="10.66.246.156",
+        )
 
 
 def test_resume_rejects_bandwidth_override(app_config: AppConfig) -> None:
