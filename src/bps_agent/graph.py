@@ -16,6 +16,7 @@ from bps_agent.models import (
     AppConfig,
     AttemptRecord,
     DutObservations,
+    EvaluationMode,
     EvaluationOutcome,
     EvidenceBundle,
     ObservationPhase,
@@ -59,7 +60,7 @@ class EvaluationState(TypedDict):
 class EvaluationServices:
     config: AppConfig
     bps: BpsPort
-    dut: DutPort
+    dut: DutPort | None
     judge: JudgePort
     artifacts: ArtifactStore
     clock: Clock
@@ -131,6 +132,9 @@ def build_graph(
     interrupt_before: list[str] | None = None,
 ) -> Any:
     cfg = services.config
+    dut_enabled = cfg.evaluation.mode == EvaluationMode.BPS_AND_DUT
+    if dut_enabled and services.dut is None:
+        raise ValueError("bps_and_dut mode requires a DUT adapter")
 
     def initialize(state: EvaluationState) -> dict[str, Any]:
         evaluation_id = state["evaluation_id"]
@@ -169,9 +173,12 @@ def build_graph(
         )
         reserved = False
         try:
-            before = services.dut.collect_supplemental()
-            if not before.is_complete:
-                raise RuntimeError("required pre-traffic DUT evidence is incomplete")
+            before: SupplementalSnapshot | None = None
+            if dut_enabled:
+                assert services.dut is not None
+                before = services.dut.collect_supplemental()
+                if not before.is_complete:
+                    raise RuntimeError("required pre-traffic DUT evidence is incomplete")
             services.bps.reserve_ports()
             reserved = True
             services.bps.set_total_bandwidth(bandwidth_percent)
@@ -216,6 +223,8 @@ def build_graph(
 
         def keepalive_if_due() -> None:
             nonlocal next_keepalive
+            if not dut_enabled or services.dut is None:
+                return
             if services.clock.monotonic() < next_keepalive:
                 return
             try:
@@ -302,30 +311,34 @@ def build_graph(
         performance_analysis: PerformanceTimeseriesAnalysis | None = None
         after: SupplementalSnapshot | None = None
         try:
-            services.clock.sleep(cfg.dut.cooldown_seconds)
-            before = attempt.dut_before
-            if before is None or not before.is_complete:
-                raise RuntimeError("required pre-traffic DUT evidence is incomplete")
-            after = services.dut.collect_supplemental()
-            if not after.is_complete:
-                raise RuntimeError("required post-traffic DUT evidence is incomplete")
             if not attempt.traffic_started_at or not attempt.traffic_finished_at:
                 raise RuntimeError("BPS traffic time window is incomplete")
-            observations = list(
-                services.dut.collect_monitoring_window(
-                    attempt.traffic_started_at,
-                    attempt.traffic_finished_at,
-                    before,
-                    after,
+            if dut_enabled:
+                assert services.dut is not None
+                services.clock.sleep(cfg.dut.cooldown_seconds)
+                before = attempt.dut_before
+                if before is None or not before.is_complete:
+                    raise RuntimeError("required pre-traffic DUT evidence is incomplete")
+                after = services.dut.collect_supplemental()
+                if not after.is_complete:
+                    raise RuntimeError("required post-traffic DUT evidence is incomplete")
+                observations = list(
+                    services.dut.collect_monitoring_window(
+                        attempt.traffic_started_at,
+                        attempt.traffic_finished_at,
+                        before,
+                        after,
+                    )
                 )
-            )
-            compact_observations = DutObservations.from_resource_observations(tuple(observations))
-            services.artifacts.write_attempt_json(
-                state["evaluation_id"],
-                attempt.number,
-                "dut-observations.json",
-                compact_observations,
-            )
+                compact_observations = DutObservations.from_resource_observations(
+                    tuple(observations)
+                )
+                services.artifacts.write_attempt_json(
+                    state["evaluation_id"],
+                    attempt.number,
+                    "dut-observations.json",
+                    compact_observations,
+                )
             report_toc = services.bps.wait_for_report(attempt.bps_run_id)
             run_id = attempt.bps_run_id
             assert run_id is not None
@@ -413,27 +426,31 @@ def build_graph(
             }
         )
 
-        complete = bool(
+        bps_complete = bool(
             attempt.bps_run_id
+            and attempt.traffic_started_at
+            and attempt.traffic_finished_at
             and report_text
             and performance_analysis
-            and attempt.dut_before
+        )
+        dut_complete = not dut_enabled or bool(
+            attempt.dut_before
             and attempt.dut_before.is_complete
             and after
             and after.is_complete
             and compact_observations
             and _has_minimum_monitoring(compact_observations)
         )
+        complete = bps_complete and dut_complete
         attempt = attempt.model_copy(update={"evidence_complete": complete})
         if complete:
-            assert attempt.dut_before is not None and after is not None
-            assert compact_observations is not None
             evidence_run_id = attempt.bps_run_id
             assert evidence_run_id is not None
             traffic_started_at = attempt.traffic_started_at
             traffic_finished_at = attempt.traffic_finished_at
             assert traffic_started_at is not None and traffic_finished_at is not None
             evidence = EvidenceBundle(
+                evaluation_mode=cfg.evaluation.mode,
                 evaluation_id=state["evaluation_id"],
                 attempt_number=attempt.number,
                 bps_run_id=evidence_run_id,
@@ -445,17 +462,18 @@ def build_graph(
                 bps_run_details=attempt.bps_run_details,
                 bps_report=report_text,
                 bps_performance_analysis=performance_analysis,
-                assessment=cfg.assessment,
-                dut_endpoint=cfg.dut.endpoint,
-                dut_interfaces=cfg.dut.interfaces,
+                assessment=cfg.selected_assessment,
+                dut_endpoint=cfg.dut.endpoint if dut_enabled else None,
+                dut_interfaces=cfg.dut.interfaces if dut_enabled else None,
                 traffic_started_at=traffic_started_at,
                 traffic_finished_at=traffic_finished_at,
-                dut_observations=compact_observations,
-                dut_before=attempt.dut_before,
-                dut_after=after,
+                dut_observations=compact_observations if dut_enabled else None,
+                dut_before=attempt.dut_before if dut_enabled else None,
+                dut_after=after if dut_enabled else None,
             )
+            evidence_document = evidence.as_document()
             evidence_path = services.artifacts.write_attempt_json(
-                state["evaluation_id"], attempt.number, "evidence.json", evidence
+                state["evaluation_id"], attempt.number, "evidence.json", evidence_document
             )
             attempt = attempt.model_copy(update={"evidence_path": str(evidence_path)})
         elif not attempt.errors:

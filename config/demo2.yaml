@@ -35,6 +35,13 @@ assessment:
     - 比较 DUT 打流前基线、打流中状态和冷却后的恢复情况
     - 只依据给定证据判断，不臆造缺失指标
 
+bps_only_assessment:
+  goal: 仅依据 BPS 证据验证指定流量目标与性能稳定性
+  expectations:
+    - 结合 BPS 自带 Test Criteria 判断测试目标是否达成
+    - 结合吞吐、Concurrent Flows 和 Flow Rate 时序分析判断性能是否稳定
+    - BPS-only 模式不提供 DUT 观测，不得臆造或要求 DUT 指标
+
 llm:
   provider: official
   company:
@@ -55,4 +62,5 @@ storage:
   checkpoint_db: .state/checkpoints.sqlite3
 
 evaluation:
+  mode: bps_and_dut
   max_attempts: 5

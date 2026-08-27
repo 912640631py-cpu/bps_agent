@@ -1,6 +1,6 @@
 # BPS 性能测试评估 Agent
 
-基于 LangGraph 的 Keysight BreakingPoint 实机测试工具。它负责 BPS 打流、DUT 监控、报告导出、性能波动分析，并由 DeepSeek 给出最终 Verdict。
+基于 LangGraph 的 Keysight BreakingPoint 实机测试工具。它负责 BPS 打流、可选的 DUT 监控、报告导出、性能波动分析，并由 DeepSeek 给出最终 Verdict。
 
 ## 主要能力
 
@@ -9,6 +9,7 @@
 - 在 Stable 阶段以 Tx/Rx 中位数为基线进行确定性性能分析。
 - LLM 返回 `retry` 时自动降载，最多执行五次；返回 `pass` 后立即结束。
 - 使用 SQLite checkpoint 支持中断恢复和 Evidence 离线回放。
+- 支持 BPS-only 模式，完全跳过 DUT 登录、CAPTCHA、keepalive 和监控读取。
 
 ## 安装
 
@@ -29,7 +30,7 @@ python -m pip install -e '.[dev]'
 凭据保存在 Windows Credential Manager，不写入配置或审计文件：
 
 - `BPS_USERNAME`、`BPS_PASSWORD`
-- `DUT_USERNAME`、`DUT_PASSWORD`
+- `DUT_USERNAME`、`DUT_PASSWORD`（BPS-only 模式不需要）
 - `COMPANY_DEEPSEEK_API_KEY` 或 `DEEPSEEK_API_KEY`
 
 ```powershell
@@ -50,6 +51,9 @@ python -m bps_agent run --template TEMPLATE --ports 4 5 --total-bandwidth-mbps 3
 # 完成实机测试和 Evidence，在调用 LLM 前停止
 python -m bps_agent run --stop-before-llm
 
+# 只使用 BPS，不登录或读取 DUT
+python -m bps_agent run --bps-only
+
 # 恢复已有 Evaluation
 python -m bps_agent run --resume EVALUATION_ID
 
@@ -57,7 +61,8 @@ python -m bps_agent run --resume EVALUATION_ID
 python -m bps_agent replay --evidence artifacts\EVALUATION_ID\attempt-01\evidence.json
 ```
 
-恢复运行时不能使用模板、端口或带宽覆盖参数。DUT CAPTCHA 由操作者输入且不会保存。
+恢复运行时不能使用模板、端口、带宽或模式覆盖参数。DUT CAPTCHA 由操作者输入且不会保存。
+也可以在 YAML 中设置 `evaluation.mode: bps_only`；默认值为 `bps_and_dut`。
 端口互斥由 BPS 的非强制预留负责；项目不再维护本地端口锁文件。
 
 ## 降载策略
@@ -80,7 +85,7 @@ python -m bps_agent replay --evidence artifacts\EVALUATION_ID\attempt-01\evidenc
 
 - `bps-report.csv`：测试参数、判据和结果，内容进入 `evidence.json`。
 - `bps-performance-timeseries.csv`：原始秒级性能数据，不进入 `evidence.json`。
-- `evidence.json`：DUT 观测、BPS 报告及紧凑的 `bps_performance_analysis`。
+- `evidence.json`：BPS 报告、紧凑的 `bps_performance_analysis`，以及启用时的 DUT 观测。
 - TOC、Section 解析结果、Attempt 和 Verdict 审计文件。
 
 性能时序按最近采样点对齐到 1 秒时间轴。Stable 负载下，吞吐下降超过约 10% 且持续至少 3 秒判为性能异常；下降超过约 20% 且持续至少 2 秒判为严重异常。Ramp-down 中吞吐与 Concurrent Flows 同步下降视为正常负载变化。

@@ -28,7 +28,13 @@ from bps_agent.credentials import (
     CredentialStore,
 )
 from bps_agent.graph import EvaluationServices, SystemClock, build_graph, initial_state
-from bps_agent.models import AppConfig, AttemptRecord, EvaluationOutcome, EvidenceBundle
+from bps_agent.models import (
+    AppConfig,
+    AttemptRecord,
+    EvaluationMode,
+    EvaluationOutcome,
+    EvidenceBundle,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -146,12 +152,14 @@ def _apply_bps_overrides(
     ports: tuple[int, ...] | None,
     total_bandwidth_mbps: float | None,
     resume_id: str | None,
+    bps_only: bool | None = None,
 ) -> AppConfig:
     if resume_id and (
-        template is not None or ports is not None or total_bandwidth_mbps is not None
+        template is not None or ports is not None or total_bandwidth_mbps is not None or bps_only
     ):
         raise ValueError(
-            "--template, --ports, and --total-bandwidth-mbps cannot be used with --resume"
+            "--template, --ports, --total-bandwidth-mbps, and --bps-only "
+            "cannot be used with --resume"
         )
     document = config.model_dump(mode="python")
     if template is not None:
@@ -163,6 +171,8 @@ def _apply_bps_overrides(
         document["bps"]["ports"] = ports
     if total_bandwidth_mbps is not None:
         document["bps"]["total_bandwidth_mbps"] = total_bandwidth_mbps
+    if bps_only:
+        document["evaluation"]["mode"] = EvaluationMode.BPS_ONLY.value
     return AppConfig.model_validate(document)
 
 
@@ -204,6 +214,7 @@ def run_live(
     template: str | None = None,
     ports: tuple[int, ...] | None = None,
     total_bandwidth_mbps: float | None = None,
+    bps_only: bool | None = None,
 ) -> int:
     config = _apply_bps_overrides(
         load_config(config_path),
@@ -211,6 +222,7 @@ def run_live(
         ports=ports,
         total_bandwidth_mbps=total_bandwidth_mbps,
         resume_id=resume_id,
+        bps_only=bps_only,
     )
     if resume_id:
         config = _load_resume_config(config, resume_id)
@@ -237,14 +249,17 @@ def run_live(
         )
         print("Authenticating to BPS...")
         bps.authenticate()
-        dut = DutClient(
-            config.dut,
-            username=_credential(store, "DUT_USERNAME", "DUT username: ", secret=False),
-            password=_credential(store, "DUT_PASSWORD", "DUT password: ", secret=True),
-            captcha_reader=_captcha_reader,
-        )
-        print("Authenticating to DUT (CAPTCHA required)...")
-        dut.authenticate()
+        if config.evaluation.mode == EvaluationMode.BPS_ONLY:
+            print("BPS-only mode: DUT authentication and monitoring are disabled.")
+        else:
+            dut = DutClient(
+                config.dut,
+                username=_credential(store, "DUT_USERNAME", "DUT username: ", secret=False),
+                password=_credential(store, "DUT_PASSWORD", "DUT password: ", secret=True),
+                captcha_reader=_captcha_reader,
+            )
+            print("Authenticating to DUT (CAPTCHA required)...")
+            dut.authenticate()
         config.storage.checkpoint_db.parent.mkdir(parents=True, exist_ok=True)
         with SqliteSaver.from_conn_string(str(config.storage.checkpoint_db)) as saver:
             services = EvaluationServices(
@@ -400,7 +415,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="LangGraph BPS performance-test agent")
     parser.add_argument("--verbose", action="store_true")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    live = subparsers.add_parser("run", help="run against real BPS and DUT devices")
+    live = subparsers.add_parser("run", help="run against real BPS with optional DUT monitoring")
     live.add_argument(
         "--config",
         type=Path,
@@ -423,6 +438,12 @@ def _parser() -> argparse.ArgumentParser:
         "--total-bandwidth-mbps",
         type=float,
         help="override the initial BPS Total Bandwidth target in Mbps",
+    )
+    live.add_argument(
+        "--bps-only",
+        action="store_true",
+        default=None,
+        help="skip DUT credentials, login, keepalive, and monitoring",
     )
     live.add_argument(
         "--stop-before-llm",
@@ -472,6 +493,7 @@ def main(argv: list[str] | None = None) -> int:
                 template=arguments.template,
                 ports=tuple(arguments.ports) if arguments.ports is not None else None,
                 total_bandwidth_mbps=arguments.total_bandwidth_mbps,
+                bps_only=arguments.bps_only,
             )
         return replay(arguments.config, arguments.evidence)
     except Exception as exc:

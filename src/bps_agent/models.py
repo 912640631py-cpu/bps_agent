@@ -40,6 +40,11 @@ class EvaluationOutcome(StrEnum):
     INCONCLUSIVE = "INCONCLUSIVE"
 
 
+class EvaluationMode(StrEnum):
+    BPS_AND_DUT = "bps_and_dut"
+    BPS_ONLY = "bps_only"
+
+
 class VerdictValue(StrEnum):
     PASS = "pass"
     RETRY = "retry"
@@ -175,6 +180,7 @@ class StorageConfig(StrictModel):
 
 
 class EvaluationConfig(StrictModel):
+    mode: EvaluationMode = EvaluationMode.BPS_AND_DUT
     max_attempts: int = Field(default=5, ge=1, le=5)
 
     @field_validator("max_attempts")
@@ -189,9 +195,23 @@ class AppConfig(StrictModel):
     bps: BpsConfig
     dut: DutConfig
     assessment: AssessmentConfig = AssessmentConfig()
+    bps_only_assessment: AssessmentConfig = AssessmentConfig(
+        goal="仅依据 BPS 证据验证指定流量目标与性能稳定性",
+        expectations=(
+            "结合 BPS 自带 Test Criteria 判断测试目标是否达成",
+            "结合吞吐、Concurrent Flows 和 Flow Rate 时序分析判断性能是否稳定",
+            "BPS-only 模式不提供 DUT 观测，不得臆造或要求 DUT 指标",
+        ),
+    )
     llm: LlmConfig = LlmConfig()
     storage: StorageConfig = StorageConfig()
     evaluation: EvaluationConfig = EvaluationConfig()
+
+    @property
+    def selected_assessment(self) -> AssessmentConfig:
+        if self.evaluation.mode == EvaluationMode.BPS_ONLY:
+            return self.bps_only_assessment
+        return self.assessment
 
 
 class ResourceObservation(StrictModel):
@@ -399,6 +419,7 @@ class VerdictDocument(BaseModel):
 
 
 class EvidenceBundle(StrictModel):
+    evaluation_mode: EvaluationMode = EvaluationMode.BPS_AND_DUT
     evaluation_id: str
     attempt_number: int
     bps_run_id: str
@@ -412,13 +433,13 @@ class EvidenceBundle(StrictModel):
     bps_performance_analysis: PerformanceTimeseriesAnalysis | None = None
     bps_report_toc: Any | None = Field(default=None, exclude=True)
     assessment: AssessmentConfig
-    dut_endpoint: str
-    dut_interfaces: tuple[str, ...]
+    dut_endpoint: str | None = None
+    dut_interfaces: tuple[str, ...] | None = None
     traffic_started_at: str
     traffic_finished_at: str
-    dut_observations: DutObservations
-    dut_before: SupplementalSnapshot
-    dut_after: SupplementalSnapshot
+    dut_observations: DutObservations | None = None
+    dut_before: SupplementalSnapshot | None = None
+    dut_after: SupplementalSnapshot | None = None
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
 
     @field_validator("dut_observations", mode="before")
@@ -428,6 +449,38 @@ class EvidenceBundle(StrictModel):
             observations = tuple(ResourceObservation.model_validate(item) for item in value)
             return DutObservations.from_resource_observations(observations)
         return value
+
+    @model_validator(mode="after")
+    def validate_evidence_for_mode(self) -> EvidenceBundle:
+        dut_fields = (
+            self.dut_endpoint,
+            self.dut_interfaces,
+            self.dut_observations,
+            self.dut_before,
+            self.dut_after,
+        )
+        if self.evaluation_mode == EvaluationMode.BPS_AND_DUT and any(
+            value is None for value in dut_fields
+        ):
+            raise ValueError("bps_and_dut Evidence requires complete DUT fields")
+        if self.evaluation_mode == EvaluationMode.BPS_ONLY and any(
+            value is not None for value in dut_fields
+        ):
+            raise ValueError("bps_only Evidence must omit DUT fields")
+        return self
+
+    def as_document(self) -> dict[str, Any]:
+        document = self.model_dump(mode="json")
+        if self.evaluation_mode == EvaluationMode.BPS_ONLY:
+            for name in (
+                "dut_endpoint",
+                "dut_interfaces",
+                "dut_observations",
+                "dut_before",
+                "dut_after",
+            ):
+                document.pop(name, None)
+        return document
 
 
 class AttemptRecord(StrictModel):

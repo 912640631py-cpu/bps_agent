@@ -14,6 +14,7 @@ from bps_agent.graph import (
 )
 from bps_agent.models import (
     AppConfig,
+    EvaluationMode,
     EvaluationOutcome,
     EvidenceBundle,
     ObservationPhase,
@@ -239,7 +240,7 @@ class FakeJudge:
 def run_graph(
     config: AppConfig,
     bps: FakeBps,
-    dut: FakeDut,
+    dut: FakeDut | None,
     judge: FakeJudge,
     clock: FakeClock,
 ) -> dict[str, Any]:
@@ -254,6 +255,38 @@ def run_graph(
         )
     )
     return graph.invoke(initial_state("evaluation-1", config))
+
+
+def test_bps_only_mode_never_calls_dut_and_omits_dut_evidence(app_config: AppConfig) -> None:
+    config = app_config.model_copy(
+        update={
+            "evaluation": app_config.evaluation.model_copy(update={"mode": EvaluationMode.BPS_ONLY})
+        }
+    )
+    clock = FakeClock()
+    dut = FakeDut()
+
+    result = run_graph(
+        config,
+        FakeBps(clock),
+        dut,
+        FakeJudge([VerdictValue.PASS]),
+        clock,
+    )
+
+    assert result["outcome"] == EvaluationOutcome.PASSED.value
+    attempt = result["attempts"][0]
+    assert attempt["evidence_complete"] is True
+    evidence_path = Path(attempt["evidence_path"])
+    evidence = ArtifactStore.read_json(evidence_path)
+    assert evidence["evaluation_mode"] == "bps_only"
+    assert evidence["assessment"] == config.bps_only_assessment.model_dump(mode="json")
+    assert not any(name.startswith("dut_") for name in evidence)
+    assert not (evidence_path.parent / "dut-observations.json").exists()
+    assert clock.sleeps == [10]
+    assert dut.keepalive_calls == 0
+    assert dut.monitoring_calls == 0
+    assert dut.supplemental_calls == 0
 
 
 def test_passes_on_first_complete_attempt(app_config: AppConfig) -> None:

@@ -19,6 +19,7 @@ from bps_agent.cli import (
 from bps_agent.models import (
     AppConfig,
     AttemptRecord,
+    EvaluationMode,
     EvaluationOutcome,
     VerdictDocument,
     VerdictValue,
@@ -56,6 +57,7 @@ def test_run_parser_accepts_template_and_port_overrides() -> None:
             "--total-bandwidth-mbps",
             "300",
             "--stop-before-llm",
+            "--bps-only",
         ]
     )
 
@@ -63,6 +65,7 @@ def test_run_parser_accepts_template_and_port_overrides() -> None:
     assert arguments.ports == [6, 7]
     assert arguments.total_bandwidth_mbps == 300.0
     assert arguments.stop_before_llm is True
+    assert arguments.bps_only is True
 
 
 def test_bps_overrides_are_validated_without_mutating_base_config(
@@ -131,6 +134,20 @@ def test_cli_allows_target_above_400_for_larger_templates(app_config: AppConfig)
     assert overridden.bps.total_bandwidth_mbps == 800.0
 
 
+def test_cli_can_override_the_evaluation_to_bps_only(app_config: AppConfig) -> None:
+    overridden = _apply_bps_overrides(
+        app_config,
+        template=None,
+        ports=None,
+        total_bandwidth_mbps=None,
+        resume_id=None,
+        bps_only=True,
+    )
+
+    assert overridden.evaluation.mode == EvaluationMode.BPS_ONLY
+    assert app_config.evaluation.mode == EvaluationMode.BPS_AND_DUT
+
+
 def test_resume_rejects_bandwidth_override(app_config: AppConfig) -> None:
     with pytest.raises(ValueError, match="cannot be used with --resume"):
         _apply_bps_overrides(
@@ -139,6 +156,18 @@ def test_resume_rejects_bandwidth_override(app_config: AppConfig) -> None:
             ports=None,
             total_bandwidth_mbps=300.0,
             resume_id="evaluation-id",
+        )
+
+
+def test_resume_rejects_bps_only_override(app_config: AppConfig) -> None:
+    with pytest.raises(ValueError, match="cannot be used with --resume"):
+        _apply_bps_overrides(
+            app_config,
+            template=None,
+            ports=None,
+            total_bandwidth_mbps=None,
+            resume_id="evaluation-id",
+            bps_only=True,
         )
 
 

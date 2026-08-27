@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from bps_agent.config import load_config
+from bps_agent.models import EvaluationMode
 
 
 def test_demo_configuration_matches_real_lab_defaults() -> None:
@@ -23,6 +24,8 @@ def test_demo_configuration_matches_real_lab_defaults() -> None:
     assert config.llm.company.model == "deepseek-v4-flash-0731"
     assert config.llm.official.model == "deepseek-v4-flash"
     assert config.evaluation.max_attempts == 5
+    assert config.evaluation.mode == EvaluationMode.BPS_AND_DUT
+    assert "BPS" in config.bps_only_assessment.goal
     assert "lock_dir" not in config.storage.model_dump()
 
 

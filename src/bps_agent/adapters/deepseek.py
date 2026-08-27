@@ -20,6 +20,7 @@ _SYSTEM_PROMPT = """你是网络设备性能测试裁决专家。
 可以加入 summary、observations、risks、retry_reason、confidence 等字段。
 不得输出 JSON 之外的文字, 不得臆造证据中不存在的指标。
 请把 bps_performance_analysis 作为确定性性能波动证据纳入判断，但它不替代你的最终 Verdict。
+evaluation_mode 为 bps_only 时没有 DUT 证据是正常情况，不得因此判定失败或要求 DUT 指标。
 不要把基础设施错误当作 DUT 性能失败。"""
 
 
@@ -120,7 +121,7 @@ class DeepSeekJudge:
         )
 
     def adjudicate(self, evidence: EvidenceBundle) -> tuple[VerdictDocument, dict[str, Any]]:
-        user_content = json.dumps(evidence.model_dump(mode="json"), ensure_ascii=False)
+        user_content = json.dumps(evidence.as_document(), ensure_ascii=False)
         return self._request_verdict(
             [
                 {"role": "system", "content": _SYSTEM_PROMPT},
