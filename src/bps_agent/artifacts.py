@@ -6,6 +6,7 @@ import json
 import os
 import re
 import tempfile
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -79,6 +80,13 @@ class ArtifactStore:
                 temporary = Path(handle.name)
             os.replace(temporary, path)
             temporary = None
+            directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            with suppress(OSError):
+                directory_fd = os.open(path.parent, directory_flags)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
             return path
         finally:
             if temporary is not None:

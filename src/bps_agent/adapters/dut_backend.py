@@ -18,6 +18,7 @@ from bps_agent.artifacts import ArtifactStore
 from bps_agent.models import (
     BackendDutEvidence,
     BackendDutTarget,
+    DutBackendConfig,
     DutCaptureResult,
     DutConfig,
 )
@@ -144,13 +145,16 @@ def _validate_snapshot(document: dict[str, Any], interfaces: tuple[str, ...]) ->
 class DutSshBackendClient:
     def __init__(self, config: DutConfig, *, username: str, password: str) -> None:
         self.config = config
+        if config.backend is None:
+            raise ValueError("backend_ssh DUT collection requires dut.backend")
+        self._backend = config.backend
         self.username = username
         self._password = password
         self._client: paramiko.SSHClient | None = None
 
     def connect(self) -> None:
         self.close()
-        backend = self.config.backend
+        backend = self._backend
         client = paramiko.SSHClient()
         # This temporary lab mode deliberately does not load or persist host keys.
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -191,7 +195,7 @@ class DutSshBackendClient:
         return self._client
 
     def read_snapshot(self, interfaces: tuple[str, ...]) -> dict[str, Any]:
-        backend = self.config.backend
+        backend = self._backend
         command = _remote_command(interfaces)
         last_error: BaseException | None = None
         for attempt in range(backend.read_attempts):
@@ -249,6 +253,12 @@ def _elapsed_seconds(origin: str, current: Any) -> str:
     if abs(elapsed) < 0.0005:
         elapsed = 0.0
     return f"{elapsed:.3f}".rstrip("0").rstrip(".")
+
+
+def _missed_intervals(next_deadline: float, now: float, interval: float) -> int:
+    if now < next_deadline:
+        return 0
+    return int((now - next_deadline) // interval) + 1
 
 
 def render_metrics_csv(samples: list[dict[str, Any]], interfaces: tuple[str, ...]) -> str:
@@ -312,6 +322,9 @@ class DutBackendCollector:
         client: DutSshBackendClient | None = None,
     ) -> None:
         self.config = config
+        if config.backend is None:
+            raise ValueError("backend_ssh DUT collection requires dut.backend")
+        self._backend: DutBackendConfig = config.backend
         self._client = client or DutSshBackendClient(
             config,
             username=username,
@@ -319,6 +332,7 @@ class DutBackendCollector:
         )
         self._samples: list[dict[str, Any]] = []
         self._errors: list[dict[str, Any]] = []
+        self._missed_sample_count = 0
         self._attempt_dir: Path | None = None
         self._raw_path: Path | None = None
         self._csv_path: Path | None = None
@@ -333,6 +347,7 @@ class DutBackendCollector:
         self._client.close()
         self._samples = []
         self._errors = []
+        self._missed_sample_count = 0
         self._traffic_started_at = None
         self._traffic_finished_at = None
         self._attempt_dir = attempt_dir
@@ -377,8 +392,8 @@ class DutBackendCollector:
             raise RuntimeError("resumed backend DUT metrics artifact is not an object")
         target = _object(document.get("target"))
         if (
-            target.get("host") != self.config.backend.host
-            or target.get("port") != self.config.backend.port
+            target.get("host") != self._backend.host
+            or target.get("port") != self._backend.port
         ):
             raise RuntimeError("resumed backend DUT target differs from the checkpoint")
         if tuple(document.get("interfaces", ())) != self.config.interfaces:
@@ -392,6 +407,10 @@ class DutBackendCollector:
         self._csv_path = attempt_dir / "dut-metrics.csv"
         self._samples = [item for item in raw_samples if isinstance(item, dict)]
         self._errors = [item for item in raw_errors if isinstance(item, dict)]
+        missed_sample_count = document.get("missed_sample_count", 0)
+        if not isinstance(missed_sample_count, int) or missed_sample_count < 0:
+            raise RuntimeError("resumed backend DUT artifact has invalid missed_sample_count")
+        self._missed_sample_count = missed_sample_count
         self._traffic_started_at = started_at
         self._traffic_finished_at = finished_at
         if finished_at is None:
@@ -402,7 +421,7 @@ class DutBackendCollector:
         origin = time.monotonic()
         sample_number = 0
         while not self._stop.is_set():
-            scheduled_at = origin + sample_number * self.config.backend.interval_seconds
+            scheduled_at = origin + sample_number * self._backend.interval_seconds
             delay = scheduled_at - time.monotonic()
             if delay > 0 and self._stop.wait(delay):
                 break
@@ -414,8 +433,16 @@ class DutBackendCollector:
                     "finished_at": _iso_now(),
                     "resources": snapshot,
                 }
+                sample_number += 1
+                missed = _missed_intervals(
+                    origin + sample_number * self._backend.interval_seconds,
+                    time.monotonic(),
+                    self._backend.interval_seconds,
+                )
+                sample_number += missed
                 with self._lock:
                     self._samples.append(sample)
+                    self._missed_sample_count += missed
                     self._write_checkpoint_locked()
             except Exception as exc:
                 failure = {
@@ -424,10 +451,17 @@ class DutBackendCollector:
                     "finished_at": _iso_now(),
                     "error": str(exc),
                 }
+                sample_number += 1
+                missed = _missed_intervals(
+                    origin + sample_number * self._backend.interval_seconds,
+                    time.monotonic(),
+                    self._backend.interval_seconds,
+                )
+                sample_number += missed
                 with self._lock:
                     self._errors.append(failure)
+                    self._missed_sample_count += missed
                     self._write_checkpoint_locked()
-            sample_number += 1
 
     def traffic_finished(self, finished_at: str) -> None:
         self._traffic_finished_at = finished_at
@@ -444,15 +478,16 @@ class DutBackendCollector:
     def _result_document(self) -> dict[str, Any]:
         return {
             "target": {
-                "host": self.config.backend.host,
-                "port": self.config.backend.port,
+                "host": self._backend.host,
+                "port": self._backend.port,
                 "transport": "ssh",
                 "backend": "PHP Dashboard/SystemChart.php",
             },
             "interfaces": list(self.config.interfaces),
             "traffic_started_at": self._traffic_started_at,
             "traffic_finished_at": self._traffic_finished_at,
-            "interval_seconds": self.config.backend.interval_seconds,
+            "interval_seconds": self._backend.interval_seconds,
+            "missed_sample_count": self._missed_sample_count,
             "samples": list(self._samples),
             "errors": list(self._errors),
         }
@@ -479,15 +514,16 @@ class DutBackendCollector:
         self._client.close()
         evidence = BackendDutEvidence(
             target=BackendDutTarget(
-                host=self.config.backend.host,
-                port=self.config.backend.port,
+                host=self._backend.host,
+                port=self._backend.port,
             ),
             interfaces=self.config.interfaces,
             traffic_started_at=started_at,
             traffic_finished_at=finished_at,
-            interval_seconds=self.config.backend.interval_seconds,
+            interval_seconds=self._backend.interval_seconds,
             successful_sample_count=len(self._samples),
             failed_sample_count=len(self._errors),
+            missed_sample_count=self._missed_sample_count,
             errors=tuple(self._errors),
             metrics_csv=metrics_csv,
         )

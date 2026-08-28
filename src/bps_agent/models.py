@@ -118,7 +118,7 @@ class BpsConfig(StrictModel):
 
 
 class DutBackendConfig(StrictModel):
-    host: str = "10.66.246.133"
+    host: str
     port: int = Field(default=50023, ge=1, le=65535)
     interval_seconds: float = Field(default=10.0, gt=0)
     connect_timeout_seconds: float = Field(default=10.0, gt=0)
@@ -154,7 +154,7 @@ class DutFrontendConfig(StrictModel):
 class DutConfig(StrictModel):
     collection_method: DutCollectionMethod = DutCollectionMethod.BACKEND_SSH
     interfaces: tuple[str, ...]
-    backend: DutBackendConfig = DutBackendConfig()
+    backend: DutBackendConfig | None = None
     frontend: DutFrontendConfig | None = None
 
     @model_validator(mode="before")
@@ -190,6 +190,8 @@ class DutConfig(StrictModel):
 
     @model_validator(mode="after")
     def require_selected_configuration(self) -> DutConfig:
+        if self.collection_method == DutCollectionMethod.BACKEND_SSH and self.backend is None:
+            raise ValueError("backend_ssh DUT collection requires dut.backend")
         if self.collection_method == DutCollectionMethod.FRONTEND_API and self.frontend is None:
             raise ValueError("frontend_api DUT collection requires dut.frontend")
         return self
@@ -332,6 +334,15 @@ class DutObservations(StrictModel):
         if not observations:
             raise ValueError("at least one DUT resource observation is required")
 
+        phases = [item.phase for item in observations]
+        duplicate_phases = sorted(
+            {phase.value for phase in phases if phases.count(phase) > 1}
+        )
+        if duplicate_phases:
+            raise ValueError(
+                "duplicate DUT resource observation phases: " + ", ".join(duplicate_phases)
+            )
+
         def build_series(documents: dict[ObservationPhase, Any]) -> ObservedSeries:
             metadata: dict[str, Any] = {}
             points: dict[ObservationPhase, tuple[dict[str, Any], ...]] = {}
@@ -372,10 +383,22 @@ class DutObservations(StrictModel):
                 documents[phase] = traffic.get(interface) if isinstance(traffic, dict) else None
             traffic_series[interface] = build_series(documents)
 
+        def instant(value: str) -> datetime:
+            parsed = datetime.fromisoformat(value)
+            if parsed.tzinfo is None:
+                raise ValueError("DUT observation timestamps must include a timezone")
+            return parsed
+
         first = observations[0]
+        collection_started_at = min(
+            observations, key=lambda item: instant(item.started_at)
+        ).started_at
+        collection_finished_at = max(
+            observations, key=lambda item: instant(item.finished_at)
+        ).finished_at
         return cls(
-            collection_started_at=first.started_at,
-            collection_finished_at=first.finished_at,
+            collection_started_at=collection_started_at,
+            collection_finished_at=collection_finished_at,
             dut_clock_offset_seconds=first.dut_clock_offset_seconds,
             windows=windows,
             resources=resources,
@@ -497,6 +520,7 @@ class BackendDutEvidence(StrictModel):
     interval_seconds: float
     successful_sample_count: int = Field(ge=0)
     failed_sample_count: int = Field(ge=0)
+    missed_sample_count: int = Field(default=0, ge=0)
     errors: tuple[dict[str, Any], ...] = ()
     metrics_csv: str
 
@@ -618,6 +642,7 @@ class AttemptRecord(StrictModel):
     dut_csv_artifact_path: str | None = None
     dut_successful_sample_count: int | None = None
     dut_failed_sample_count: int | None = None
+    dut_missed_sample_count: int | None = None
     report_path: str | None = None
     pdf_report_path: str | None = None
     performance_timeseries_path: str | None = None

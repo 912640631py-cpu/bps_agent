@@ -11,7 +11,9 @@ from typing import Any, Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from bps_agent.adjudication import verdict_artifact
 from bps_agent.artifacts import ArtifactStore
+from bps_agent.launch import LaunchReconciliationError, RunLaunchCoordinator
 from bps_agent.models import (
     AppConfig,
     AttemptRecord,
@@ -146,6 +148,7 @@ def build_graph(
     interrupt_before: list[str] | None = None,
 ) -> Any:
     cfg = services.config
+    launcher = RunLaunchCoordinator(services.bps, services.artifacts)
     dut_enabled = cfg.evaluation.mode == EvaluationMode.BPS_AND_DUT
     if dut_enabled and services.dut is None:
         raise ValueError("bps_and_dut mode requires a DUT adapter")
@@ -189,19 +192,42 @@ def build_graph(
         run_id: str | None = None
         dut_started = False
         try:
-            if dut_enabled:
-                assert services.dut is not None
-                services.dut.prepare_attempt(
-                    services.artifacts.attempt_dir(state["evaluation_id"], attempt_number)
+            launch = launcher.recover(
+                state["evaluation_id"],
+                attempt_number,
+                template=cfg.bps.template,
+                group=cfg.bps.group,
+            )
+            recovered = launch is not None
+            if launch is None:
+                if dut_enabled:
+                    assert services.dut is not None
+                    services.dut.prepare_attempt(
+                        services.artifacts.attempt_dir(state["evaluation_id"], attempt_number)
+                    )
+                services.bps.reserve_ports()
+                reserved = True
+                services.bps.set_total_bandwidth(bandwidth_percent)
+                launch = launcher.start(
+                    state["evaluation_id"],
+                    attempt_number,
+                    template=cfg.bps.template,
+                    group=cfg.bps.group,
                 )
-            services.bps.reserve_ports()
-            reserved = True
-            services.bps.set_total_bandwidth(bandwidth_percent)
-            run_id = services.bps.start_run()
-            traffic_started_at = utc_now()
+            else:
+                reserved = True
+            run_id = launch.run_id
+            traffic_started_at = launch.launched_at
             if dut_enabled:
                 assert services.dut is not None
-                services.dut.traffic_started(traffic_started_at)
+                if recovered:
+                    services.dut.restore_attempt(
+                        services.artifacts.attempt_dir(state["evaluation_id"], attempt_number),
+                        traffic_started_at,
+                        None,
+                    )
+                else:
+                    services.dut.traffic_started(traffic_started_at)
                 dut_started = True
             attempt = attempt.model_copy(
                 update={
@@ -223,6 +249,17 @@ def build_graph(
                 bandwidth_percent,
             )
             return {"attempts": [*state["attempts"], attempt.model_dump(mode="json")]}
+        except LaunchReconciliationError as exc:
+            attempt = _append_error(attempt, f"BPS launch reconciliation failed: {exc}")
+            attempt = attempt.model_copy(update={"ports_reserved": True})
+            services.artifacts.write_attempt_json(
+                state["evaluation_id"], attempt_number, "attempt.json", attempt
+            )
+            return {
+                "attempts": [*state["attempts"], attempt.model_dump(mode="json")],
+                "outcome": EvaluationOutcome.INCONCLUSIVE.value,
+                "error": attempt.errors[-1],
+            }
         except Exception as exc:
             if run_id is not None:
                 try:
@@ -259,6 +296,9 @@ def build_graph(
             completion = services.bps.wait_for_completion(attempt.bps_run_id, lambda: None)
             if not completion.terminal:
                 raise RuntimeError("BPS adapter did not confirm a terminal run state")
+            launcher.mark_terminal(
+                state["evaluation_id"], attempt.number, attempt.bps_run_id
+            )
         except Exception as exc:
             attempt = _append_error(attempt, f"BPS monitoring failed: {exc}")
             run_id = attempt.bps_run_id
@@ -310,6 +350,9 @@ def build_graph(
                 "error": release_error,
             }
         attempt = attempt.model_copy(update={"ports_reserved": False})
+        released_run_id = attempt.bps_run_id
+        assert released_run_id is not None
+        launcher.mark_released(state["evaluation_id"], attempt.number, released_run_id)
         services.artifacts.write_attempt_json(
             state["evaluation_id"], attempt.number, "attempt.json", attempt
         )
@@ -351,6 +394,7 @@ def build_graph(
                         {
                             "dut_successful_sample_count": (dut_evidence.successful_sample_count),
                             "dut_failed_sample_count": dut_evidence.failed_sample_count,
+                            "dut_missed_sample_count": dut_evidence.missed_sample_count,
                         }
                     )
                 attempt = attempt.model_copy(update=sample_updates)
@@ -402,18 +446,6 @@ def build_graph(
                     selection.ambiguous_required,
                 )
             attempt_dir = services.artifacts.attempt_dir(state["evaluation_id"], attempt.number)
-            pdf_destination = attempt_dir / "bps-report-full.pdf"
-            full_section_ids = tuple(
-                section.section_id for section in report_sections if section.parent_id is None
-            )
-            try:
-                services.bps.schedule_full_report_pdf(
-                    run_id,
-                    pdf_destination,
-                    full_section_ids,
-                )
-            except Exception as exc:
-                LOGGER.warning("Optional full PDF report export could not be scheduled: %s", exc)
             destination = attempt_dir / "bps-report.csv"
             report_path = services.bps.export_report(
                 run_id,
@@ -435,6 +467,18 @@ def build_graph(
             )
             performance_analysis = analyze_performance_timeseries(performance_path)
             report_text = report_path.read_text(encoding="utf-8-sig", errors="replace")
+            pdf_destination = attempt_dir / "bps-report-full.pdf"
+            full_section_ids = tuple(
+                section.section_id for section in report_sections if section.parent_id is None
+            )
+            try:
+                services.bps.schedule_full_report_pdf(
+                    run_id,
+                    pdf_destination,
+                    full_section_ids,
+                )
+            except Exception as exc:
+                LOGGER.warning("Optional full PDF report export could not be scheduled: %s", exc)
         except Exception as exc:
             attempt = _append_error(attempt, f"evidence collection failed: {exc}")
 
@@ -498,8 +542,9 @@ def build_graph(
     def adjudicate(state: EvaluationState) -> dict[str, Any]:
         attempt = _attempts(state)[-1]
         assert attempt.evidence_path is not None
+        evidence_path = Path(attempt.evidence_path)
         evidence = EvidenceBundle.model_validate(
-            services.artifacts.read_json(Path(attempt.evidence_path))
+            services.artifacts.read_json(evidence_path)
         )
         try:
             verdict, raw_response = services.judge.adjudicate(evidence)
@@ -517,7 +562,14 @@ def build_graph(
             state["evaluation_id"],
             attempt.number,
             "verdict.json",
-            {"parsed": verdict.model_dump(mode="json"), "raw_response": raw_response},
+            verdict_artifact(
+                provider=services.judge.provider_name,
+                model=services.judge.model_name,
+                reasoning_effort=getattr(services.judge, "reasoning_effort", None),
+                verdict=verdict,
+                provider_exchange=raw_response,
+                evidence_path=evidence_path,
+            ),
         )
         attempt = attempt.model_copy(update={"verdict": verdict, "verdict_path": str(verdict_path)})
         services.artifacts.write_attempt_json(

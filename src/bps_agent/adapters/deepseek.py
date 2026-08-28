@@ -25,7 +25,19 @@ backend_ssh 的 DUT 证据以 metrics_csv 提供连续采样；结合成功/失�
 不要把基础设施错误当作 DUT 性能失败。"""
 
 
-class ProviderCompatibilityError(RuntimeError):
+class ProviderError(RuntimeError):
+    pass
+
+
+class ProviderCompatibilityError(ProviderError):
+    pass
+
+
+class ProviderRequestError(ProviderError):
+    pass
+
+
+class ProviderResponseError(ProviderError):
     pass
 
 
@@ -65,44 +77,48 @@ class DeepSeekJudge:
             "thinking": {"type": "enabled"},
             "reasoning_effort": self.reasoning_effort,
         }
-        last_error: Exception | None = None
+        last_error: RuntimeError | None = None
+        last_cause: Exception | None = None
         for attempt in range(self.config.attempts):
             try:
                 response = self._client.post(self._endpoint, headers=self._headers, json=payload)
+            except httpx.HTTPError as exc:
+                last_error = ProviderRequestError(f"LLM request transport failed: {exc}")
+                last_cause = exc
+            else:
                 if response.is_redirect:
-                    raise RuntimeError("LLM endpoint returned an unexpected redirect")
-                if response.status_code in _RETRYABLE_STATUS and attempt + 1 < self.config.attempts:
-                    time.sleep(min(2**attempt, 10))
-                    continue
+                    raise ProviderRequestError("LLM endpoint returned an unexpected redirect")
                 if response.status_code == 400:
                     raise ProviderCompatibilityError(
                         "LLM rejected JSON/thinking/reasoning_effort="
                         f"{self.reasoning_effort} compatibility: "
                         f"{response.text[:500]}"
                     )
-                response.raise_for_status()
-                document = response.json()
-                if not isinstance(document, dict):
-                    raise RuntimeError("LLM response envelope is not a JSON object")
-                parsed = json.loads(self._content(document))
-                return VerdictDocument.model_validate(parsed), {
-                    "request": payload,
-                    "response": document,
-                }
-            except ProviderCompatibilityError:
-                raise
-            except (
-                httpx.NetworkError,
-                httpx.TimeoutException,
-                json.JSONDecodeError,
-                RuntimeError,
-                ValueError,
-            ) as exc:
-                last_error = exc
-                if attempt + 1 >= self.config.attempts:
-                    break
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    last_error = ProviderRequestError(
+                        f"LLM request failed with HTTP {response.status_code}"
+                    )
+                    last_cause = exc
+                    if response.status_code not in _RETRYABLE_STATUS:
+                        raise last_error from exc
+                else:
+                    try:
+                        document = response.json()
+                        if not isinstance(document, dict):
+                            raise ValueError("LLM response envelope is not a JSON object")
+                        parsed = json.loads(self._content(document))
+                        verdict = VerdictDocument.model_validate(parsed)
+                    except (json.JSONDecodeError, RuntimeError, ValueError) as exc:
+                        last_error = ProviderResponseError(f"LLM response was invalid: {exc}")
+                        last_cause = exc
+                    else:
+                        return verdict, {"response": document}
+            if attempt + 1 < self.config.attempts:
                 time.sleep(min(2**attempt, 10))
-        raise RuntimeError(f"LLM did not return a valid Verdict after retries: {last_error}")
+        assert last_error is not None
+        raise last_error from last_cause
 
     @staticmethod
     def _content(document: dict[str, Any]) -> str:

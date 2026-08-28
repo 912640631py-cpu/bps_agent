@@ -8,7 +8,12 @@ import httpx
 import pytest
 
 from bps_agent.adapters.bps import BpsClient, PortReleaseError
-from bps_agent.adapters.deepseek import DeepSeekJudge
+from bps_agent.adapters.deepseek import (
+    DeepSeekJudge,
+    ProviderCompatibilityError,
+    ProviderRequestError,
+    ProviderResponseError,
+)
 from bps_agent.adapters.dut import DutClient
 from bps_agent.models import (
     BpsConfig,
@@ -342,6 +347,97 @@ def test_deepseek_retries_invalid_json_at_most_three_times() -> None:
     assert calls == 3
 
 
+@pytest.mark.parametrize("status_code", [401, 403, 404])
+def test_deepseek_wraps_non_retryable_http_status(status_code: int) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, text="rejected")
+
+    judge = DeepSeekJudge(
+        "official",
+        ProviderConfig(
+            base_url="https://api.deepseek.com",
+            model="deepseek-v4-flash",
+            token_env="DEEPSEEK_API_KEY",
+            attempts=3,
+        ),
+        token="secret",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(ProviderRequestError, match=f"HTTP {status_code}"):
+        judge.validate_compatibility()
+
+
+def test_deepseek_wraps_invalid_response_after_retries() -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"choices": []})
+
+    judge = DeepSeekJudge(
+        "official",
+        ProviderConfig(
+            base_url="https://api.deepseek.com",
+            model="deepseek-v4-flash",
+            token_env="DEEPSEEK_API_KEY",
+            attempts=2,
+        ),
+        token="secret",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(ProviderResponseError, match="omitted choices"):
+        judge.validate_compatibility()
+    assert calls == 2
+
+
+def test_deepseek_wraps_transport_failure_after_retries() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ConnectError("connection refused", request=request)
+
+    judge = DeepSeekJudge(
+        "official",
+        ProviderConfig(
+            base_url="https://api.deepseek.com",
+            model="deepseek-v4-flash",
+            token_env="DEEPSEEK_API_KEY",
+            attempts=2,
+        ),
+        token="secret",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(ProviderRequestError, match="transport failed"):
+        judge.validate_compatibility()
+    assert calls == 2
+
+
+def test_deepseek_preserves_compatibility_error_type() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, text="unsupported reasoning")
+
+    judge = DeepSeekJudge(
+        "official",
+        ProviderConfig(
+            base_url="https://api.deepseek.com",
+            model="deepseek-v4-flash",
+            token_env="DEEPSEEK_API_KEY",
+            attempts=3,
+        ),
+        token="secret",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(ProviderCompatibilityError, match="unsupported reasoning"):
+        judge.validate_compatibility()
+
+
 def test_bps_completion_requires_report_when_run_was_never_observed() -> None:
     report_checks = 0
     polls = 0
@@ -382,6 +478,34 @@ def test_bps_completion_requires_report_when_run_was_never_observed() -> None:
     assert completion.terminal
     assert completion.details["completion"] == "report-ready-before-registration-observed"
     assert report_checks == polls == 2
+
+
+def test_bps_reconciliation_filters_running_runs_by_template_and_group() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/topology/runningTest")
+        return httpx.Response(
+            200,
+            json=[
+                {"runId": "11", "modelName": "template", "group": 10},
+                {"runId": "12", "modelName": "other", "group": 10},
+                {"runId": "13", "modelName": "template", "group": 11},
+            ],
+        )
+
+    client = BpsClient(
+        BpsConfig(
+            endpoint="https://bps.example.test",
+            template="template",
+            slot=4,
+            ports=(4, 5),
+            group=10,
+        ),
+        username="user",
+        password="password",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert client.find_running_runs(template="template", group=10) == ("11",)
 
 
 def test_bps_temporary_disappearance_does_not_complete_without_ready_report() -> None:

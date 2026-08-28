@@ -22,6 +22,7 @@ from bps_agent.adapters.bps import BpsClient
 from bps_agent.adapters.deepseek import DeepSeekJudge
 from bps_agent.adapters.dut import DutClient
 from bps_agent.adapters.dut_backend import DutBackendCollector
+from bps_agent.adjudication import verdict_artifact
 from bps_agent.artifacts import ArtifactStore
 from bps_agent.config import load_config
 from bps_agent.credentials import (
@@ -216,6 +217,8 @@ def _apply_bps_overrides(
         document["evaluation"]["mode"] = EvaluationMode.BPS_ONLY.value
     if dut_collection_method is not None:
         document["dut"]["collection_method"] = dut_collection_method.value
+    if any(value is not None for value in (dut_host, dut_port, dut_interval_seconds)):
+        document["dut"]["backend"] = document["dut"].get("backend") or {}
     if dut_host is not None:
         document["dut"]["backend"]["host"] = dut_host
     if dut_port is not None:
@@ -451,12 +454,14 @@ def replay(
         output_path = evidence_path.parent / "replay-verdict.json"
         ArtifactStore.write_json(
             output_path,
-            {
-                "provider": judge.provider_name,
-                "model": judge.model_name,
-                "parsed": verdict.model_dump(mode="json"),
-                "raw_response": raw,
-            },
+            verdict_artifact(
+                provider=judge.provider_name,
+                model=judge.model_name,
+                reasoning_effort=judge.reasoning_effort,
+                verdict=verdict,
+                provider_exchange=raw,
+                evidence_path=evidence_path,
+            ),
         )
         print(verdict.model_dump_json(indent=2))
         print(f"Replay audit: {output_path}")

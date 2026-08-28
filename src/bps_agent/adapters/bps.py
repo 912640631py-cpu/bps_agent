@@ -7,18 +7,21 @@ import logging
 import math
 import os
 import re
+import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
-from threading import Thread
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 import httpx
 
+from bps_agent.artifacts import ArtifactStore
 from bps_agent.models import BpsConfig, RunCompletion
+from bps_agent.pdf_worker import PdfExportJob
 
 LOGGER = logging.getLogger(__name__)
 
@@ -365,6 +368,36 @@ class BpsClient:
         )
         return _extract_run_id(payload)
 
+    def find_running_runs(self, *, template: str, group: int) -> tuple[str, ...]:
+        payload = self._checked(
+            self._request("GET", "/bps/api/v2/core/topology/runningTest", timeout=30)
+        )
+        matches: list[str] = []
+        for item in _normalize_list(
+            payload, ("items", "results", "data", "runningTest", "runningTests")
+        ):
+            item_template = next(
+                (
+                    item[key]
+                    for key in ("modelname", "modelName", "testModelName", "testName")
+                    if key in item
+                ),
+                None,
+            )
+            item_group = next(
+                (item[key] for key in ("group", "groupId", "groupid") if key in item),
+                None,
+            )
+            if str(item_template) != template or str(item_group) != str(group):
+                continue
+            run_id = next(
+                (str(item[key]) for key in ("id", "runid", "runId") if item.get(key) is not None),
+                None,
+            )
+            if run_id is not None:
+                matches.append(run_id)
+        return tuple(dict.fromkeys(matches))
+
     def _running_test(self, run_id: str) -> dict[str, Any] | None:
         payload = self._checked(
             self._request("GET", "/bps/api/v2/core/topology/runningTest", timeout=30)
@@ -583,43 +616,45 @@ class BpsClient:
         destination: Path,
         section_ids: tuple[str, ...],
     ) -> None:
-        """Start an isolated best-effort PDF export outside the Evaluation critical path."""
+        """Persist and launch an independently authenticated supplementary export."""
 
-        if not self._session_id or not self._api_key:
+        if not self._session_id or not self._api_key or not self._password:
             LOGGER.warning(
                 "Optional full PDF report export was not scheduled: BPS is not logged in"
             )
             return
-        config = self.config
-        username = self.username
-        headers = dict(self._client.headers)
-        cookies = dict(self._client.cookies.items())
-
-        def export() -> None:
-            try:
-                with httpx.Client(
-                    verify=config.verify_tls,
-                    follow_redirects=False,
-                    timeout=httpx.Timeout(30.0, read=config.pdf_report_timeout_seconds),
-                    trust_env=False,
-                    headers=headers,
-                    cookies=cookies,
-                ) as client:
-                    worker = BpsClient(
-                        config,
-                        username=username,
-                        password="",
-                        client=client,
-                    )
-                    worker.export_full_report_pdf(run_id, destination, section_ids)
-            except Exception as exc:
-                LOGGER.warning("Optional full PDF report export failed: %s", exc)
-
-        Thread(
-            target=export,
-            name=f"bps-full-pdf-{run_id}",
-            daemon=True,
-        ).start()
+        job_path = destination.with_name("bps-report-full.job.json")
+        job = PdfExportJob.pending(
+            config=self.config,
+            run_id=run_id,
+            destination=destination,
+            section_ids=section_ids,
+        )
+        ArtifactStore.write_json(job_path, job)
+        worker_environment = os.environ.copy()
+        worker_environment["BPS_USERNAME"] = self.username
+        worker_environment["BPS_PASSWORD"] = self._password
+        creation_flags = 0
+        start_new_session = os.name != "nt"
+        if os.name == "nt":
+            creation_flags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
+        try:
+            subprocess.Popen(
+                [sys.executable, "-m", "bps_agent.pdf_worker", "--job", str(job_path)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                env=worker_environment,
+                creationflags=creation_flags,
+                start_new_session=start_new_session,
+            )
+        except OSError as exc:
+            ArtifactStore.write_json(job_path, job.failed(f"could not launch PDF worker: {exc}"))
+            raise
+        finally:
+            worker_environment["BPS_USERNAME"] = ""
+            worker_environment["BPS_PASSWORD"] = ""
 
     def stop_run(self, run_id: str) -> None:
         self._checked(

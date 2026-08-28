@@ -74,9 +74,10 @@ python -m bps_agent replay --evidence artifacts\EVALUATION_ID\attempt-01\evidenc
 
 恢复运行时不能使用模板、端口、带宽、DUT 或模式覆盖参数。
 也可以在 YAML 中设置 `evaluation.mode: bps_only`；默认值为 `bps_and_dut`。
-`dut.collection_method` 默认是 `backend_ssh`，采样从 BPS 打流开始持续到流量结束，
-不使用固定样本数，也不登录 DUT 前端或请求 CAPTCHA。当前 SSH 方式不读取、
-校验或持久化主机密钥。设置为 `frontend_api` 时，CAPTCHA 由操作者输入且不会保存。
+`dut.collection_method` 默认是 `backend_ssh`，该模式必须显式配置 `dut.backend.host`。
+采样从 BPS 打流开始持续到流量结束；错过的周期会跳过并计入
+`missed_sample_count`，不会集中补采。当前 SSH 方式不读取、校验或持久化主机密钥。
+设置为 `frontend_api` 时，CAPTCHA 由操作者输入且不会保存。
 
 `llm.reasoning_effort` 控制模型推理程度，默认为 `max`，可在 `demo.yaml` 中调整。
 端口互斥由 BPS 的非强制预留负责；项目不再维护本地端口锁文件。
@@ -101,12 +102,18 @@ python -m bps_agent replay --evidence artifacts\EVALUATION_ID\attempt-01\evidenc
 每次 Attempt 默认生成：
 
 - `bps-report.csv`：测试参数、判据和结果，内容进入 `evidence.json`。
-- `bps-report-full.pdf`：best-effort 的 BPS 完整 PDF 结果报告，使用独立后台下载且不进入 LLM Evidence；慢速下载不会阻塞 Evidence、Verdict 或 finalize，失败只记录 warning，因此该补充产物可能缺失。
+- `bps-report-full.pdf`：best-effort 的 BPS 完整 PDF 结果报告；关键 CSV 导出完成后，
+  由独立进程使用自己的 BPS Session 下载，不进入 LLM Evidence。任务状态写入
+  `bps-report-full.job.json`，慢速下载不会阻塞 Evidence、Verdict 或 finalize。
+- `bps-launch.json`：BPS 外部 Run 的 durable launch journal；Resume 使用它接管已启动
+  Run，无法唯一 reconciliation 时停止为 `INCONCLUSIVE`，不会盲目重复打流。
 - `bps-performance-timeseries.csv`：原始秒级性能数据，不进入 `evidence.json`。
 - `dut-metrics.json`：使用 SSH 后端方式时，保存逐次采样的完整审计数据和失败记录，不发送给 LLM。
 - `dut-metrics.csv`：使用 SSH 后端方式时，保存打流期间的紧凑 DUT 时序，仅首行保留真实时间锚点，后续行使用相对秒数；正文进入 `evidence.json` 交给 LLM。
 - `evidence.json`：BPS 报告、紧凑的 `bps_performance_analysis`，以及启用时的 DUT 证据。
-- TOC、Section 解析结果、Attempt 和 Verdict 审计文件。
+- `verdict.json`：解析后的裁决、provider response、模型参数以及 Evidence 路径和 SHA-256；
+  不重复保存完整 Evidence 请求。
+- TOC、Section 解析结果和 Attempt 审计文件。
 
 性能时序按最近采样点对齐到 1 秒时间轴。Stable 阶段开始后的前 5 个对齐样本用于建立冻结 baseline，后续下降不会反向污染基线。Stable 负载下，吞吐下降超过约 10% 且持续至少 3 秒判为性能异常；下降超过约 20% 且持续至少 2 秒判为严重异常。Ramp-down 中吞吐与 Concurrent Flows 同步下降视为正常负载变化。
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from bps_agent.config import load_config
 from bps_agent.models import DutCollectionMethod, DutConfig, EvaluationMode
 
@@ -50,13 +52,12 @@ def test_legacy_flat_dut_configuration_selects_frontend_collection() -> None:
     assert config.frontend.baseline_seconds == 300
 
 
-def test_structured_dut_configuration_defaults_to_backend_collection() -> None:
-    config = DutConfig(
-        interfaces=("T1/1",),
-        frontend={"endpoint": "https://dut.example.test"},
-    )
-
-    assert config.collection_method == DutCollectionMethod.BACKEND_SSH
+def test_structured_backend_configuration_requires_an_explicit_target() -> None:
+    with pytest.raises(ValueError, match=r"requires dut\.backend"):
+        DutConfig(
+            interfaces=("T1/1",),
+            frontend={"endpoint": "https://dut.example.test"},
+        )
 
 
 def test_serialized_configuration_contains_no_secret_values() -> None:

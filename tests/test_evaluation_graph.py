@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
@@ -122,7 +123,7 @@ class FakeBps:
         self.pdf_started = Event()
         self.pdf_release = Event()
         self.pdf_finished = Event()
-        self.pdf_overlapped_existing_exports = False
+        self.pdf_started_after_existing_exports = False
         self.pdf_warning_count = 0
 
     def find_template(self, name: str) -> dict[str, Any]:
@@ -151,6 +152,10 @@ class FakeBps:
         self.run_count += 1
         return f"run-{self.run_count}"
 
+    def find_running_runs(self, *, template: str, group: int) -> tuple[str, ...]:
+        del template, group
+        return (f"run-{self.run_count}",) if self.run_count > self.stop_count else ()
+
     def wait_for_completion(self, run_id: str, on_poll: Callable[[], None]) -> RunCompletion:
         self.clock.sleep(10)
         on_poll()
@@ -166,10 +171,6 @@ class FakeBps:
         destination: Path,
         section_ids: tuple[str, ...],
     ) -> Path:
-        if self.verify_pdf_parallel and destination.name == "bps-report.csv":
-            assert self.pdf_started.wait(1)
-            self.pdf_overlapped_existing_exports = True
-            self.pdf_release.set()
         self.export_run_ids.append(run_id)
         self.export_section_ids.append(section_ids)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -189,6 +190,8 @@ class FakeBps:
         self.pdf_export_run_ids.append(run_id)
         self.pdf_export_section_ids.append(section_ids)
         self.pdf_destinations.append(destination)
+        if self.verify_pdf_parallel:
+            self.pdf_started_after_existing_exports = len(self.export_run_ids) == 2
         if self.pdf_error:
             raise RuntimeError("fixture PDF export failed")
         if self.verify_pdf_parallel or self.block_pdf_until_released:
@@ -500,7 +503,7 @@ def test_passes_on_first_complete_attempt(app_config: AppConfig) -> None:
     assert Path(result["final_artifact"]).exists()
 
 
-def test_full_pdf_export_overlaps_existing_report_exports(app_config: AppConfig) -> None:
+def test_full_pdf_worker_starts_after_critical_report_exports(app_config: AppConfig) -> None:
     clock = FakeClock()
     bps = FakeBps(clock, verify_pdf_parallel=True)
 
@@ -513,7 +516,7 @@ def test_full_pdf_export_overlaps_existing_report_exports(app_config: AppConfig)
     )
 
     assert result["outcome"] == EvaluationOutcome.PASSED.value
-    assert bps.pdf_overlapped_existing_exports
+    assert bps.pdf_started_after_existing_exports
 
 
 def test_full_pdf_export_failure_does_not_affect_evaluation(app_config: AppConfig) -> None:
@@ -956,3 +959,73 @@ def test_sqlite_checkpoint_can_resume_after_bps_run_creation(app_config: AppConf
 
     assert result["outcome"] == EvaluationOutcome.PASSED.value
     assert bps.run_count == 1
+
+
+def test_launch_journal_prevents_duplicate_after_node_crash(app_config: AppConfig) -> None:
+    clock = FakeClock()
+    bps = FakeBps(clock)
+    dut = FakeDut()
+    judge = FakeJudge([VerdictValue.PASS])
+    artifacts = ArtifactStore(app_config.storage.artifact_dir)
+    original_write_attempt_json = artifacts.write_attempt_json
+    crashed = False
+
+    def crash_before_node_checkpoint(
+        evaluation_id: str,
+        attempt_number: int,
+        name: str,
+        value: Any,
+    ) -> Path:
+        nonlocal crashed
+        if name == "attempt.json" and not crashed:
+            crashed = True
+            raise SystemExit("simulated kill after durable run ID")
+        return original_write_attempt_json(evaluation_id, attempt_number, name, value)
+
+    artifacts.write_attempt_json = crash_before_node_checkpoint  # type: ignore[method-assign]
+    with SqliteSaver.from_conn_string(str(app_config.storage.checkpoint_db)) as saver:
+        graph = build_graph(
+            EvaluationServices(
+                config=app_config,
+                bps=bps,
+                dut=dut,
+                judge=judge,
+                artifacts=artifacts,
+                clock=clock,
+            ),
+            checkpointer=saver,
+        )
+        invocation = {"configurable": {"thread_id": "launch-crash"}}
+        with pytest.raises(SystemExit, match="simulated kill"):
+            graph.invoke(initial_state("launch-crash", app_config), config=invocation)
+
+        artifacts.write_attempt_json = original_write_attempt_json  # type: ignore[method-assign]
+        result = graph.invoke(None, config=invocation)
+
+    assert result["outcome"] == EvaluationOutcome.PASSED.value
+    assert bps.run_count == 1
+    launch = ArtifactStore.read_json(
+        app_config.storage.artifact_dir / "launch-crash" / "attempt-01" / "bps-launch.json"
+    )
+    assert launch["status"] == "released"
+
+
+def test_verdict_artifact_references_evidence_without_repeating_request(
+    app_config: AppConfig,
+) -> None:
+    result = run_graph(
+        app_config,
+        FakeBps(FakeClock()),
+        FakeDut(),
+        FakeJudge([VerdictValue.PASS]),
+        FakeClock(),
+    )
+
+    attempt = result["attempts"][0]
+    evidence_path = Path(attempt["evidence_path"])
+    verdict = ArtifactStore.read_json(Path(attempt["verdict_path"]))
+    assert verdict["evidence"]["path"] == str(evidence_path)
+    assert verdict["evidence"]["sha256"] == hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+    assert verdict["provider_response"] == {"fixture": True}
+    assert "raw_response" not in verdict
+    assert "request" not in verdict

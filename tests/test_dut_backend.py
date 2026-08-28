@@ -4,6 +4,7 @@ import csv
 import io
 import json
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -13,8 +14,10 @@ from bps_agent.adapters.dut_backend import (
     DutBackendCollector,
     DutSshBackendClient,
     _extract_json,
+    _missed_intervals,
     render_metrics_csv,
 )
+from bps_agent.artifacts import ArtifactStore
 from bps_agent.models import DutBackendConfig, DutCollectionMethod, DutConfig
 
 
@@ -170,6 +173,45 @@ def test_failed_sample_is_recorded_and_collection_continues(tmp_path: Path) -> N
     assert capture.evidence.successful_sample_count >= 1  # type: ignore[union-attr]
     assert capture.evidence.failed_sample_count == 1  # type: ignore[union-attr]
     assert "temporary failure" in capture.warnings[0]
+
+
+def test_missed_interval_calculation_advances_to_a_future_tick() -> None:
+    assert _missed_intervals(10.0, 9.999, 10.0) == 0
+    assert _missed_intervals(10.0, 10.0, 10.0) == 1
+    assert _missed_intervals(10.0, 35.0, 10.0) == 3
+
+
+def test_slow_sample_skips_missed_ticks_without_catch_up_burst(tmp_path: Path) -> None:
+    class SlowFirstClient(FakeSnapshotClient):
+        def __init__(self) -> None:
+            super().__init__([sample_snapshot()])
+            self.call_times: list[float] = []
+
+        def read_snapshot(self, interfaces: tuple[str, ...]) -> dict[str, Any]:
+            self.call_times.append(time.monotonic())
+            if len(self.call_times) == 1:
+                time.sleep(0.055)
+            if len(self.call_times) >= 3:
+                self.ready.set()
+            return sample_snapshot()
+
+    client = SlowFirstClient()
+    collector = DutBackendCollector(
+        backend_config(interval_seconds=0.02),
+        username="dutcollector",
+        password="password",
+        client=client,  # type: ignore[arg-type]
+    )
+    collector.prepare_attempt(tmp_path)
+    collector.traffic_started("2026-08-27T13:53:30+08:00")
+    assert client.ready.wait(1)
+    collector.traffic_finished("2026-08-27T13:54:00+08:00")
+    capture = collector.finalize_attempt()
+
+    assert client.call_times[2] - client.call_times[1] >= 0.01
+    assert capture.evidence.missed_sample_count >= 2  # type: ignore[union-attr]
+    raw = ArtifactStore.read_json(Path(capture.raw_artifact_path or ""))
+    assert raw["missed_sample_count"] == capture.evidence.missed_sample_count  # type: ignore[union-attr]
 
 
 def test_completed_attempt_can_restore_from_atomic_metrics_artifact(tmp_path: Path) -> None:
