@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from bps_agent.models import EvidenceBundle, ProviderConfig, VerdictDocument
+from bps_agent.models import EvidenceBundle, ProviderConfig, ReasoningEffort, VerdictDocument
 
 _RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504}
 _SYSTEM_PROMPT = """你是网络设备性能测试裁决专家。
@@ -36,11 +36,13 @@ class DeepSeekJudge:
         config: ProviderConfig,
         *,
         token: str,
+        reasoning_effort: ReasoningEffort = "max",
         client: httpx.Client | None = None,
     ) -> None:
         self.provider_name = provider_name
         self.model_name = config.model
         self.config = config
+        self.reasoning_effort = reasoning_effort
         self._client = client or httpx.Client(
             timeout=httpx.Timeout(config.timeout_seconds),
             follow_redirects=False,
@@ -61,7 +63,7 @@ class DeepSeekJudge:
             "messages": messages,
             "response_format": {"type": "json_object"},
             "thinking": {"type": "enabled"},
-            "reasoning_effort": "max",
+            "reasoning_effort": self.reasoning_effort,
         }
         last_error: Exception | None = None
         for attempt in range(self.config.attempts):
@@ -74,7 +76,8 @@ class DeepSeekJudge:
                     continue
                 if response.status_code == 400:
                     raise ProviderCompatibilityError(
-                        "LLM rejected JSON/thinking/reasoning_effort=max compatibility: "
+                        "LLM rejected JSON/thinking/reasoning_effort="
+                        f"{self.reasoning_effort} compatibility: "
                         f"{response.text[:500]}"
                     )
                 response.raise_for_status()

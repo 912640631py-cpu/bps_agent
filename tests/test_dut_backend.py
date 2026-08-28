@@ -67,17 +67,31 @@ def test_csv_is_one_compact_row_per_sample_with_dynamic_interfaces() -> None:
                 "started_at": "2026-08-27T13:53:33+08:00",
                 "finished_at": "2026-08-27T13:53:34+08:00",
                 "resources": sample_snapshot(),
-            }
+            },
+            {
+                "started_at": "2026-08-27T13:53:43.125+08:00",
+                "finished_at": "2026-08-27T13:53:44+08:00",
+                "resources": sample_snapshot(),
+            },
         ],
         ("T1/1", "T1/2"),
     )
 
     rows = list(csv.DictReader(io.StringIO(text)))
-    assert len(rows) == 1
+    assert len(rows) == 2
+    assert rows[0]["time_origin"] == "2026-08-27T13:53:33+08:00"
+    assert rows[0]["elapsed_seconds"] == "0"
+    assert rows[1]["time_origin"] == ""
+    assert rows[1]["elapsed_seconds"] == "10.125"
     assert rows[0]["cpu_mgt_percent"] == "11"
     assert rows[0]["memory_threshold_percent"] == "66"
     assert rows[0]["traffic[T1/1].ibps"] == "20"
     assert rows[0]["traffic[T1/2].obps"] == "30"
+    assert "sample_finished_at" not in rows[0]
+    assert "dut_collected_at" not in rows[0]
+    assert "traffic[T1/1].time" not in rows[0]
+    assert text.count("2026-08-27T13:53:33+08:00") == 1
+    assert "08-27 13:53" not in text
 
 
 class FakeSnapshotClient:

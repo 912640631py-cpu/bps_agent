@@ -75,6 +75,9 @@ class PerformanceAssessment(StrEnum):
     NORMAL_LOAD_CHANGE = "normal_load_change"
 
 
+ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+
+
 class BpsConfig(StrictModel):
     endpoint: str
     template: str
@@ -94,6 +97,8 @@ class BpsConfig(StrictModel):
     report_type: Literal["CSV"] = "CSV"
     report_data_type: str = "ALL"
     max_report_bytes: int = Field(default=50 * 1024 * 1024, ge=1024)
+    pdf_report_timeout_seconds: float = Field(default=1200.0, gt=0)
+    max_pdf_report_bytes: int = Field(default=512 * 1024 * 1024, ge=1024)
 
     @field_validator("endpoint")
     @classmethod
@@ -113,7 +118,7 @@ class BpsConfig(StrictModel):
 
 
 class DutBackendConfig(StrictModel):
-    host: str = "10.66.246.156"
+    host: str = "10.66.246.133"
     port: int = Field(default=50023, ge=1, le=65535)
     interval_seconds: float = Field(default=10.0, gt=0)
     connect_timeout_seconds: float = Field(default=10.0, gt=0)
@@ -147,7 +152,7 @@ class DutFrontendConfig(StrictModel):
 
 
 class DutConfig(StrictModel):
-    collection_method: DutCollectionMethod = DutCollectionMethod.FRONTEND_API
+    collection_method: DutCollectionMethod = DutCollectionMethod.BACKEND_SSH
     interfaces: tuple[str, ...]
     backend: DutBackendConfig = DutBackendConfig()
     frontend: DutFrontendConfig | None = None
@@ -214,6 +219,7 @@ class ProviderConfig(StrictModel):
 
 class LlmConfig(StrictModel):
     provider: Literal["company", "official"] = "company"
+    reasoning_effort: ReasoningEffort = "max"
     company: ProviderConfig = ProviderConfig(
         base_url="https://aigw.inone.nsfocus.com/deepseek/v1",
         model="deepseek-v4-flash-0731",
@@ -237,13 +243,13 @@ class StorageConfig(StrictModel):
 
 class EvaluationConfig(StrictModel):
     mode: EvaluationMode = EvaluationMode.BPS_AND_DUT
-    max_attempts: int = Field(default=5, ge=1, le=5)
+    max_attempts: int = Field(default=6, ge=1, le=6)
 
     @field_validator("max_attempts")
     @classmethod
-    def require_five_attempt_capacity(cls, value: int) -> int:
-        if value != 5:
-            raise ValueError("the bandwidth fallback policy requires max_attempts to be exactly 5")
+    def require_full_attempt_capacity(cls, value: int) -> int:
+        if value != 6:
+            raise ValueError("the bandwidth fallback policy requires max_attempts to be exactly 6")
         return value
 
 
@@ -612,6 +618,7 @@ class AttemptRecord(StrictModel):
     dut_successful_sample_count: int | None = None
     dut_failed_sample_count: int | None = None
     report_path: str | None = None
+    pdf_report_path: str | None = None
     performance_timeseries_path: str | None = None
     report_toc_path: str | None = None
     evidence_path: str | None = None
@@ -624,8 +631,8 @@ class AttemptRecord(StrictModel):
 
     @model_validator(mode="after")
     def valid_number(self) -> AttemptRecord:
-        if self.number < 1 or self.number > 5:
-            raise ValueError("Attempt number must be between 1 and 5")
+        if self.number < 1 or self.number > 6:
+            raise ValueError("Attempt number must be between 1 and 6")
         return self
 
 

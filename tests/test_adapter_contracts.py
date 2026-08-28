@@ -280,7 +280,7 @@ def test_dut_contract_reads_history_once_and_filters_the_traffic_window() -> Non
     )
 
 
-def test_deepseek_contract_sends_json_and_max_reasoning() -> None:
+def test_deepseek_contract_sends_configured_reasoning_effort() -> None:
     captured: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -304,6 +304,7 @@ def test_deepseek_contract_sends_json_and_max_reasoning() -> None:
             attempts=1,
         ),
         token="secret",
+        reasoning_effort="high",
         client=http,
     )
 
@@ -312,7 +313,7 @@ def test_deepseek_contract_sends_json_and_max_reasoning() -> None:
     assert captured["authorization"] == "Bearer secret"
     assert captured["body"]["response_format"] == {"type": "json_object"}
     assert captured["body"]["thinking"] == {"type": "enabled"}
-    assert captured["body"]["reasoning_effort"] == "max"
+    assert captured["body"]["reasoning_effort"] == "high"
 
 
 def test_deepseek_retries_invalid_json_at_most_three_times() -> None:
@@ -554,3 +555,47 @@ def test_bps_export_report_uses_runtime_section_selection(tmp_path: Path) -> Non
 
     assert destination.read_text(encoding="utf-8") == "section,result\n3.2,pass\n"
     assert captured["body"]["sectionIds"] == "3.2,7.19"
+    assert captured["body"]["includeSubsections"] is False
+
+
+def test_bps_exports_complete_pdf_with_pdf_limits(tmp_path: Path) -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/reports/operations/exportReport"):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"url": "/reports/full.pdf"})
+        if request.url.path == "/reports/full.pdf":
+            return httpx.Response(
+                200,
+                content=b"%PDF-1.7\nfixture",
+                headers={"content-type": "application/pdf"},
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    client = BpsClient(
+        BpsConfig(
+            endpoint="https://bps.example.test",
+            template="template",
+            slot=4,
+            ports=(4, 5),
+            group=10,
+            pdf_report_timeout_seconds=900,
+            max_pdf_report_bytes=1024 * 1024,
+        ),
+        username="user",
+        password="password",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    destination = client.export_full_report_pdf(
+        "1873",
+        tmp_path / "bps-report-full.pdf",
+        ("1", "1.1", "2"),
+    )
+
+    assert destination.read_bytes() == b"%PDF-1.7\nfixture"
+    assert captured["body"]["reportType"] == "PDF"
+    assert captured["body"]["sectionIds"] == "1,1.1,2"
+    assert captured["body"]["includeSubsections"] is True
+    assert captured["body"]["dataType"] == "ALL"

@@ -433,12 +433,25 @@ class BpsClient:
                 time.sleep(self.config.report_poll_interval_seconds)
         raise TimeoutError(f"BPS report for run {run_id} did not become ready")
 
-    def _download(self, reference: str) -> bytes:
+    def _download(
+        self,
+        reference: str,
+        destination: Path,
+        *,
+        max_bytes: int,
+        timeout_seconds: float,
+        require_pdf: bool,
+    ) -> Path:
         url = urljoin(f"{self.config.endpoint}/", reference)
         for _ in range(6):
             if self._origin(url) != self._origin(self.config.endpoint):
                 raise BpsProtocolError("BPS report download escaped the authenticated origin")
-            with self._client.stream("GET", url, follow_redirects=False, timeout=300) as response:
+            with self._client.stream(
+                "GET",
+                url,
+                follow_redirects=False,
+                timeout=timeout_seconds,
+            ) as response:
                 if response.is_redirect:
                     location = response.headers.get("location")
                     if not location:
@@ -447,32 +460,54 @@ class BpsClient:
                     continue
                 response.raise_for_status()
                 if response.headers.get("content-type", "").casefold().startswith("text/html"):
-                    raise BpsProtocolError("BPS CSV download unexpectedly returned HTML")
+                    raise BpsProtocolError("BPS report download unexpectedly returned HTML")
                 declared = response.headers.get("content-length")
-                if (
-                    declared
-                    and declared.isdecimal()
-                    and int(declared) > self.config.max_report_bytes
-                ):
+                if declared and declared.isdecimal() and int(declared) > max_bytes:
                     raise BpsProtocolError("BPS report exceeds configured size limit")
-                chunks: list[bytes] = []
-                size = 0
-                for chunk in response.iter_bytes():
-                    size += len(chunk)
-                    if size > self.config.max_report_bytes:
-                        raise BpsProtocolError("BPS report exceeds configured size limit")
-                    chunks.append(chunk)
-                content = b"".join(chunks)
-                if not content:
-                    raise BpsProtocolError("BPS report download was empty")
-                return content
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                temporary: Path | None = None
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        mode="wb",
+                        prefix=f".{destination.name}.",
+                        suffix=".part",
+                        dir=destination.parent,
+                        delete=False,
+                    ) as handle:
+                        temporary = Path(handle.name)
+                        size = 0
+                        prefix = bytearray()
+                        for chunk in response.iter_bytes():
+                            size += len(chunk)
+                            if size > max_bytes:
+                                raise BpsProtocolError("BPS report exceeds configured size limit")
+                            if len(prefix) < 1024:
+                                prefix.extend(chunk[: 1024 - len(prefix)])
+                            handle.write(chunk)
+                        if size == 0:
+                            raise BpsProtocolError("BPS report download was empty")
+                        if require_pdf and b"%PDF-" not in prefix:
+                            raise BpsProtocolError("BPS PDF export did not contain a PDF signature")
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temporary, destination)
+                    temporary = None
+                    return destination
+                finally:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
         raise BpsProtocolError("too many BPS report redirects")
 
-    def export_report(
+    def _export_report(
         self,
         run_id: str,
         destination: Path,
         section_ids: tuple[str, ...],
+        *,
+        report_type: str,
+        max_bytes: int,
+        timeout_seconds: float,
+        include_subsections: bool,
     ) -> Path:
         response = self._request(
             "POST",
@@ -480,11 +515,12 @@ class BpsClient:
             json={
                 "filepath": str(destination),
                 "runid": run_id,
-                "reportType": self.config.report_type,
+                "reportType": report_type,
                 "sectionIds": ",".join(section_ids),
+                "includeSubsections": include_subsections,
                 "dataType": self.config.report_data_type,
             },
-            timeout=120,
+            timeout=timeout_seconds,
         )
         payload = self._checked(response)
         reference: str | None = None
@@ -497,27 +533,45 @@ class BpsClient:
                     break
         if not reference:
             raise BpsProtocolError("BPS export response omitted a download reference")
-        content = self._download(reference)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="wb",
-                prefix=f".{destination.name}.",
-                suffix=".part",
-                dir=destination.parent,
-                delete=False,
-            ) as handle:
-                handle.write(content)
-                handle.flush()
-                os.fsync(handle.fileno())
-                temporary = Path(handle.name)
-            os.replace(temporary, destination)
-            temporary = None
-            return destination
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+        return self._download(
+            reference,
+            destination,
+            max_bytes=max_bytes,
+            timeout_seconds=timeout_seconds,
+            require_pdf=report_type == "PDF",
+        )
+
+    def export_report(
+        self,
+        run_id: str,
+        destination: Path,
+        section_ids: tuple[str, ...],
+    ) -> Path:
+        return self._export_report(
+            run_id,
+            destination,
+            section_ids,
+            report_type=self.config.report_type,
+            max_bytes=self.config.max_report_bytes,
+            timeout_seconds=300,
+            include_subsections=False,
+        )
+
+    def export_full_report_pdf(
+        self,
+        run_id: str,
+        destination: Path,
+        section_ids: tuple[str, ...],
+    ) -> Path:
+        return self._export_report(
+            run_id,
+            destination,
+            section_ids,
+            report_type="PDF",
+            max_bytes=self.config.max_pdf_report_bytes,
+            timeout_seconds=self.config.pdf_report_timeout_seconds,
+            include_subsections=True,
+        )
 
     def stop_run(self, run_id: str) -> None:
         self._checked(

@@ -16,8 +16,10 @@ def test_demo_configuration_matches_real_lab_defaults() -> None:
     assert config.bps.port_release_attempts == 6
     assert config.bps.port_release_retry_backoff_seconds == 5
     assert "report_section_ids" not in config.bps.model_dump()
-    assert config.dut.collection_method == DutCollectionMethod.FRONTEND_API
-    assert config.dut.backend.host == "10.66.246.156"
+    assert config.bps.pdf_report_timeout_seconds == 1200
+    assert config.bps.max_pdf_report_bytes == 512 * 1024 * 1024
+    assert config.dut.collection_method == DutCollectionMethod.BACKEND_SSH
+    assert config.dut.backend.host == "10.66.246.133"
     assert config.dut.backend.port == 50023
     assert config.dut.backend.interval_seconds == 10
     assert config.dut.frontend is not None
@@ -28,7 +30,8 @@ def test_demo_configuration_matches_real_lab_defaults() -> None:
     assert config.dut.frontend.keepalive_interval_seconds == 60
     assert config.llm.company.model == "deepseek-v4-flash-0731"
     assert config.llm.official.model == "deepseek-v4-flash"
-    assert config.evaluation.max_attempts == 5
+    assert config.llm.reasoning_effort == "max"
+    assert config.evaluation.max_attempts == 6
     assert config.evaluation.mode == EvaluationMode.BPS_AND_DUT
     assert "BPS" in config.bps_only_assessment.goal
     assert "lock_dir" not in config.storage.model_dump()
@@ -47,13 +50,13 @@ def test_legacy_flat_dut_configuration_selects_frontend_collection() -> None:
     assert config.frontend.baseline_seconds == 300
 
 
-def test_structured_dut_configuration_defaults_to_frontend_collection() -> None:
+def test_structured_dut_configuration_defaults_to_backend_collection() -> None:
     config = DutConfig(
         interfaces=("T1/1",),
         frontend={"endpoint": "https://dut.example.test"},
     )
 
-    assert config.collection_method == DutCollectionMethod.FRONTEND_API
+    assert config.collection_method == DutCollectionMethod.BACKEND_SSH
 
 
 def test_serialized_configuration_contains_no_secret_values() -> None:
@@ -62,3 +65,13 @@ def test_serialized_configuration_contains_no_secret_values() -> None:
     assert "password" not in serialized.casefold()
     assert "bearer" not in serialized.casefold()
     assert "api_key" in serialized.casefold()  # Environment-variable names only.
+
+
+def test_llm_reasoning_effort_is_configurable() -> None:
+    config = load_config(Path("config/demo.yaml"))
+    document = config.model_dump(mode="python")
+    document["llm"]["reasoning_effort"] = "high"
+
+    updated = type(config).model_validate(document)
+
+    assert updated.llm.reasoning_effort == "high"

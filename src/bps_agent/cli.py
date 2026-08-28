@@ -26,6 +26,8 @@ from bps_agent.config import load_config
 from bps_agent.credentials import (
     SECRET_CREDENTIALS,
     SUPPORTED_CREDENTIALS,
+    CredentialRequirement,
+    CredentialResolver,
     CredentialStore,
 )
 from bps_agent.graph import EvaluationServices, SystemClock, build_graph, initial_state
@@ -59,25 +61,42 @@ class _EvidenceOnlyJudge:
         return None
 
 
-def _credential(
-    store: CredentialStore,
-    name: str,
-    prompt: str,
+_BPS_CREDENTIALS = (
+    CredentialRequirement("BPS_USERNAME", "BPS username: "),
+    CredentialRequirement("BPS_PASSWORD", "BPS password: ", secret=True),
+)
+_BACKEND_DUT_CREDENTIALS = (
+    CredentialRequirement("DUT_BACKEND_USERNAME", "DUT backend SSH username: "),
+    CredentialRequirement("DUT_BACKEND_PASSWORD", "DUT backend SSH password: ", secret=True),
+)
+_FRONTEND_DUT_CREDENTIALS = (
+    CredentialRequirement("DUT_FRONTEND_USERNAME", "DUT frontend username: "),
+    CredentialRequirement("DUT_FRONTEND_PASSWORD", "DUT frontend password: ", secret=True),
+)
+
+
+def _run_credential_requirements(
+    config: AppConfig,
     *,
-    secret: bool,
-) -> str:
-    value = os.environ.get(name)
-    if value:
-        return value
-    value = store.get(name)
-    if value:
-        return value
-    value = getpass.getpass(prompt) if secret else input(prompt).strip()
-    if not value:
-        raise ValueError(f"{name} is required")
-    store.set(name, value)
-    print(f"Saved {name} in the system keyring.")
-    return value
+    stop_before_llm: bool,
+) -> tuple[CredentialRequirement, ...]:
+    requirements = list(_BPS_CREDENTIALS)
+    if config.evaluation.mode != EvaluationMode.BPS_ONLY:
+        requirements.extend(
+            _BACKEND_DUT_CREDENTIALS
+            if config.dut.collection_method == DutCollectionMethod.BACKEND_SSH
+            else _FRONTEND_DUT_CREDENTIALS
+        )
+    if not stop_before_llm:
+        provider_name = config.llm.provider
+        requirements.append(
+            CredentialRequirement(
+                config.llm.selected.token_env,
+                f"{provider_name} DeepSeek Bearer token: ",
+                secret=True,
+            )
+        )
+    return tuple(requirements)
 
 
 def _captcha_reader(image: bytes, media_type: str) -> str:
@@ -112,16 +131,10 @@ def _captcha_reader(image: bytes, media_type: str) -> str:
             path.unlink(missing_ok=True)
 
 
-def _provider(config: AppConfig, store: CredentialStore) -> tuple[str, Any, str]:
+def _provider(config: AppConfig, credentials: dict[str, str]) -> tuple[str, Any, str]:
     name = config.llm.provider
     selected = config.llm.selected
-    token = _credential(
-        store,
-        selected.token_env,
-        f"{name} DeepSeek Bearer token: ",
-        secret=True,
-    )
-    return name, selected, token
+    return name, selected, credentials[selected.token_env]
 
 
 def _has_unsafe_reservation(result: dict[str, Any]) -> bool:
@@ -262,6 +275,9 @@ def run_live(
     if resume_id:
         config = _load_resume_config(config, resume_id)
     store = credential_store or CredentialStore()
+    credentials = CredentialResolver(store).resolve(
+        _run_credential_requirements(config, stop_before_llm=stop_before_llm)
+    )
     evaluation_id = resume_id or str(uuid4())
     artifacts = ArtifactStore(config.storage.artifact_dir)
     judge: DeepSeekJudge | _EvidenceOnlyJudge | None = None
@@ -273,14 +289,22 @@ def run_live(
             judge = _EvidenceOnlyJudge()
             print("Evidence-only mode: DeepSeek will not be contacted.")
         else:
-            provider_name, provider_config, token = _provider(config, store)
-            judge = DeepSeekJudge(provider_name, provider_config, token=token)
-            print(f"Checking {provider_name} provider compatibility with reasoning_effort=max...")
+            provider_name, provider_config, token = _provider(config, credentials)
+            judge = DeepSeekJudge(
+                provider_name,
+                provider_config,
+                token=token,
+                reasoning_effort=config.llm.reasoning_effort,
+            )
+            print(
+                f"Checking {provider_name} provider compatibility with "
+                f"reasoning_effort={config.llm.reasoning_effort}..."
+            )
             judge.validate_compatibility()
         bps = BpsClient(
             config.bps,
-            username=_credential(store, "BPS_USERNAME", "BPS username: ", secret=False),
-            password=_credential(store, "BPS_PASSWORD", "BPS password: ", secret=True),
+            username=credentials["BPS_USERNAME"],
+            password=credentials["BPS_PASSWORD"],
         )
         print("Authenticating to BPS...")
         bps.authenticate()
@@ -289,25 +313,15 @@ def run_live(
         elif config.dut.collection_method == DutCollectionMethod.BACKEND_SSH:
             dut = DutBackendCollector(
                 config.dut,
-                username=_credential(
-                    store,
-                    "DUT_BACKEND_USERNAME",
-                    "DUT backend SSH username: ",
-                    secret=False,
-                ),
-                password=_credential(
-                    store,
-                    "DUT_BACKEND_PASSWORD",
-                    "DUT backend SSH password: ",
-                    secret=True,
-                ),
+                username=credentials["DUT_BACKEND_USERNAME"],
+                password=credentials["DUT_BACKEND_PASSWORD"],
             )
             print("DUT backend SSH collection enabled (host keys are not currently verified).")
         else:
             dut = DutClient(
                 config.dut,
-                username=_credential(store, "DUT_USERNAME", "DUT username: ", secret=False),
-                password=_credential(store, "DUT_PASSWORD", "DUT password: ", secret=True),
+                username=credentials["DUT_FRONTEND_USERNAME"],
+                password=credentials["DUT_FRONTEND_PASSWORD"],
                 captcha_reader=_captcha_reader,
             )
             print("Authenticating to DUT (CAPTCHA required)...")
@@ -412,7 +426,17 @@ def replay(
     config = load_config(config_path)
     store = credential_store or CredentialStore()
     evidence = EvidenceBundle.model_validate(json.loads(evidence_path.read_text(encoding="utf-8")))
-    provider_name, provider_config, token = _provider(config, store)
+    token_name = config.llm.selected.token_env
+    credentials = CredentialResolver(store).resolve(
+        (
+            CredentialRequirement(
+                token_name,
+                f"{config.llm.provider} DeepSeek Bearer token: ",
+                secret=True,
+            ),
+        )
+    )
+    provider_name, provider_config, token = _provider(config, credentials)
     judge = DeepSeekJudge(provider_name, provider_config, token=token)
     try:
         verdict, raw = judge.adjudicate(evidence)

@@ -17,12 +17,14 @@ bps:
   report_type: CSV
   report_data_type: ALL
   max_report_bytes: 52428800
+  pdf_report_timeout_seconds: 1200
+  max_pdf_report_bytes: 536870912
 
 dut:
-  collection_method: frontend_api
+  collection_method: backend_ssh
   interfaces: [T1/1, T1/2]
   backend:
-    host: 10.66.246.156
+    host: 10.66.246.133
     port: 50023
     interval_seconds: 10
     connect_timeout_seconds: 10
@@ -42,7 +44,7 @@ assessment:
   goal: 验证 DUT 在指定并发和带宽下的资源与转发表现
   expectations:
     - 结合 BPS 自带 Test Criteria 判断测试目标是否达成
-    - 比较 DUT 打流前基线、打流中状态和冷却后的恢复情况
+    - 结合 DUT 打流期间连续采样 CSV 判断资源与转发表现
     - 只依据给定证据判断，不臆造缺失指标
 
 bps_only_assessment:
@@ -54,6 +56,7 @@ bps_only_assessment:
 
 llm:
   provider: official
+  reasoning_effort: max
   company:
     base_url: https://aigw.inone.nsfocus.com/deepseek/v1
     model: deepseek-v4-flash-0731
@@ -73,4 +76,4 @@ storage:
 
 evaluation:
   mode: bps_and_dut
-  max_attempts: 5
+  max_attempts: 6

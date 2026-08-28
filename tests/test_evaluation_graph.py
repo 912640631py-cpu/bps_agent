@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -73,6 +74,8 @@ class FakeBps:
         template_error: bool = False,
         template_bandwidth_mbps: float = 400.0,
         report_toc: Any = None,
+        verify_pdf_parallel: bool = False,
+        pdf_error: bool = False,
     ) -> None:
         self.clock = clock
         self.template_error = template_error
@@ -107,7 +110,14 @@ class FakeBps:
         self.export_section_ids: list[tuple[str, ...]] = []
         self.report_run_ids: list[str] = []
         self.export_run_ids: list[str] = []
+        self.pdf_export_run_ids: list[str] = []
+        self.pdf_export_section_ids: list[tuple[str, ...]] = []
         self.bandwidth_percentages: list[float] = []
+        self.verify_pdf_parallel = verify_pdf_parallel
+        self.pdf_error = pdf_error
+        self.pdf_started = Event()
+        self.pdf_release = Event()
+        self.pdf_overlapped_existing_exports = False
 
     def find_template(self, name: str) -> dict[str, Any]:
         if self.template_error:
@@ -150,6 +160,10 @@ class FakeBps:
         destination: Path,
         section_ids: tuple[str, ...],
     ) -> Path:
+        if self.verify_pdf_parallel and destination.name == "bps-report.csv":
+            assert self.pdf_started.wait(1)
+            self.pdf_overlapped_existing_exports = True
+            self.pdf_release.set()
         self.export_run_ids.append(run_id)
         self.export_section_ids.append(section_ids)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -158,6 +172,23 @@ class FakeBps:
         else:
             content = f"Test Model,performance-demo\nRun ID,{run_id}\nResult,passed\n"
         destination.write_text(content, encoding="utf-8")
+        return destination
+
+    def export_full_report_pdf(
+        self,
+        run_id: str,
+        destination: Path,
+        section_ids: tuple[str, ...],
+    ) -> Path:
+        self.pdf_export_run_ids.append(run_id)
+        self.pdf_export_section_ids.append(section_ids)
+        if self.pdf_error:
+            raise RuntimeError("fixture PDF export failed")
+        if self.verify_pdf_parallel:
+            self.pdf_started.set()
+            assert self.pdf_release.wait(1)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"%PDF-1.7\nfixture")
         return destination
 
     def release_ports(self) -> None:
@@ -309,11 +340,11 @@ class FakeBackendDut:
 
     def finalize_attempt(self) -> DutCaptureResult:
         assert self.started_at is not None and self.finished_at is not None
-        csv_text = "sample_index,cpu_mgt_percent\n"
+        csv_text = "sample_index,time_origin,elapsed_seconds,cpu_mgt_percent\n"
         if self.successful_samples:
-            csv_text += "1,11\n"
+            csv_text += f"1,{self.started_at},0,11\n"
         evidence = BackendDutEvidence(
-            target=BackendDutTarget(host="10.66.246.156", port=50023),
+            target=BackendDutTarget(host="10.66.246.133", port=50023),
             interfaces=("T1/1", "T1/2"),
             traffic_started_at=self.started_at,
             traffic_finished_at=self.finished_at,
@@ -415,6 +446,15 @@ def test_passes_on_first_complete_attempt(app_config: AppConfig) -> None:
     assert judge.calls == 1
     assert bps.report_run_ids == ["run-1"]
     assert bps.export_run_ids == ["run-1", "run-1"]
+    assert bps.pdf_export_run_ids == ["run-1"]
+    assert bps.pdf_export_section_ids == [
+        (
+            "10",
+            "12",
+            "20",
+            "30",
+        )
+    ]
     assert bps.export_section_ids == [
         (
             "10.4",
@@ -427,7 +467,47 @@ def test_passes_on_first_complete_attempt(app_config: AppConfig) -> None:
         ),
         ("30.4.5", "30.4.7", "30.4.8"),
     ]
+    attempt = result["attempts"][0]
+    pdf_path = Path(attempt["pdf_report_path"])
+    assert pdf_path.name == "bps-report-full.pdf"
+    assert pdf_path.read_bytes().startswith(b"%PDF-")
     assert Path(result["final_artifact"]).exists()
+
+
+def test_full_pdf_export_overlaps_existing_report_exports(app_config: AppConfig) -> None:
+    clock = FakeClock()
+    bps = FakeBps(clock, verify_pdf_parallel=True)
+
+    result = run_graph(
+        app_config,
+        bps,
+        FakeDut(),
+        FakeJudge([VerdictValue.PASS]),
+        clock,
+    )
+
+    assert result["outcome"] == EvaluationOutcome.PASSED.value
+    assert bps.pdf_overlapped_existing_exports
+
+
+def test_full_pdf_export_failure_does_not_affect_evaluation(app_config: AppConfig) -> None:
+    clock = FakeClock()
+    judge = FakeJudge([VerdictValue.PASS])
+
+    result = run_graph(
+        app_config,
+        FakeBps(clock, pdf_error=True),
+        FakeDut(),
+        judge,
+        clock,
+    )
+
+    assert result["outcome"] == EvaluationOutcome.PASSED.value
+    attempt = result["attempts"][0]
+    assert attempt["evidence_complete"] is True
+    assert attempt["pdf_report_path"] is None
+    assert any("fixture PDF export failed" in error for error in attempt["errors"])
+    assert judge.calls == 1
 
 
 def test_backend_csv_is_the_only_backend_metrics_sent_to_the_judge(
@@ -452,7 +532,7 @@ def test_backend_csv_is_the_only_backend_metrics_sent_to_the_judge(
     assert result["outcome"] == EvaluationOutcome.PASSED.value
     evidence = ArtifactStore.read_json(Path(result["attempts"][0]["evidence_path"]))
     assert evidence["dut_evidence"]["collection_method"] == "backend_ssh"
-    assert "sample_index,cpu_mgt_percent" in evidence["dut_evidence"]["metrics_csv"]
+    assert "sample_index,time_origin,elapsed_seconds" in evidence["dut_evidence"]["metrics_csv"]
     assert "samples" not in evidence["dut_evidence"]
 
 
@@ -507,6 +587,7 @@ def test_can_stop_after_evidence_without_calling_the_llm(app_config: AppConfig) 
     assert "bps_report_toc" not in evidence
     assert "performance_timeseries_path" not in evidence
     assert "bps-performance-timeseries.csv" not in serialized_evidence
+    assert "bps-report-full.pdf" not in serialized_evidence
     assert "Timestamp" not in evidence["bps_report"]
     assert evidence["bps_performance_analysis"]["assessment"] == "normal"
     assert evidence["bps_template_total_bandwidth_mbps"] == 400.0
@@ -605,27 +686,28 @@ def test_port_release_failure_does_not_erase_confirmed_run_terminal_state(
     assert result["error"].startswith("BPS port release failed after confirmed terminal state:")
 
 
-def test_five_retry_verdicts_reduce_bandwidth_then_end_not_passed(
+def test_six_retry_verdicts_reduce_bandwidth_then_end_not_passed(
     app_config: AppConfig,
 ) -> None:
     clock = FakeClock()
     bps = FakeBps(clock)
-    judge = FakeJudge([VerdictValue.RETRY] * 5)
+    judge = FakeJudge([VerdictValue.RETRY] * 6)
 
     result = run_graph(app_config, bps, FakeDut(), judge, clock)
 
     assert result["outcome"] == EvaluationOutcome.NOT_PASSED.value
-    assert bps.run_count == 5
-    assert bps.reserve_count == bps.release_count == 5
-    assert bps.bandwidth_percentages == [100.0, 80.0, 60.0, 40.0, 20.0]
-    assert judge.calls == 5
-    assert len(result["attempts"]) == 5
+    assert bps.run_count == 6
+    assert bps.reserve_count == bps.release_count == 6
+    assert bps.bandwidth_percentages == [100.0, 80.0, 60.0, 40.0, 20.0, 10.0]
+    assert judge.calls == 6
+    assert len(result["attempts"]) == 6
     assert [attempt["bps_total_bandwidth_mbps"] for attempt in result["attempts"]] == [
         400.0,
         320.0,
         240.0,
         160.0,
         80.0,
+        40.0,
     ]
 
 
@@ -642,18 +724,19 @@ def test_retry_bandwidth_levels_are_relative_to_configured_initial_target(
         config,
         bps,
         FakeDut(),
-        FakeJudge([VerdictValue.RETRY] * 5),
+        FakeJudge([VerdictValue.RETRY] * 6),
         clock,
     )
 
     assert result["outcome"] == EvaluationOutcome.NOT_PASSED.value
-    assert bps.bandwidth_percentages == [75.0, 60.0, 45.0, 30.0, 15.0]
+    assert bps.bandwidth_percentages == [75.0, 60.0, 45.0, 30.0, 15.0, 7.5]
     assert [attempt["bps_total_bandwidth_mbps"] for attempt in result["attempts"]] == [
         300.0,
         240.0,
         180.0,
         120.0,
         60.0,
+        30.0,
     ]
 
 
@@ -667,12 +750,12 @@ def test_bandwidth_percentage_uses_template_json_original_value(
         app_config,
         bps,
         FakeDut(),
-        FakeJudge([VerdictValue.RETRY] * 5),
+        FakeJudge([VerdictValue.RETRY] * 6),
         clock,
     )
 
     assert result["outcome"] == EvaluationOutcome.NOT_PASSED.value
-    assert bps.bandwidth_percentages == [50.0, 40.0, 30.0, 20.0, 10.0]
+    assert bps.bandwidth_percentages == [50.0, 40.0, 30.0, 20.0, 10.0, 5.0]
     assert all(
         attempt["bps_template_total_bandwidth_mbps"] == 800.0 for attempt in result["attempts"]
     )

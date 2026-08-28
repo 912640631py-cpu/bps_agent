@@ -7,7 +7,7 @@
 - 从每个 Run 的 TOC 按“章节标题 + 父级路径”动态解析 Section ID。
 - 分别导出主报告和秒级吞吐、Flow Rate、Concurrent Flows 时序数据。
 - 在 Stable 阶段以 Tx/Rx 中位数为基线进行确定性性能分析。
-- LLM 返回 `retry` 时自动降载，最多执行五次；返回 `pass` 后立即结束。
+- LLM 返回 `retry` 时自动降载，最多执行六次；返回 `pass` 后立即结束。
 - 使用 SQLite checkpoint 支持中断恢复和 Evidence 离线回放。
 - 支持 BPS-only 模式，完全跳过 DUT 登录、CAPTCHA、keepalive 和监控读取。
 
@@ -30,9 +30,14 @@ python -m pip install -e '.[dev]'
 凭据保存在 Windows Credential Manager，不写入配置或审计文件：
 
 - `BPS_USERNAME`、`BPS_PASSWORD`
-- `DUT_USERNAME`、`DUT_PASSWORD`（默认前端采集）
-- `DUT_BACKEND_USERNAME`、`DUT_BACKEND_PASSWORD`（仅 SSH 后端采集）
+- `DUT_BACKEND_USERNAME`、`DUT_BACKEND_PASSWORD`（默认 SSH 后端采集）
+- `DUT_FRONTEND_USERNAME`、`DUT_FRONTEND_PASSWORD`（仅前端采集）
 - `COMPANY_DEEPSEEK_API_KEY` 或 `DEEPSEEK_API_KEY`
+
+`run` 会根据 BPS-only、DUT Collection Method 和 `--stop-before-llm` 只读取本次所需凭据。
+缺失值会在启动时交互输入；全部输入完成后只询问一次是否将这些新值保存到
+Windows Credential Manager。选择不保存时，新值仅用于本次运行；
+`--stop-before-llm` 不要求 LLM API key。
 
 ```powershell
 python -m bps_agent credentials set
@@ -51,7 +56,7 @@ python -m bps_agent run --template TEMPLATE --ports 4 5 --total-bandwidth-mbps 3
 
 # 临时覆盖 DUT SSH 后端目标、接口和采样间隔
 python -m bps_agent run --dut-collection-method backend_ssh `
-  --dut-host 10.66.246.156 --dut-port 50023 `
+  --dut-host 10.66.246.133 --dut-port 50023 `
   --dut-interface T1/1 --dut-interface T1/2 --dut-interval-seconds 10
 
 # 完成实机测试和 Evidence，在调用 LLM 前停止
@@ -69,14 +74,16 @@ python -m bps_agent replay --evidence artifacts\EVALUATION_ID\attempt-01\evidenc
 
 恢复运行时不能使用模板、端口、带宽、DUT 或模式覆盖参数。
 也可以在 YAML 中设置 `evaluation.mode: bps_only`；默认值为 `bps_and_dut`。
-`dut.collection_method` 默认是 `frontend_api`，CAPTCHA 由操作者输入且不会保存。
-设置为 `backend_ssh` 后，采样从 BPS 打流开始持续到流量结束，不使用固定样本数，
-也不登录 DUT 前端或请求 CAPTCHA。当前 SSH 方式不读取、校验或持久化主机密钥。
+`dut.collection_method` 默认是 `backend_ssh`，采样从 BPS 打流开始持续到流量结束，
+不使用固定样本数，也不登录 DUT 前端或请求 CAPTCHA。当前 SSH 方式不读取、
+校验或持久化主机密钥。设置为 `frontend_api` 时，CAPTCHA 由操作者输入且不会保存。
+
+`llm.reasoning_effort` 控制模型推理程度，默认为 `max`，可在 `demo.yaml` 中调整。
 端口互斥由 BPS 的非强制预留负责；项目不再维护本地端口锁文件。
 
 ## 降载策略
 
-首次 Attempt 使用配置目标。若 LLM 判定未通过，后续目标依次为初始目标的 `80%`、`60%`、`40%`、`20%`。
+首次 Attempt 使用配置目标。若 LLM 判定未通过，后续目标依次为初始目标的 `80%`、`60%`、`40%`、`20%`、`10%`。
 
 例如模板原始带宽为 400 Mbps、初始目标为 300 Mbps 时：
 
@@ -87,15 +94,17 @@ python -m bps_agent replay --evidence artifacts\EVALUATION_ID\attempt-01\evidenc
 | 3 | 180 | 45% |
 | 4 | 120 | 30% |
 | 5 | 60 | 15% |
+| 6 | 30 | 7.5% |
 
 ## 产物与判定
 
 每次 Attempt 默认生成：
 
 - `bps-report.csv`：测试参数、判据和结果，内容进入 `evidence.json`。
+- `bps-report-full.pdf`：BPS 完整 PDF 结果报告，与现有 CSV 导出和性能分析并行下载，不进入 LLM Evidence；下载失败只记录警告，不影响 Evidence、Verdict 或 Outcome。
 - `bps-performance-timeseries.csv`：原始秒级性能数据，不进入 `evidence.json`。
 - `dut-metrics.json`：使用 SSH 后端方式时，保存逐次采样的完整审计数据和失败记录，不发送给 LLM。
-- `dut-metrics.csv`：使用 SSH 后端方式时，保存打流期间的紧凑 DUT 时序，正文进入 `evidence.json` 交给 LLM。
+- `dut-metrics.csv`：使用 SSH 后端方式时，保存打流期间的紧凑 DUT 时序，仅首行保留真实时间锚点，后续行使用相对秒数；正文进入 `evidence.json` 交给 LLM。
 - `evidence.json`：BPS 报告、紧凑的 `bps_performance_analysis`，以及启用时的 DUT 证据。
 - TOC、Section 解析结果、Attempt 和 Verdict 审计文件。
 
@@ -105,7 +114,7 @@ python -m bps_agent replay --evidence artifacts\EVALUATION_ID\attempt-01\evidenc
 
 - `PASSED`：首次目标流量的 Attempt 被 LLM 判定为 `pass`。
 - `DEGRADED_PASS`：首次目标未通过，但某个降载 Attempt 被判定为 `pass`。
-- `NOT_PASSED`：五次 Attempt 均返回 `retry`。
+- `NOT_PASSED`：六次 Attempt 均返回 `retry`。
 - `INCONCLUSIVE`：证据不完整或外部接口失败。
 
 ## 开发检查

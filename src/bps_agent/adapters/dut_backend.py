@@ -239,34 +239,39 @@ def _object(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _elapsed_seconds(origin: str, current: Any) -> str:
+    if not isinstance(current, str) or not origin:
+        return ""
+    try:
+        elapsed = (datetime.fromisoformat(current) - datetime.fromisoformat(origin)).total_seconds()
+    except ValueError:
+        return ""
+    if abs(elapsed) < 0.0005:
+        elapsed = 0.0
+    return f"{elapsed:.3f}".rstrip("0").rstrip(".")
+
+
 def render_metrics_csv(samples: list[dict[str, Any]], interfaces: tuple[str, ...]) -> str:
     fixed_columns = [
         "sample_index",
-        "sample_started_at",
-        "sample_finished_at",
-        "dut_collected_at",
-        "cpu_time",
-        "cpu_timestamp",
+        "time_origin",
+        "elapsed_seconds",
         "cpu_mgt_percent",
         "cpu_data_percent",
         "cpu_mgt_threshold_percent",
         "cpu_data_threshold_percent",
-        "memory_time",
         "memory_percent",
         "memory_threshold_percent",
-        "new_sessions_time",
         "new_sessions_count",
-        "concurrent_sessions_time",
         "concurrent_sessions_count",
     ]
     interface_columns = [
-        f"traffic[{interface}].{field}"
-        for interface in interfaces
-        for field in ("time", "ibps", "obps")
+        f"traffic[{interface}].{field}" for interface in interfaces for field in ("ibps", "obps")
     ]
     output = io.StringIO(newline="")
     writer = csv.writer(output, lineterminator="\n")
     writer.writerow([*fixed_columns, *interface_columns])
+    origin = str(samples[0].get("started_at") or "") if samples else ""
     for index, sample in enumerate(samples, start=1):
         resources = _object(sample.get("resources"))
         cpu = _object(resources.get("cpu"))
@@ -279,26 +284,20 @@ def render_metrics_csv(samples: list[dict[str, Any]], interfaces: tuple[str, ...
         traffic = _object(resources.get("traffic"))
         row: list[Any] = [
             index,
-            sample.get("started_at"),
-            sample.get("finished_at"),
-            resources.get("collected_at"),
-            cpu_latest.get("time"),
-            cpu_latest.get("timestamp"),
+            origin if index == 1 else "",
+            _elapsed_seconds(origin, sample.get("started_at")),
             cpu_latest.get("mgt"),
             cpu_latest.get("data"),
             cpu_threshold.get("mgt"),
             cpu_threshold.get("data"),
-            memory_latest.get("time"),
             memory_latest.get("percent"),
             memory.get("threshold"),
-            new_sessions.get("time"),
             new_sessions.get("count"),
-            concurrent_sessions.get("time"),
             concurrent_sessions.get("count"),
         ]
         for interface in interfaces:
             interface_traffic = _object(traffic.get(interface))
-            row.extend(interface_traffic.get(field) for field in ("time", "ibps", "obps"))
+            row.extend(interface_traffic.get(field) for field in ("ibps", "obps"))
         writer.writerow(row)
     return output.getvalue()
 

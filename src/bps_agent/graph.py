@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypedDict
@@ -37,7 +38,7 @@ from bps_agent.report_sections import (
 
 LOGGER = logging.getLogger(__name__)
 
-_ATTEMPT_BANDWIDTH_FACTORS = (1.0, 0.8, 0.6, 0.4, 0.2)
+_ATTEMPT_BANDWIDTH_FACTORS = (1.0, 0.8, 0.6, 0.4, 0.2, 0.1)
 
 
 class SystemClock:
@@ -322,6 +323,8 @@ def build_graph(
         report_text = ""
         report_toc: Any = None
         performance_analysis: PerformanceTimeseriesAnalysis | None = None
+        pdf_executor: ThreadPoolExecutor | None = None
+        pdf_future: Future[Path] | None = None
         try:
             if not attempt.traffic_started_at or not attempt.traffic_finished_at:
                 raise RuntimeError("BPS traffic time window is incomplete")
@@ -401,10 +404,22 @@ def build_graph(
                     "Required BPS report section paths were ambiguous: %s",
                     selection.ambiguous_required,
                 )
-            destination = (
-                services.artifacts.attempt_dir(state["evaluation_id"], attempt.number)
-                / "bps-report.csv"
+            attempt_dir = services.artifacts.attempt_dir(state["evaluation_id"], attempt.number)
+            pdf_destination = attempt_dir / "bps-report-full.pdf"
+            full_section_ids = tuple(
+                section.section_id for section in report_sections if section.parent_id is None
             )
+            pdf_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="bps-full-pdf",
+            )
+            pdf_future = pdf_executor.submit(
+                services.bps.export_full_report_pdf,
+                run_id,
+                pdf_destination,
+                full_section_ids,
+            )
+            destination = attempt_dir / "bps-report.csv"
             report_path = services.bps.export_report(
                 run_id,
                 destination,
@@ -425,8 +440,19 @@ def build_graph(
             )
             performance_analysis = analyze_performance_timeseries(performance_path)
             report_text = report_path.read_text(encoding="utf-8-sig", errors="replace")
+            try:
+                pdf_report_path = pdf_future.result()
+            except Exception as exc:
+                warning = f"optional full PDF report export failed: {exc}"
+                LOGGER.warning(warning)
+                attempt = _append_error(attempt, warning)
+            else:
+                attempt = attempt.model_copy(update={"pdf_report_path": str(pdf_report_path)})
         except Exception as exc:
             attempt = _append_error(attempt, f"evidence collection failed: {exc}")
+        finally:
+            if pdf_executor is not None:
+                pdf_executor.shutdown(wait=True, cancel_futures=False)
 
         bps_complete = bool(
             attempt.bps_run_id
