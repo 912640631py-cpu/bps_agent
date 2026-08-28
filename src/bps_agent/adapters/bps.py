@@ -20,7 +20,7 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 
 from bps_agent.artifacts import ArtifactStore
-from bps_agent.models import BpsConfig, RunCompletion
+from bps_agent.models import BpsConfig, PortReservation, RunCompletion
 from bps_agent.pdf_worker import PdfExportJob
 
 LOGGER = logging.getLogger(__name__)
@@ -28,6 +28,21 @@ LOGGER = logging.getLogger(__name__)
 _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _RETRYABLE_REPORT_STATUSES = {404, 409, 500, 503}
 _RETRYABLE_PORT_RELEASE_STATUSES = {400, 409, 423, 500, 502, 503, 504}
+_PDF_WORKER_SYSTEM_ENVIRONMENT = frozenset(
+    {
+        "COMSPEC",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "WINDIR",
+    }
+)
 _EXPLICIT_TERMINAL_STATES = {
     "aborted",
     "complete",
@@ -293,6 +308,117 @@ class BpsClient:
         if response.status_code in {400, 409, 423}:
             raise PortOccupiedError(f"BPS ports are unavailable (HTTP {response.status_code})")
         response.raise_for_status()
+
+    def _topology(self) -> dict[str, Any]:
+        payload = self._checked(
+            self._request("GET", "/bps/api/v2/core/topology", timeout=30)
+        )
+        if not isinstance(payload, dict):
+            raise BpsProtocolError("BPS topology response is not a JSON object")
+        return payload
+
+    @staticmethod
+    def _reservation_owner(port: dict[str, Any]) -> str | None:
+        raw_owner = port.get("reservedBy")
+        if raw_owner is None:
+            descriptor = port.get("owner")
+            if isinstance(descriptor, str) and descriptor.startswith("BreakingPoint/"):
+                parts = descriptor.split("/")
+                raw_owner = parts[1] if len(parts) >= 2 else None
+        if raw_owner is None:
+            return None
+        owner = str(raw_owner).strip()
+        if owner.casefold() in {"", "none", "null", "unreserved", "available", "free"}:
+            return None
+        return owner
+
+    def port_reservations(self) -> tuple[PortReservation, ...]:
+        """Query BPS for the actual owners of every configured physical port."""
+
+        topology = self._topology()
+        slots = topology.get("slot")
+        if not isinstance(slots, list):
+            raise BpsProtocolError("BPS topology response omitted slots")
+        selected_slots = [
+            item
+            for item in slots
+            if isinstance(item, dict) and str(item.get("id")) == str(self.config.slot)
+        ]
+        if len(selected_slots) != 1:
+            raise BpsProtocolError(
+                f"BPS topology contained {len(selected_slots)} entries for slot {self.config.slot}"
+            )
+        raw_ports = selected_slots[0].get("port")
+        if not isinstance(raw_ports, list):
+            raise BpsProtocolError(f"BPS topology slot {self.config.slot} omitted ports")
+
+        reservations: list[PortReservation] = []
+        for configured_port in self.config.ports:
+            matches = [
+                item
+                for item in raw_ports
+                if isinstance(item, dict) and str(item.get("id")) == str(configured_port)
+            ]
+            if len(matches) != 1:
+                raise BpsProtocolError(
+                    "BPS topology contained "
+                    f"{len(matches)} entries for port {self.config.slot}/{configured_port}"
+                )
+            owner = self._reservation_owner(matches[0])
+            reservations.append(
+                PortReservation(
+                    slot=self.config.slot,
+                    port=configured_port,
+                    owner=owner,
+                    owned_by_agent=(
+                        owner is not None and owner.casefold() == self.username.casefold()
+                    ),
+                )
+            )
+        return tuple(reservations)
+
+    def find_active_runs_for_ports(self) -> tuple[str, ...]:
+        """Return active BPS Runs owned by this account or using configured ports."""
+
+        topology = self._topology()
+        running_tests = topology.get("runningTest")
+        if not isinstance(running_tests, list):
+            raise BpsProtocolError("BPS topology response omitted runningTest")
+        configured_ports = {(self.config.slot, port) for port in self.config.ports}
+        matches: list[str] = []
+        for item in running_tests:
+            if not isinstance(item, dict) or _is_explicit_terminal_state(item):
+                continue
+            uses_configured_port = False
+            raw_ports = item.get("port")
+            if isinstance(raw_ports, list):
+                for raw_port in raw_ports:
+                    if not isinstance(raw_port, dict):
+                        continue
+                    identity = raw_port.get("pi", raw_port)
+                    if not isinstance(identity, dict):
+                        continue
+                    try:
+                        physical_port = (int(identity["slot"]), int(identity["port"]))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if physical_port in configured_ports:
+                        uses_configured_port = True
+                        break
+            owned_by_agent = (
+                isinstance(item.get("user"), str)
+                and str(item["user"]).casefold() == self.username.casefold()
+            )
+            if not uses_configured_port and not owned_by_agent:
+                continue
+            run_id = next(
+                (str(item[key]) for key in ("id", "runid", "runId") if item.get(key) is not None),
+                None,
+            )
+            if run_id is None or not _RUN_ID.fullmatch(run_id):
+                raise BpsProtocolError("BPS active Run response omitted a safe run ID")
+            matches.append(run_id)
+        return tuple(dict.fromkeys(matches))
 
     def release_ports(self) -> None:
         attempts = self.config.port_release_attempts
@@ -631,9 +757,14 @@ class BpsClient:
             section_ids=section_ids,
         )
         ArtifactStore.write_json(job_path, job)
-        worker_environment = os.environ.copy()
-        worker_environment["BPS_USERNAME"] = self.username
-        worker_environment["BPS_PASSWORD"] = self._password
+        worker_environment = {
+            name.upper(): value
+            for name, value in os.environ.items()
+            if name.upper() in _PDF_WORKER_SYSTEM_ENVIRONMENT
+        }
+        worker_environment.update(
+            {"BPS_USERNAME": self.username, "BPS_PASSWORD": self._password}
+        )
         creation_flags = 0
         start_new_session = os.name != "nt"
         if os.name == "nt":

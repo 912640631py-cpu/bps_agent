@@ -9,6 +9,7 @@ from typing import Any, Protocol
 from bps_agent.models import (
     DutCaptureResult,
     EvidenceBundle,
+    PortReservation,
     RunCompletion,
     VerdictDocument,
 )
@@ -24,6 +25,10 @@ class BpsPort(Protocol):
     def find_template(self, name: str) -> dict[str, Any]: ...
 
     def reserve_ports(self) -> None: ...
+
+    def port_reservations(self) -> tuple[PortReservation, ...]: ...
+
+    def find_active_runs_for_ports(self) -> tuple[str, ...]: ...
 
     def set_total_bandwidth(self, percentage: float) -> None: ...
 

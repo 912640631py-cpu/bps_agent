@@ -242,6 +242,19 @@ class StorageConfig(StrictModel):
     artifact_dir: Path = Path("artifacts")
     checkpoint_db: Path = Path(".state/checkpoints.sqlite3")
 
+    def resolved_relative_to(self, base_dir: Path) -> StorageConfig:
+        """Return storage paths anchored to the directory containing the config file."""
+
+        def resolved(path: Path) -> Path:
+            return path.resolve() if path.is_absolute() else (base_dir / path).resolve()
+
+        return self.model_copy(
+            update={
+                "artifact_dir": resolved(self.artifact_dir),
+                "checkpoint_db": resolved(self.checkpoint_db),
+            }
+        )
+
 
 class EvaluationConfig(StrictModel):
     mode: EvaluationMode = EvaluationMode.BPS_AND_DUT
@@ -257,7 +270,7 @@ class EvaluationConfig(StrictModel):
 
 class AppConfig(StrictModel):
     bps: BpsConfig
-    dut: DutConfig
+    dut: DutConfig | None = None
     assessment: AssessmentConfig = AssessmentConfig()
     bps_only_assessment: AssessmentConfig = AssessmentConfig(
         goal="仅依据 BPS 证据验证指定流量目标与性能稳定性",
@@ -270,6 +283,12 @@ class AppConfig(StrictModel):
     llm: LlmConfig = LlmConfig()
     storage: StorageConfig = StorageConfig()
     evaluation: EvaluationConfig = EvaluationConfig()
+
+    @model_validator(mode="after")
+    def require_dut_for_selected_mode(self) -> AppConfig:
+        if self.evaluation.mode == EvaluationMode.BPS_AND_DUT and self.dut is None:
+            raise ValueError("bps_and_dut evaluation requires dut configuration")
+        return self
 
     @property
     def selected_assessment(self) -> AssessmentConfig:
@@ -428,6 +447,17 @@ class SupplementalSnapshot(StrictModel):
 class RunCompletion(StrictModel):
     terminal: bool
     details: dict[str, Any] = Field(default_factory=dict)
+
+
+class PortReservation(StrictModel):
+    """Actual BPS reservation owner for one configured physical port."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    slot: int = Field(ge=0)
+    port: int = Field(ge=0)
+    owner: str | None = None
+    owned_by_agent: bool = False
 
 
 class PerformanceAnalysisThresholds(StrictModel):

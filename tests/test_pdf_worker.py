@@ -24,6 +24,9 @@ def test_scheduler_persists_secret_free_job_and_launches_isolated_process(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     captured: dict[str, Any] = {}
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "must-not-leak")
+    monkeypatch.setenv("DUT_BACKEND_PASSWORD", "must-not-leak-either")
+    monkeypatch.setenv("UNRELATED_SETTING", "must-not-leak")
 
     def popen(arguments: list[str], **kwargs: Any) -> object:
         captured["arguments"] = arguments
@@ -45,6 +48,24 @@ def test_scheduler_persists_secret_free_job_and_launches_isolated_process(
     assert json.loads(raw_job)["status"] == "pending"
     assert captured["environment"]["BPS_USERNAME"] == "bps-user"
     assert captured["environment"]["BPS_PASSWORD"] == "bps-password"
+    assert "DEEPSEEK_API_KEY" not in captured["environment"]
+    assert "DUT_BACKEND_PASSWORD" not in captured["environment"]
+    assert "UNRELATED_SETTING" not in captured["environment"]
+    assert set(captured["environment"]) <= {
+        "BPS_PASSWORD",
+        "BPS_USERNAME",
+        "COMSPEC",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "WINDIR",
+    }
     assert captured["arguments"][-2:] == ["--job", str(job_path)]
 
 

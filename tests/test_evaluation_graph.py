@@ -28,6 +28,7 @@ from bps_agent.models import (
     EvidenceBundle,
     FrontendDutEvidence,
     ObservationPhase,
+    PortReservation,
     ResourceObservation,
     RunCompletion,
     SupplementalSnapshot,
@@ -110,6 +111,8 @@ class FakeBps:
         self.reserve_count = 0
         self.release_count = 0
         self.stop_count = 0
+        self.reservation_owner: str | None = None
+        self.active_run_ids: set[str] = set()
         self.export_section_ids: list[tuple[str, ...]] = []
         self.report_run_ids: list[str] = []
         self.export_run_ids: list[str] = []
@@ -144,13 +147,30 @@ class FakeBps:
 
     def reserve_ports(self) -> None:
         self.reserve_count += 1
+        self.reservation_owner = "agent-user"
+
+    def port_reservations(self) -> tuple[PortReservation, ...]:
+        return tuple(
+            PortReservation(
+                slot=4,
+                port=port,
+                owner=self.reservation_owner,
+                owned_by_agent=self.reservation_owner == "agent-user",
+            )
+            for port in (4, 5)
+        )
+
+    def find_active_runs_for_ports(self) -> tuple[str, ...]:
+        return tuple(sorted(self.active_run_ids))
 
     def set_total_bandwidth(self, percentage: float) -> None:
         self.bandwidth_percentages.append(percentage)
 
     def start_run(self) -> str:
         self.run_count += 1
-        return f"run-{self.run_count}"
+        run_id = f"run-{self.run_count}"
+        self.active_run_ids.add(run_id)
+        return run_id
 
     def find_running_runs(self, *, template: str, group: int) -> tuple[str, ...]:
         del template, group
@@ -159,6 +179,7 @@ class FakeBps:
     def wait_for_completion(self, run_id: str, on_poll: Callable[[], None]) -> RunCompletion:
         self.clock.sleep(10)
         on_poll()
+        self.active_run_ids.discard(run_id)
         return RunCompletion(terminal=True, details={"run_id": run_id, "result": "complete"})
 
     def wait_for_report(self, run_id: str) -> Any:
@@ -219,9 +240,11 @@ class FakeBps:
 
     def release_ports(self) -> None:
         self.release_count += 1
+        self.reservation_owner = None
 
     def stop_run(self, run_id: str) -> None:
         self.stop_count += 1
+        self.active_run_ids.discard(run_id)
 
 
 class FakeDut:
@@ -454,6 +477,25 @@ def test_bps_only_mode_never_calls_dut_and_omits_dut_evidence(app_config: AppCon
     assert dut.keepalive_calls == 0
     assert dut.monitoring_calls == 0
     assert dut.supplemental_calls == 0
+
+
+def test_bps_only_graph_runs_without_any_dut_configuration(app_config: AppConfig) -> None:
+    document = app_config.model_dump(mode="python")
+    document.pop("dut")
+    document["evaluation"]["mode"] = EvaluationMode.BPS_ONLY.value
+    config = AppConfig.model_validate(document)
+    clock = FakeClock()
+
+    result = run_graph(
+        config,
+        FakeBps(clock),
+        None,
+        FakeJudge([VerdictValue.PASS]),
+        clock,
+    )
+
+    assert result["outcome"] == EvaluationOutcome.PASSED.value
+    assert result["attempts"][0]["dut_collection_method"] is None
 
 
 def test_passes_on_first_complete_attempt(app_config: AppConfig) -> None:
@@ -737,12 +779,100 @@ def test_dut_keepalive_failure_is_a_non_fatal_attempt_warning(
     assert any("DUT keepalive failed" in error for error in result["attempts"][0]["errors"])
 
 
+def test_stale_agent_reservation_is_released_only_when_no_active_run_exists(
+    app_config: AppConfig,
+) -> None:
+    bps = FakeBps(FakeClock())
+    bps.reservation_owner = "agent-user"
+
+    result = run_graph(
+        app_config,
+        bps,
+        FakeDut(),
+        FakeJudge([VerdictValue.PASS]),
+        bps.clock,
+    )
+
+    assert result["outcome"] == EvaluationOutcome.PASSED.value
+    assert bps.reserve_count == 1
+    assert bps.release_count == 2  # stale reservation, then the completed BPS Run
+
+
+def test_agent_reservation_with_active_run_is_not_unreserved_without_journal(
+    app_config: AppConfig,
+) -> None:
+    bps = FakeBps(FakeClock())
+    bps.reservation_owner = "agent-user"
+    bps.active_run_ids.add("external-active-run")
+
+    result = run_graph(
+        app_config,
+        bps,
+        FakeDut(),
+        FakeJudge([VerdictValue.PASS]),
+        bps.clock,
+    )
+
+    assert result["outcome"] == EvaluationOutcome.INCONCLUSIVE.value
+    assert "active Run(s) exist" in result["error"]
+    assert bps.reserve_count == bps.release_count == 0
+
+
+def test_other_account_reservation_is_never_unreserved(app_config: AppConfig) -> None:
+    bps = FakeBps(FakeClock())
+    bps.reservation_owner = "another-user"
+
+    result = run_graph(
+        app_config,
+        bps,
+        FakeDut(),
+        FakeJudge([VerdictValue.PASS]),
+        bps.clock,
+    )
+
+    assert result["outcome"] == EvaluationOutcome.INCONCLUSIVE.value
+    assert "reserved by another account" in result["error"]
+    assert bps.reserve_count == bps.release_count == 0
+
+
+def test_resume_reconciles_unreserved_ports_instead_of_trusting_checkpoint(
+    app_config: AppConfig,
+) -> None:
+    bps = FakeBps(FakeClock())
+    with SqliteSaver.from_conn_string(str(app_config.storage.checkpoint_db)) as saver:
+        graph = build_graph(
+            EvaluationServices(
+                config=app_config,
+                bps=bps,
+                dut=FakeDut(),
+                judge=FakeJudge([VerdictValue.PASS]),
+                artifacts=ArtifactStore(app_config.storage.artifact_dir),
+                clock=bps.clock,
+            ),
+            checkpointer=saver,
+        )
+        invocation = {"configurable": {"thread_id": "reservation-recovery"}}
+        stream = graph.stream(initial_state("reservation-recovery", app_config), config=invocation)
+        for event in stream:
+            if "start_attempt" in event:
+                break
+        stream.close()
+        assert graph.get_state(invocation).values["attempts"][-1]["ports_reserved"] is True
+
+        bps.reservation_owner = None
+        result = graph.invoke(None, config=invocation)
+
+    assert result["outcome"] == EvaluationOutcome.PASSED.value
+    assert result["attempts"][0]["ports_reserved"] is False
+    assert bps.release_count == 0
+
+
 def test_port_release_failure_does_not_erase_confirmed_run_terminal_state(
     app_config: AppConfig,
 ) -> None:
     class ReleaseFailingBps(FakeBps):
         def release_ports(self) -> None:
-            super().release_ports()
+            self.release_count += 1
             raise RuntimeError("release retries exhausted")
 
     clock = FakeClock()

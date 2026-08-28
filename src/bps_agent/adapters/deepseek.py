@@ -11,6 +11,22 @@ import httpx
 from bps_agent.models import EvidenceBundle, ProviderConfig, ReasoningEffort, VerdictDocument
 
 _RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504}
+_COMPATIBILITY_FEATURE_MARKERS = (
+    "json_object",
+    "reasoning",
+    "reasoning_effort",
+    "response_format",
+    "thinking",
+)
+_COMPATIBILITY_REJECTION_MARKERS = (
+    "invalid parameter",
+    "not allowed",
+    "not supported",
+    "not valid",
+    "unknown parameter",
+    "unrecognized",
+    "unsupported",
+)
 _SYSTEM_PROMPT = """你是网络设备性能测试裁决专家。
 请只依据给定 Evidence Bundle 判断本次性能测试是否通过。
 你拥有测试 Verdict 的最终裁决权。
@@ -68,7 +84,10 @@ class DeepSeekJudge:
         return f"{self.config.base_url}/chat/completions"
 
     def _request_verdict(
-        self, messages: list[dict[str, str]]
+        self,
+        messages: list[dict[str, str]],
+        *,
+        compatibility_probe: bool = False,
     ) -> tuple[VerdictDocument, dict[str, Any]]:
         payload = {
             "model": self.config.model,
@@ -88,17 +107,21 @@ class DeepSeekJudge:
             else:
                 if response.is_redirect:
                     raise ProviderRequestError("LLM endpoint returned an unexpected redirect")
-                if response.status_code == 400:
+                if (
+                    response.status_code == 400
+                    and compatibility_probe
+                    and self._is_compatibility_rejection(response)
+                ):
                     raise ProviderCompatibilityError(
-                        "LLM rejected JSON/thinking/reasoning_effort="
-                        f"{self.reasoning_effort} compatibility: "
-                        f"{response.text[:500]}"
+                        "LLM compatibility probe rejected JSON/thinking/reasoning_effort="
+                        f"{self.reasoning_effort}: {self._provider_error(response)}"
                     )
                 try:
                     response.raise_for_status()
                 except httpx.HTTPStatusError as exc:
                     last_error = ProviderRequestError(
-                        f"LLM request failed with HTTP {response.status_code}"
+                        f"LLM request failed with HTTP {response.status_code}: "
+                        f"{self._provider_error(response)}"
                     )
                     last_cause = exc
                     if response.status_code not in _RETRYABLE_STATUS:
@@ -132,12 +155,47 @@ class DeepSeekJudge:
         assert isinstance(content, str)
         return content
 
+    @staticmethod
+    def _provider_error(response: httpx.Response) -> str:
+        code: Any = None
+        message: Any = None
+        try:
+            document = response.json()
+        except (json.JSONDecodeError, ValueError):
+            document = None
+        if isinstance(document, dict):
+            error = document.get("error", document)
+            if isinstance(error, dict):
+                code = error.get("code") or error.get("type")
+                message = error.get("message")
+        parts: list[str] = []
+        if code is not None:
+            parts.append(f"code={code}")
+        if message is not None:
+            parts.append(f"message={str(message)[:500]}")
+        if not parts:
+            text = response.text.strip()
+            parts.append(text[:500] if text else "provider returned no error details")
+        return ", ".join(parts)
+
+    @classmethod
+    def _is_compatibility_rejection(cls, response: httpx.Response) -> bool:
+        details = cls._provider_error(response).casefold()
+        mentions_feature = any(
+            marker in details for marker in _COMPATIBILITY_FEATURE_MARKERS
+        )
+        rejects_feature = any(
+            marker in details for marker in _COMPATIBILITY_REJECTION_MARKERS
+        )
+        return mentions_feature and rejects_feature
+
     def validate_compatibility(self) -> None:
         self._request_verdict(
             [
                 {"role": "system", "content": '只返回 JSON：{"verdict":"pass"}'},
                 {"role": "user", "content": "这是接口兼容性检查，不是实际测试裁决。"},
-            ]
+            ],
+            compatibility_probe=True,
         )
 
     def adjudicate(self, evidence: EvidenceBundle) -> tuple[VerdictDocument, dict[str, Any]]:

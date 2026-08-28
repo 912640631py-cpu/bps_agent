@@ -114,6 +114,57 @@ def test_bps_run_contract_never_forces_reservation() -> None:
     )
 
 
+def test_bps_queries_actual_reservation_owners_and_active_runs() -> None:
+    topology = {
+        "runningTest": [
+            {
+                "id": "TEST-1922",
+                "completed": False,
+                "user": "agent-user",
+                "port": [{"pi": {"slot": 4, "port": 4}}, {"pi": {"slot": 4, "port": 5}}],
+            }
+        ],
+        "slot": [
+            {
+                "id": "4",
+                "port": [
+                    {
+                        "id": "4",
+                        "owner": "BreakingPoint/agent-user/10",
+                        "reservedBy": "agent-user",
+                    },
+                    {"id": "5", "owner": "None", "reservedBy": ""},
+                ],
+            }
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/bps/api/v2/core/topology"
+        return httpx.Response(200, json=topology)
+
+    client = BpsClient(
+        BpsConfig(
+            endpoint="https://bps.example.test",
+            template="template",
+            slot=4,
+            ports=(4, 5),
+            group=10,
+        ),
+        username="agent-user",
+        password="password",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    reservations = client.port_reservations()
+
+    assert [(item.port, item.owner, item.owned_by_agent) for item in reservations] == [
+        (4, "agent-user", True),
+        (5, None, False),
+    ]
+    assert client.find_active_runs_for_ports() == ("TEST-1922",)
+
+
 def test_bps_total_bandwidth_rejects_invalid_percentage() -> None:
     client = BpsClient(
         BpsConfig(
@@ -435,6 +486,61 @@ def test_deepseek_preserves_compatibility_error_type() -> None:
     )
 
     with pytest.raises(ProviderCompatibilityError, match="unsupported reasoning"):
+        judge.validate_compatibility()
+
+
+def test_deepseek_normal_400_is_a_request_error_with_provider_details() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "code": "context_length_exceeded",
+                    "message": "input exceeds the model context window",
+                }
+            },
+        )
+
+    judge = DeepSeekJudge(
+        "official",
+        ProviderConfig(
+            base_url="https://api.deepseek.com",
+            model="deepseek-v4-flash",
+            token_env="DEEPSEEK_API_KEY",
+            attempts=3,
+        ),
+        token="secret",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(ProviderRequestError) as captured:
+        judge._request_verdict([{"role": "user", "content": "real Evidence Bundle"}])
+
+    assert "HTTP 400" in str(captured.value)
+    assert "context_length_exceeded" in str(captured.value)
+    assert "input exceeds the model context window" in str(captured.value)
+
+
+def test_deepseek_probe_400_without_compatibility_signal_is_a_request_error() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={"error": {"code": "invalid_request", "message": "malformed messages"}},
+        )
+
+    judge = DeepSeekJudge(
+        "official",
+        ProviderConfig(
+            base_url="https://api.deepseek.com",
+            model="deepseek-v4-flash",
+            token_env="DEEPSEEK_API_KEY",
+            attempts=1,
+        ),
+        token="secret",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(ProviderRequestError, match="malformed messages"):
         judge.validate_compatibility()
 
 

@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from bps_agent.config import load_config
-from bps_agent.models import DutCollectionMethod, DutConfig, EvaluationMode
+from bps_agent.models import AppConfig, DutCollectionMethod, DutConfig, EvaluationMode
 
 
 def test_demo_configuration_matches_real_lab_defaults() -> None:
@@ -76,3 +76,96 @@ def test_llm_reasoning_effort_is_configurable() -> None:
     updated = type(config).model_validate(document)
 
     assert updated.llm.reasoning_effort == "high"
+
+
+def test_bps_only_configuration_can_omit_dut_section(tmp_path: Path) -> None:
+    config_path = tmp_path / "bps-only.yaml"
+    config_path.write_text(
+        """
+bps:
+  endpoint: https://bps.example.test
+  template: performance-demo
+  slot: 4
+  ports: [4, 5]
+  group: 10
+evaluation:
+  mode: bps_only
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.evaluation.mode == EvaluationMode.BPS_ONLY
+    assert config.dut is None
+
+
+def test_bps_only_cli_mode_override_is_applied_before_cross_field_validation(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "bps-only-via-cli.yaml"
+    config_path.write_text(
+        """
+bps:
+  endpoint: https://bps.example.test
+  template: performance-demo
+  slot: 4
+  ports: [4, 5]
+  group: 10
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path, mode_override=EvaluationMode.BPS_ONLY)
+
+    assert config.evaluation.mode == EvaluationMode.BPS_ONLY
+    assert config.dut is None
+
+
+def test_bps_and_dut_configuration_requires_dut_section() -> None:
+    with pytest.raises(ValueError, match="bps_and_dut evaluation requires dut"):
+        AppConfig.model_validate(
+            {
+                "bps": {
+                    "endpoint": "https://bps.example.test",
+                    "template": "performance-demo",
+                    "slot": 4,
+                    "ports": [4, 5],
+                    "group": 10,
+                }
+            }
+        )
+
+
+def test_storage_paths_are_anchored_to_configuration_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_dir = tmp_path / "configuration"
+    config_dir.mkdir()
+    config_path = config_dir / "bps-only.yaml"
+    config_path.write_text(
+        """
+bps:
+  endpoint: https://bps.example.test
+  template: performance-demo
+  slot: 4
+  ports: [4, 5]
+  group: 10
+evaluation:
+  mode: bps_only
+storage:
+  artifact_dir: output/artifacts
+  checkpoint_db: state/checkpoints.sqlite3
+""".strip(),
+        encoding="utf-8",
+    )
+    other_cwd = tmp_path / "other-cwd"
+    other_cwd.mkdir()
+    monkeypatch.chdir(other_cwd)
+
+    config = load_config(config_path)
+
+    assert config.storage.artifact_dir == (config_dir / "output/artifacts").resolve()
+    assert config.storage.checkpoint_db == (config_dir / "state/checkpoints.sqlite3").resolve()
+    assert config.storage.artifact_dir.is_absolute()
+    assert config.storage.checkpoint_db.is_absolute()

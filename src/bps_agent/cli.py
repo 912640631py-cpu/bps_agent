@@ -84,6 +84,7 @@ def _run_credential_requirements(
 ) -> tuple[CredentialRequirement, ...]:
     requirements = list(_BPS_CREDENTIALS)
     if config.evaluation.mode != EvaluationMode.BPS_ONLY:
+        assert config.dut is not None
         requirements.extend(
             _BACKEND_DUT_CREDENTIALS
             if config.dut.collection_method == DutCollectionMethod.BACKEND_SSH
@@ -215,6 +216,8 @@ def _apply_bps_overrides(
         document["bps"]["total_bandwidth_mbps"] = total_bandwidth_mbps
     if bps_only:
         document["evaluation"]["mode"] = EvaluationMode.BPS_ONLY.value
+    if any(value is not None for value in dut_overrides) and document.get("dut") is None:
+        raise ValueError("DUT overrides require a dut section in the configuration")
     if dut_collection_method is not None:
         document["dut"]["collection_method"] = dut_collection_method.value
     if any(value is not None for value in (dut_host, dut_port, dut_interval_seconds)):
@@ -276,7 +279,10 @@ def run_live(
     dut_interval_seconds: float | None = None,
 ) -> int:
     config = _apply_bps_overrides(
-        load_config(config_path),
+        load_config(
+            config_path,
+            mode_override=EvaluationMode.BPS_ONLY if bps_only else None,
+        ),
         template=template,
         ports=ports,
         total_bandwidth_mbps=total_bandwidth_mbps,
@@ -320,22 +326,27 @@ def run_live(
         bps.authenticate()
         if config.evaluation.mode == EvaluationMode.BPS_ONLY:
             print("BPS-only mode: DUT authentication and monitoring are disabled.")
-        elif config.dut.collection_method == DutCollectionMethod.BACKEND_SSH:
-            dut = DutBackendCollector(
-                config.dut,
-                username=credentials["DUT_BACKEND_USERNAME"],
-                password=credentials["DUT_BACKEND_PASSWORD"],
-            )
-            print("DUT backend SSH collection enabled (host keys are not currently verified).")
         else:
-            dut = DutClient(
-                config.dut,
-                username=credentials["DUT_FRONTEND_USERNAME"],
-                password=credentials["DUT_FRONTEND_PASSWORD"],
-                captcha_reader=_captcha_reader,
-            )
-            print("Authenticating to DUT (CAPTCHA required)...")
-            dut.authenticate()
+            assert config.dut is not None
+            if config.dut.collection_method == DutCollectionMethod.BACKEND_SSH:
+                dut = DutBackendCollector(
+                    config.dut,
+                    username=credentials["DUT_BACKEND_USERNAME"],
+                    password=credentials["DUT_BACKEND_PASSWORD"],
+                )
+                print(
+                    "DUT backend SSH collection enabled "
+                    "(host keys are not currently verified)."
+                )
+            else:
+                dut = DutClient(
+                    config.dut,
+                    username=credentials["DUT_FRONTEND_USERNAME"],
+                    password=credentials["DUT_FRONTEND_PASSWORD"],
+                    captcha_reader=_captcha_reader,
+                )
+                print("Authenticating to DUT (CAPTCHA required)...")
+                dut.authenticate()
         config.storage.checkpoint_db.parent.mkdir(parents=True, exist_ok=True)
         with SqliteSaver.from_conn_string(str(config.storage.checkpoint_db)) as saver:
             services = EvaluationServices(

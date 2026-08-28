@@ -117,6 +117,16 @@ class RunLaunchCoordinator:
             return self._request_start(intent)
         return self._reconcile(intent)
 
+    def recovery_requires_reservation(
+        self,
+        evaluation_id: str,
+        attempt_number: int,
+    ) -> bool:
+        """Whether a durable launch is still prepared and has not sent its run request."""
+
+        intent = self._read(evaluation_id, attempt_number)
+        return intent is not None and intent.status == "prepared"
+
     def start(
         self,
         evaluation_id: str,
