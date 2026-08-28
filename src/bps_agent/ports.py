@@ -40,12 +40,12 @@ class BpsPort(Protocol):
         section_ids: tuple[str, ...],
     ) -> Path: ...
 
-    def export_full_report_pdf(
+    def schedule_full_report_pdf(
         self,
         run_id: str,
         destination: Path,
         section_ids: tuple[str, ...],
-    ) -> Path: ...
+    ) -> None: ...
 
     def release_ports(self) -> None: ...
 

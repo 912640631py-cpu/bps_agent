@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import tempfile
 from contextlib import suppress
 from pathlib import Path
@@ -135,6 +136,18 @@ def _provider(config: AppConfig, credentials: dict[str, str]) -> tuple[str, Any,
     name = config.llm.provider
     selected = config.llm.selected
     return name, selected, credentials[selected.token_env]
+
+
+def _configured_judge(config: AppConfig, credentials: dict[str, str]) -> DeepSeekJudge:
+    """Create the identically configured judge used by Live Evaluation and Replay."""
+
+    provider_name, provider_config, token = _provider(config, credentials)
+    return DeepSeekJudge(
+        provider_name,
+        provider_config,
+        token=token,
+        reasoning_effort=config.llm.reasoning_effort,
+    )
 
 
 def _has_unsafe_reservation(result: dict[str, Any]) -> bool:
@@ -289,15 +302,9 @@ def run_live(
             judge = _EvidenceOnlyJudge()
             print("Evidence-only mode: DeepSeek will not be contacted.")
         else:
-            provider_name, provider_config, token = _provider(config, credentials)
-            judge = DeepSeekJudge(
-                provider_name,
-                provider_config,
-                token=token,
-                reasoning_effort=config.llm.reasoning_effort,
-            )
+            judge = _configured_judge(config, credentials)
             print(
-                f"Checking {provider_name} provider compatibility with "
+                f"Checking {judge.provider_name} provider compatibility with "
                 f"reasoning_effort={config.llm.reasoning_effort}..."
             )
             judge.validate_compatibility()
@@ -394,6 +401,8 @@ def run_live(
                 return 0
         outcome = str(result["outcome"])
         print(json.dumps({"evaluation_id": evaluation_id, "outcome": outcome}, ensure_ascii=False))
+        if result.get("error"):
+            print(f"Error: {result['error']}", file=sys.stderr)
         verdict_fields = _verdict_console_fields(result)
         if verdict_fields is not None:
             print(json.dumps(verdict_fields, ensure_ascii=False, indent=2))
@@ -436,16 +445,15 @@ def replay(
             ),
         )
     )
-    provider_name, provider_config, token = _provider(config, credentials)
-    judge = DeepSeekJudge(provider_name, provider_config, token=token)
+    judge = _configured_judge(config, credentials)
     try:
         verdict, raw = judge.adjudicate(evidence)
         output_path = evidence_path.parent / "replay-verdict.json"
         ArtifactStore.write_json(
             output_path,
             {
-                "provider": provider_name,
-                "model": provider_config.model,
+                "provider": judge.provider_name,
+                "model": judge.model_name,
                 "parsed": verdict.model_dump(mode="json"),
                 "raw_response": raw,
             },

@@ -305,25 +305,30 @@ def analyze_performance_timeseries(path: Path) -> PerformanceTimeseriesAnalysis:
     tables = _parse_tables(path)
     samples, expected, coverage = _align(tables, thresholds)
     phases, stable_start, stable_finish = _phases(samples, thresholds)
-    stable_samples = samples[stable_start : stable_finish + 1]
+    baseline_finish = stable_start + thresholds.stable_baseline_sample_count
+    if baseline_finish > stable_finish + 1:
+        raise PerformanceTimeseriesError(
+            "Stable phase is too short to establish the configured early baseline window"
+        )
+    baseline_samples = samples[stable_start:baseline_finish]
     baseline = PerformanceStableBaseline(
-        started_at_second=stable_samples[0].second,
-        finished_at_second=stable_samples[-1].second,
-        sample_count=len(stable_samples),
-        tx_median_mbps=statistics.median(sample.tx_mbps for sample in stable_samples),
-        rx_median_mbps=statistics.median(sample.rx_mbps for sample in stable_samples),
+        started_at_second=baseline_samples[0].second,
+        finished_at_second=baseline_samples[-1].second,
+        sample_count=len(baseline_samples),
+        tx_median_mbps=statistics.median(sample.tx_mbps for sample in baseline_samples),
+        rx_median_mbps=statistics.median(sample.rx_mbps for sample in baseline_samples),
         concurrent_flows_median=statistics.median(
-            sample.concurrent_flows for sample in stable_samples
+            sample.concurrent_flows for sample in baseline_samples
         ),
         flow_rate_median_per_second=statistics.median(
-            sample.flow_rate_per_second for sample in stable_samples
+            sample.flow_rate_per_second for sample in baseline_samples
         ),
     )
     if baseline.concurrent_flows_median <= 0:
         raise PerformanceTimeseriesError("Stable Concurrent Flows baseline must be positive")
 
     stable_candidates: list[int] = []
-    for index in range(stable_start, stable_finish + 1):
+    for index in range(baseline_finish, stable_finish + 1):
         sample = samples[index]
         throughput_drop = max(
             _drop(sample.tx_mbps, baseline.tx_median_mbps),
@@ -432,7 +437,7 @@ def analyze_performance_timeseries(path: Path) -> PerformanceTimeseriesAnalysis:
         summary = "Observed throughput decline follows the Ramp-down load reduction."
     else:
         assessment = PerformanceAssessment.NORMAL
-        summary = "Stable-phase Tx/Rx throughput remains near its test-specific median baseline."
+        summary = "Stable-phase Tx/Rx throughput remains near its frozen early-window baseline."
 
     events.sort(key=lambda event: (event.started_at_second, event.finished_at_second))
     return PerformanceTimeseriesAnalysis(

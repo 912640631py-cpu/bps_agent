@@ -12,6 +12,7 @@ from bps_agent.cli import (
     EXIT_CODES,
     _apply_bps_overrides,
     _configure_logging,
+    _configured_judge,
     _load_resume_config,
     _parser,
     _verdict_console_fields,
@@ -285,6 +286,44 @@ def test_cli_suppresses_http_client_info_logs() -> None:
 
     assert logging.getLogger("httpx").level == logging.WARNING
     assert logging.getLogger("httpcore").level == logging.WARNING
+
+
+def test_live_and_replay_share_the_complete_llm_configuration(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    class CapturingJudge:
+        def __init__(
+            self,
+            provider_name: str,
+            provider_config: object,
+            *,
+            token: str,
+            reasoning_effort: str,
+        ) -> None:
+            calls.append(
+                {
+                    "provider_name": provider_name,
+                    "provider_config": provider_config,
+                    "token": token,
+                    "reasoning_effort": reasoning_effort,
+                }
+            )
+
+    monkeypatch.setattr("bps_agent.cli.DeepSeekJudge", CapturingJudge)
+    config = app_config.model_copy(
+        update={"llm": app_config.llm.model_copy(update={"reasoning_effort": "high"})}
+    )
+    credentials = {config.llm.selected.token_env: "token"}
+
+    live_judge = _configured_judge(config, credentials)
+    replay_judge = _configured_judge(config, credentials)
+
+    assert live_judge is not replay_judge
+    assert calls[0] == calls[1]
+    assert calls[0]["reasoning_effort"] == "high"
 
 
 def test_degraded_pass_has_distinct_nonzero_exit_code() -> None:

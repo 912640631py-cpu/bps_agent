@@ -6,7 +6,7 @@
 
 - 从每个 Run 的 TOC 按“章节标题 + 父级路径”动态解析 Section ID。
 - 分别导出主报告和秒级吞吐、Flow Rate、Concurrent Flows 时序数据。
-- 在 Stable 阶段以 Tx/Rx 中位数为基线进行确定性性能分析。
+- 在 Stable 阶段开始后的固定早期窗口建立并冻结 Tx/Rx 基线，进行确定性性能分析。
 - LLM 返回 `retry` 时自动降载，最多执行六次；返回 `pass` 后立即结束。
 - 使用 SQLite checkpoint 支持中断恢复和 Evidence 离线回放。
 - 支持 BPS-only 模式，完全跳过 DUT 登录、CAPTCHA、keepalive 和监控读取。
@@ -101,14 +101,14 @@ python -m bps_agent replay --evidence artifacts\EVALUATION_ID\attempt-01\evidenc
 每次 Attempt 默认生成：
 
 - `bps-report.csv`：测试参数、判据和结果，内容进入 `evidence.json`。
-- `bps-report-full.pdf`：BPS 完整 PDF 结果报告，与现有 CSV 导出和性能分析并行下载，不进入 LLM Evidence；下载失败只记录警告，不影响 Evidence、Verdict 或 Outcome。
+- `bps-report-full.pdf`：best-effort 的 BPS 完整 PDF 结果报告，使用独立后台下载且不进入 LLM Evidence；慢速下载不会阻塞 Evidence、Verdict 或 finalize，失败只记录 warning，因此该补充产物可能缺失。
 - `bps-performance-timeseries.csv`：原始秒级性能数据，不进入 `evidence.json`。
 - `dut-metrics.json`：使用 SSH 后端方式时，保存逐次采样的完整审计数据和失败记录，不发送给 LLM。
 - `dut-metrics.csv`：使用 SSH 后端方式时，保存打流期间的紧凑 DUT 时序，仅首行保留真实时间锚点，后续行使用相对秒数；正文进入 `evidence.json` 交给 LLM。
 - `evidence.json`：BPS 报告、紧凑的 `bps_performance_analysis`，以及启用时的 DUT 证据。
 - TOC、Section 解析结果、Attempt 和 Verdict 审计文件。
 
-性能时序按最近采样点对齐到 1 秒时间轴。Stable 负载下，吞吐下降超过约 10% 且持续至少 3 秒判为性能异常；下降超过约 20% 且持续至少 2 秒判为严重异常。Ramp-down 中吞吐与 Concurrent Flows 同步下降视为正常负载变化。
+性能时序按最近采样点对齐到 1 秒时间轴。Stable 阶段开始后的前 5 个对齐样本用于建立冻结 baseline，后续下降不会反向污染基线。Stable 负载下，吞吐下降超过约 10% 且持续至少 3 秒判为性能异常；下降超过约 20% 且持续至少 2 秒判为严重异常。Ramp-down 中吞吐与 Concurrent Flows 同步下降视为正常负载变化。
 
 最终 Outcome：
 

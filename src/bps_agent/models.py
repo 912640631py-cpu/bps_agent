@@ -414,6 +414,7 @@ class PerformanceAnalysisThresholds(StrictModel):
     stable_flow_floor_ratio_to_peak: float = 0.9
     stable_flow_tolerance_ratio: float = 0.1
     minimum_stable_samples: int = 5
+    stable_baseline_sample_count: int = Field(default=5, ge=1)
     throughput_drop_ratio: float = 0.1
     throughput_drop_minimum_samples: int = 3
     severe_throughput_drop_ratio: float = 0.2

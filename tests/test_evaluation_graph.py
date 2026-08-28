@@ -3,9 +3,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 from typing import Any
 
+import pytest
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from bps_agent.artifacts import ArtifactStore
@@ -76,6 +77,7 @@ class FakeBps:
         report_toc: Any = None,
         verify_pdf_parallel: bool = False,
         pdf_error: bool = False,
+        block_pdf_until_released: bool = False,
     ) -> None:
         self.clock = clock
         self.template_error = template_error
@@ -112,12 +114,16 @@ class FakeBps:
         self.export_run_ids: list[str] = []
         self.pdf_export_run_ids: list[str] = []
         self.pdf_export_section_ids: list[tuple[str, ...]] = []
+        self.pdf_destinations: list[Path] = []
         self.bandwidth_percentages: list[float] = []
         self.verify_pdf_parallel = verify_pdf_parallel
         self.pdf_error = pdf_error
+        self.block_pdf_until_released = block_pdf_until_released
         self.pdf_started = Event()
         self.pdf_release = Event()
+        self.pdf_finished = Event()
         self.pdf_overlapped_existing_exports = False
+        self.pdf_warning_count = 0
 
     def find_template(self, name: str) -> dict[str, Any]:
         if self.template_error:
@@ -182,14 +188,31 @@ class FakeBps:
     ) -> Path:
         self.pdf_export_run_ids.append(run_id)
         self.pdf_export_section_ids.append(section_ids)
+        self.pdf_destinations.append(destination)
         if self.pdf_error:
             raise RuntimeError("fixture PDF export failed")
-        if self.verify_pdf_parallel:
+        if self.verify_pdf_parallel or self.block_pdf_until_released:
             self.pdf_started.set()
-            assert self.pdf_release.wait(1)
+            assert self.pdf_release.wait(5)
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(b"%PDF-1.7\nfixture")
         return destination
+
+    def schedule_full_report_pdf(
+        self,
+        run_id: str,
+        destination: Path,
+        section_ids: tuple[str, ...],
+    ) -> None:
+        def export() -> None:
+            try:
+                self.export_full_report_pdf(run_id, destination, section_ids)
+            except Exception:
+                self.pdf_warning_count += 1
+            finally:
+                self.pdf_finished.set()
+
+        Thread(target=export, name="fake-bps-full-pdf", daemon=True).start()
 
     def release_ports(self) -> None:
         self.release_count += 1
@@ -404,16 +427,18 @@ def test_bps_only_mode_never_calls_dut_and_omits_dut_evidence(app_config: AppCon
     )
     clock = FakeClock()
     dut = FakeDut()
+    bps = FakeBps(clock)
 
     result = run_graph(
         config,
-        FakeBps(clock),
+        bps,
         dut,
         FakeJudge([VerdictValue.PASS]),
         clock,
     )
 
     assert result["outcome"] == EvaluationOutcome.PASSED.value
+    assert bps.run_count == 1
     attempt = result["attempts"][0]
     assert attempt["evidence_complete"] is True
     evidence_path = Path(attempt["evidence_path"])
@@ -467,10 +492,11 @@ def test_passes_on_first_complete_attempt(app_config: AppConfig) -> None:
         ),
         ("30.4.5", "30.4.7", "30.4.8"),
     ]
-    attempt = result["attempts"][0]
-    pdf_path = Path(attempt["pdf_report_path"])
+    assert bps.pdf_finished.wait(1)
+    pdf_path = bps.pdf_destinations[0]
     assert pdf_path.name == "bps-report-full.pdf"
     assert pdf_path.read_bytes().startswith(b"%PDF-")
+    assert result["attempts"][0]["pdf_report_path"] is None
     assert Path(result["final_artifact"]).exists()
 
 
@@ -493,21 +519,71 @@ def test_full_pdf_export_overlaps_existing_report_exports(app_config: AppConfig)
 def test_full_pdf_export_failure_does_not_affect_evaluation(app_config: AppConfig) -> None:
     clock = FakeClock()
     judge = FakeJudge([VerdictValue.PASS])
+    bps = FakeBps(clock, pdf_error=True)
 
     result = run_graph(
         app_config,
-        FakeBps(clock, pdf_error=True),
+        bps,
         FakeDut(),
         judge,
         clock,
     )
 
+    assert bps.pdf_finished.wait(1)
     assert result["outcome"] == EvaluationOutcome.PASSED.value
     attempt = result["attempts"][0]
     assert attempt["evidence_complete"] is True
     assert attempt["pdf_report_path"] is None
-    assert any("fixture PDF export failed" in error for error in attempt["errors"])
+    assert not any("PDF" in error for error in attempt["errors"])
+    assert bps.pdf_warning_count == 1
     assert judge.calls == 1
+
+
+def test_full_pdf_schedule_failure_is_only_a_warning(
+    app_config: AppConfig,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class ScheduleFailingBps(FakeBps):
+        def schedule_full_report_pdf(
+            self,
+            run_id: str,
+            destination: Path,
+            section_ids: tuple[str, ...],
+        ) -> None:
+            raise RuntimeError("fixture scheduling failure")
+
+    clock = FakeClock()
+    result = run_graph(
+        app_config,
+        ScheduleFailingBps(clock),
+        FakeDut(),
+        FakeJudge([VerdictValue.PASS]),
+        clock,
+    )
+
+    assert result["outcome"] == EvaluationOutcome.PASSED.value
+    assert not any("PDF" in error for error in result["attempts"][0]["errors"])
+    assert "fixture scheduling failure" in caplog.text
+
+
+def test_slow_full_pdf_does_not_delay_verdict_or_finalize(app_config: AppConfig) -> None:
+    clock = FakeClock()
+    bps = FakeBps(clock, block_pdf_until_released=True)
+
+    result = run_graph(
+        app_config,
+        bps,
+        FakeDut(),
+        FakeJudge([VerdictValue.PASS]),
+        clock,
+    )
+
+    assert bps.pdf_started.is_set()
+    assert not bps.pdf_finished.is_set()
+    assert result["outcome"] == EvaluationOutcome.PASSED.value
+    assert Path(result["final_artifact"]).exists()
+    bps.pdf_release.set()
+    assert bps.pdf_finished.wait(1)
 
 
 def test_backend_csv_is_the_only_backend_metrics_sent_to_the_judge(

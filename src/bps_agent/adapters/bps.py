@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -11,12 +12,15 @@ import time
 from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
+from threading import Thread
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 import httpx
 
 from bps_agent.models import BpsConfig, RunCompletion
+
+LOGGER = logging.getLogger(__name__)
 
 _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _RETRYABLE_REPORT_STATUSES = {404, 409, 500, 503}
@@ -572,6 +576,50 @@ class BpsClient:
             timeout_seconds=self.config.pdf_report_timeout_seconds,
             include_subsections=True,
         )
+
+    def schedule_full_report_pdf(
+        self,
+        run_id: str,
+        destination: Path,
+        section_ids: tuple[str, ...],
+    ) -> None:
+        """Start an isolated best-effort PDF export outside the Evaluation critical path."""
+
+        if not self._session_id or not self._api_key:
+            LOGGER.warning(
+                "Optional full PDF report export was not scheduled: BPS is not logged in"
+            )
+            return
+        config = self.config
+        username = self.username
+        headers = dict(self._client.headers)
+        cookies = dict(self._client.cookies.items())
+
+        def export() -> None:
+            try:
+                with httpx.Client(
+                    verify=config.verify_tls,
+                    follow_redirects=False,
+                    timeout=httpx.Timeout(30.0, read=config.pdf_report_timeout_seconds),
+                    trust_env=False,
+                    headers=headers,
+                    cookies=cookies,
+                ) as client:
+                    worker = BpsClient(
+                        config,
+                        username=username,
+                        password="",
+                        client=client,
+                    )
+                    worker.export_full_report_pdf(run_id, destination, section_ids)
+            except Exception as exc:
+                LOGGER.warning("Optional full PDF report export failed: %s", exc)
+
+        Thread(
+            target=export,
+            name=f"bps-full-pdf-{run_id}",
+            daemon=True,
+        ).start()
 
     def stop_run(self, run_id: str) -> None:
         self._checked(
