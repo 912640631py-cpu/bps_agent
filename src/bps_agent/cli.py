@@ -40,6 +40,7 @@ from bps_agent.models import (
     EvaluationMode,
     EvaluationOutcome,
     EvidenceBundle,
+    PortReservationState,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -157,7 +158,11 @@ def _has_unsafe_reservation(result: dict[str, Any]) -> bool:
     if not isinstance(attempts, list) or not attempts:
         return False
     try:
-        return AttemptRecord.model_validate(attempts[-1]).ports_reserved
+        attempt = AttemptRecord.model_validate(attempts[-1])
+        return (
+            attempt.ports_reserved
+            or attempt.port_reservation_state != PortReservationState.NONE
+        )
     except ValueError:
         return True
 

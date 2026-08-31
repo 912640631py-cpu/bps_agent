@@ -24,6 +24,7 @@ def test_demo_configuration_matches_real_lab_defaults() -> None:
     assert config.dut.backend.host == "10.66.246.133"
     assert config.dut.backend.port == 50023
     assert config.dut.backend.interval_seconds == 10
+    assert config.dut.backend.worker_stop_timeout_seconds == 5
     assert config.dut.frontend is not None
     assert config.dut.frontend.endpoint == "https://10.66.246.133"
     assert config.dut.interfaces == ("T1/1", "T1/2")

@@ -8,6 +8,7 @@ import io
 import json
 import threading
 import time
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,8 @@ from bps_agent.models import (
 _REMOTE_API_DIR = "/opt/nsfocus/web/www/api"
 _REMOTE_SYSTEM_CHART = "Dashboard/SystemChart.php"
 _MAX_RETRY_DELAY_SECONDS = 5.0
+_CHANNEL_READ_SIZE = 64 * 1024
+_CHANNEL_POLL_INTERVAL_SECONDS = 0.01
 
 
 class DutBackendError(RuntimeError):
@@ -142,6 +145,57 @@ def _validate_snapshot(document: dict[str, Any], interfaces: tuple[str, ...]) ->
         )
 
 
+def _read_channel_output(
+    channel: paramiko.Channel,
+    timeout_seconds: float,
+) -> tuple[int, str, str]:
+    """Drain both SSH streams before requesting exit status, with a hard deadline."""
+
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        while channel.recv_ready():
+            chunk = channel.recv(_CHANNEL_READ_SIZE)
+            if not chunk:
+                break
+            stdout_chunks.append(chunk)
+        while channel.recv_stderr_ready():
+            chunk = channel.recv_stderr(_CHANNEL_READ_SIZE)
+            if not chunk:
+                break
+            stderr_chunks.append(chunk)
+        if channel.exit_status_ready():
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            with suppress(Exception):
+                channel.close()
+            raise TimeoutError(
+                f"DUT backend command exceeded {timeout_seconds:g} seconds"
+            )
+        time.sleep(min(_CHANNEL_POLL_INTERVAL_SECONDS, remaining))
+
+    # SSH channel messages are ordered; once exit-status is visible, all preceding
+    # stdout/stderr data can be drained before recv_exit_status() is called.
+    while channel.recv_ready():
+        chunk = channel.recv(_CHANNEL_READ_SIZE)
+        if not chunk:
+            break
+        stdout_chunks.append(chunk)
+    while channel.recv_stderr_ready():
+        chunk = channel.recv_stderr(_CHANNEL_READ_SIZE)
+        if not chunk:
+            break
+        stderr_chunks.append(chunk)
+    exit_status = channel.recv_exit_status()
+    return (
+        exit_status,
+        b"".join(stdout_chunks).decode("utf-8", errors="replace"),
+        b"".join(stderr_chunks).decode("utf-8", errors="replace").strip(),
+    )
+
+
 class DutSshBackendClient:
     def __init__(self, config: DutConfig, *, username: str, password: str) -> None:
         self.config = config
@@ -151,9 +205,16 @@ class DutSshBackendClient:
         self.username = username
         self._password = password
         self._client: paramiko.SSHClient | None = None
+        self._close_generation = 0
+
+    def _disconnect(self) -> None:
+        client = self._client
+        self._client = None
+        if client is not None:
+            client.close()
 
     def connect(self) -> None:
-        self.close()
+        self._disconnect()
         backend = self._backend
         client = paramiko.SSHClient()
         # This temporary lab mode deliberately does not load or persist host keys.
@@ -175,9 +236,8 @@ class DutSshBackendClient:
         self._client = client
 
     def close(self) -> None:
-        if self._client is not None:
-            self._client.close()
-            self._client = None
+        self._close_generation += 1
+        self._disconnect()
 
     def clear_credentials(self) -> None:
         self.close()
@@ -198,18 +258,26 @@ class DutSshBackendClient:
         backend = self._backend
         command = _remote_command(interfaces)
         last_error: BaseException | None = None
+        close_generation = self._close_generation
         for attempt in range(backend.read_attempts):
+            if self._close_generation != close_generation:
+                last_error = DutBackendError("DUT backend collection was cancelled")
+                break
             try:
                 client = self._ensure_connected()
-                stdin, stdout, stderr = client.exec_command(
+                if self._close_generation != close_generation:
+                    self._disconnect()
+                    raise DutBackendError("DUT backend collection was cancelled")
+                stdin, stdout, _stderr = client.exec_command(
                     command,
                     timeout=backend.command_timeout_seconds,
                     get_pty=False,
                 )
                 stdin.close()
-                exit_status = stdout.channel.recv_exit_status()
-                stdout_text = stdout.read().decode("utf-8", errors="replace")
-                stderr_text = stderr.read().decode("utf-8", errors="replace").strip()
+                exit_status, stdout_text, stderr_text = _read_channel_output(
+                    stdout.channel,
+                    backend.command_timeout_seconds,
+                )
                 if exit_status != 0:
                     detail = stderr_text or stdout_text.strip() or "no diagnostic output"
                     raise DutBackendError(
@@ -226,7 +294,9 @@ class DutSshBackendClient:
                 DutBackendError,
             ) as exc:
                 last_error = exc
-                self.close()
+                if self._close_generation != close_generation:
+                    break
+                self._disconnect()
                 if attempt + 1 < backend.read_attempts:
                     delay = min(
                         backend.read_retry_backoff_seconds * (2**attempt),
@@ -341,13 +411,16 @@ class DutBackendCollector:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        self._worker_failure: str | None = None
 
     def prepare_attempt(self, attempt_dir: Path) -> None:
         self._stop_worker()
+        self._raise_worker_failure()
         self._client.close()
         self._samples = []
         self._errors = []
         self._missed_sample_count = 0
+        self._worker_failure = None
         self._traffic_started_at = None
         self._traffic_finished_at = None
         self._attempt_dir = attempt_dir
@@ -385,6 +458,7 @@ class DutBackendCollector:
                 self.traffic_finished(finished_at)
             return
         self._stop_worker()
+        self._raise_worker_failure()
         if not raw_path.is_file():
             raise RuntimeError("resumed backend DUT Attempt omitted dut-metrics.json")
         document = ArtifactStore.read_json(raw_path)
@@ -411,6 +485,10 @@ class DutBackendCollector:
         if not isinstance(missed_sample_count, int) or missed_sample_count < 0:
             raise RuntimeError("resumed backend DUT artifact has invalid missed_sample_count")
         self._missed_sample_count = missed_sample_count
+        worker_failure = document.get("worker_failure")
+        if worker_failure is not None and not isinstance(worker_failure, str):
+            raise RuntimeError("resumed backend DUT artifact has invalid worker_failure")
+        self._worker_failure = worker_failure
         self._traffic_started_at = started_at
         self._traffic_finished_at = finished_at
         if finished_at is None:
@@ -428,6 +506,8 @@ class DutBackendCollector:
             started_at = _iso_now()
             try:
                 snapshot = self._client.read_snapshot(self.config.interfaces)
+                if self._stop.is_set():
+                    break
                 sample = {
                     "started_at": started_at,
                     "finished_at": _iso_now(),
@@ -445,6 +525,8 @@ class DutBackendCollector:
                     self._missed_sample_count += missed
                     self._write_checkpoint_locked()
             except Exception as exc:
+                if self._stop.is_set():
+                    break
                 failure = {
                     "scheduled_at": started_at,
                     "started_at": started_at,
@@ -467,13 +549,39 @@ class DutBackendCollector:
         self._traffic_finished_at = finished_at
         self._stop_worker()
         self._write_checkpoint()
+        self._raise_worker_failure()
 
     def _stop_worker(self) -> None:
         self._stop.set()
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
-            thread.join()
+            thread.join(timeout=self._backend.worker_stop_timeout_seconds)
+            if thread.is_alive():
+                self._client.close()
+                thread.join(timeout=min(1.0, self._backend.worker_stop_timeout_seconds))
+                message = (
+                    "DUT backend collector worker did not stop within "
+                    f"{self._backend.worker_stop_timeout_seconds:g} seconds; "
+                    "the SSH channel and transport were closed"
+                )
+                if self._worker_failure is None:
+                    self._worker_failure = message
+                    now = _iso_now()
+                    with self._lock:
+                        self._errors.append(
+                            {
+                                "scheduled_at": now,
+                                "started_at": now,
+                                "finished_at": now,
+                                "error": message,
+                            }
+                        )
+                        self._write_checkpoint_locked()
         self._thread = None
+
+    def _raise_worker_failure(self) -> None:
+        if self._worker_failure is not None:
+            raise DutBackendError(self._worker_failure)
 
     def _result_document(self) -> dict[str, Any]:
         return {
@@ -488,6 +596,7 @@ class DutBackendCollector:
             "traffic_finished_at": self._traffic_finished_at,
             "interval_seconds": self._backend.interval_seconds,
             "missed_sample_count": self._missed_sample_count,
+            "worker_failure": self._worker_failure,
             "samples": list(self._samples),
             "errors": list(self._errors),
         }
@@ -502,6 +611,7 @@ class DutBackendCollector:
 
     def finalize_attempt(self) -> DutCaptureResult:
         self._stop_worker()
+        self._raise_worker_failure()
         started_at = self._traffic_started_at
         finished_at = self._traffic_finished_at
         if started_at is None or finished_at is None:

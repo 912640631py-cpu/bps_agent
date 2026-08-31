@@ -26,6 +26,8 @@ from bps_agent.models import (
     FrontendDutEvidence,
     ObservationPhase,
     PerformanceTimeseriesAnalysis,
+    PortReservationState,
+    PortReservationStatus,
     VerdictValue,
     utc_now,
 )
@@ -156,37 +158,92 @@ def build_graph(
     if dut_enabled and dut_config is None:
         raise ValueError("bps_and_dut mode requires DUT configuration")
 
-    def agent_owns_actual_reservation() -> bool:
-        reservations = services.bps.port_reservations()
+    def actual_reservation_status() -> PortReservationStatus:
+        return services.bps.port_reservation_status()
+
+    def reject_foreign_reservation(status: PortReservationStatus) -> None:
+        if status.state != PortReservationState.FOREIGN:
+            return
         other_owners = sorted(
             {
                 reservation.owner
-                for reservation in reservations
+                for reservation in status.reservations
                 if reservation.owner is not None and not reservation.owned_by_agent
             }
         )
-        if other_owners:
-            raise RuntimeError(
-                "configured BPS ports are reserved by another account: "
-                + ", ".join(other_owners)
-            )
-        return any(reservation.owned_by_agent for reservation in reservations)
+        raise RuntimeError(
+            "configured BPS ports are reserved by another account: "
+            + ", ".join(other_owners)
+        )
 
-    def release_agent_reservation_if_inactive() -> None:
-        if not agent_owns_actual_reservation():
-            return
+    def attempt_reservation_update(status: PortReservationStatus) -> dict[str, Any]:
+        return {
+            "ports_reserved": status.state == PortReservationState.ALL_AGENT,
+            "port_reservation_state": status.state,
+        }
+
+    def release_agent_reservation_if_inactive(
+        status: PortReservationStatus | None = None,
+    ) -> PortReservationStatus:
+        status = status or actual_reservation_status()
+        reject_foreign_reservation(status)
+        if status.state == PortReservationState.NONE:
+            return status
         active_runs = services.bps.find_active_runs_for_ports()
         if active_runs:
+            reservation_label = (
+                "partially reserved"
+                if status.state == PortReservationState.PARTIAL_AGENT
+                else "reserved"
+            )
             raise RuntimeError(
-                "refusing to unreserve Agent-owned BPS ports while active Run(s) exist: "
+                f"refusing to clean {reservation_label} Agent-owned BPS ports while "
+                "active Run(s) exist: "
                 + ", ".join(active_runs)
             )
+        selected_ports = (
+            status.agent_owned_ports
+            if status.state == PortReservationState.PARTIAL_AGENT
+            else None
+        )
         try:
-            services.bps.release_ports()
+            if selected_ports is None:
+                services.bps.release_ports()
+            else:
+                services.bps.release_ports(selected_ports)
         except Exception:
-            if not agent_owns_actual_reservation():
-                return
+            reconciled = actual_reservation_status()
+            reject_foreign_reservation(reconciled)
+            if not reconciled.agent_owned_ports:
+                return reconciled
             raise
+        reconciled = actual_reservation_status()
+        reject_foreign_reservation(reconciled)
+        if reconciled.state != PortReservationState.NONE:
+            raise RuntimeError(
+                "BPS ports remained reserved after cleanup: " + reconciled.state.value
+            )
+        return reconciled
+
+    def reconcile_partial_reservation(
+        status: PortReservationStatus,
+    ) -> PortReservationStatus:
+        reject_foreign_reservation(status)
+        if status.state != PortReservationState.PARTIAL_AGENT:
+            return status
+        return release_agent_reservation_if_inactive(status)
+
+    def reserve_all_ports() -> PortReservationStatus:
+        services.bps.reserve_ports()
+        status = actual_reservation_status()
+        if status.state != PortReservationState.ALL_AGENT:
+            if status.state == PortReservationState.PARTIAL_AGENT:
+                release_agent_reservation_if_inactive(status)
+            raise RuntimeError(
+                "BPS reserve did not produce a complete Agent reservation: "
+                + status.state.value
+            )
+        return status
 
     def initialize(state: EvaluationState) -> dict[str, Any]:
         evaluation_id = state["evaluation_id"]
@@ -223,24 +280,23 @@ def build_graph(
             bps_total_bandwidth_mbps=target_mbps,
             bps_total_bandwidth_percent=bandwidth_percent,
         )
-        reserved = False
+        reservation = PortReservationStatus.classify(())
         run_id: str | None = None
         dut_started = False
         try:
-            reserved = agent_owns_actual_reservation()
+            reservation = reconcile_partial_reservation(actual_reservation_status())
             if launcher.recovery_requires_reservation(
                 state["evaluation_id"], attempt_number
             ):
-                if reserved:
+                if reservation.state == PortReservationState.ALL_AGENT:
                     active_runs = services.bps.find_active_runs_for_ports()
                     if active_runs:
                         raise RuntimeError(
                             "refusing to send a prepared BPS launch while active Run(s) exist: "
                             + ", ".join(active_runs)
                         )
-                else:
-                    services.bps.reserve_ports()
-                    reserved = True
+                elif reservation.state == PortReservationState.NONE:
+                    reservation = reserve_all_ports()
             launch = launcher.recover(
                 state["evaluation_id"],
                 attempt_number,
@@ -249,16 +305,14 @@ def build_graph(
             )
             recovered = launch is not None
             if launch is None:
-                if reserved:
-                    release_agent_reservation_if_inactive()
-                    reserved = False
+                if reservation.state == PortReservationState.ALL_AGENT:
+                    reservation = release_agent_reservation_if_inactive(reservation)
                 if dut_enabled:
                     assert services.dut is not None
                     services.dut.prepare_attempt(
                         services.artifacts.attempt_dir(state["evaluation_id"], attempt_number)
                     )
-                services.bps.reserve_ports()
-                reserved = True
+                reservation = reserve_all_ports()
                 services.bps.set_total_bandwidth(bandwidth_percent)
                 launch = launcher.start(
                     state["evaluation_id"],
@@ -267,7 +321,7 @@ def build_graph(
                     group=cfg.bps.group,
                 )
             else:
-                reserved = agent_owns_actual_reservation()
+                reservation = reconcile_partial_reservation(actual_reservation_status())
             run_id = launch.run_id
             traffic_started_at = launch.launched_at
             if dut_enabled:
@@ -291,7 +345,7 @@ def build_graph(
                         if dut_enabled and dut_config is not None
                         else None
                     ),
-                    "ports_reserved": reserved,
+                    **attempt_reservation_update(reservation),
                 }
             )
             services.artifacts.write_attempt_json(
@@ -308,13 +362,12 @@ def build_graph(
         except LaunchReconciliationError as exc:
             attempt = _append_error(attempt, f"BPS launch reconciliation failed: {exc}")
             try:
-                reserved = agent_owns_actual_reservation()
+                reservation = actual_reservation_status()
             except Exception as reservation_exc:
                 attempt = _append_error(
                     attempt, f"BPS reservation reconciliation failed: {reservation_exc}"
                 )
-                reserved = True
-            attempt = attempt.model_copy(update={"ports_reserved": reserved})
+            attempt = attempt.model_copy(update=attempt_reservation_update(reservation))
             services.artifacts.write_attempt_json(
                 state["evaluation_id"], attempt_number, "attempt.json", attempt
             )
@@ -334,10 +387,12 @@ def build_graph(
                         services.dut.traffic_finished(utc_now())
                 except Exception as cleanup_exc:
                     exc = RuntimeError(f"{exc}; BPS run cleanup failed: {cleanup_exc}")
-            if reserved:
+            if reservation.state in {
+                PortReservationState.ALL_AGENT,
+                PortReservationState.PARTIAL_AGENT,
+            }:
                 try:
-                    release_agent_reservation_if_inactive()
-                    reserved = False
+                    reservation = release_agent_reservation_if_inactive(reservation)
                 except Exception as cleanup_exc:
                     exc = RuntimeError(f"{exc}; pre-run port cleanup failed: {cleanup_exc}")
             return {
@@ -350,7 +405,9 @@ def build_graph(
         monitored_run_id = attempt.bps_run_id
         assert monitored_run_id is not None
         try:
-            actual_reservation = agent_owns_actual_reservation()
+            reservation = actual_reservation_status()
+            attempt = attempt.model_copy(update=attempt_reservation_update(reservation))
+            reservation = reconcile_partial_reservation(reservation)
         except Exception as exc:
             recovery_error = f"BPS reservation recovery failed: {exc}"
             attempt = _append_error(attempt, recovery_error)
@@ -362,7 +419,7 @@ def build_graph(
                 "outcome": EvaluationOutcome.INCONCLUSIVE.value,
                 "error": recovery_error,
             }
-        attempt = attempt.model_copy(update={"ports_reserved": actual_reservation})
+        attempt = attempt.model_copy(update=attempt_reservation_update(reservation))
         try:
             if dut_enabled:
                 assert services.dut is not None
@@ -415,7 +472,7 @@ def build_graph(
             }
         )
         try:
-            release_agent_reservation_if_inactive()
+            reservation = release_agent_reservation_if_inactive()
         except Exception as exc:
             release_error = f"BPS port release failed after confirmed terminal state: {exc}"
             attempt = _append_error(attempt, release_error)
@@ -428,7 +485,7 @@ def build_graph(
                 "outcome": EvaluationOutcome.INCONCLUSIVE.value,
                 "error": release_error,
             }
-        attempt = attempt.model_copy(update={"ports_reserved": False})
+        attempt = attempt.model_copy(update=attempt_reservation_update(reservation))
         released_run_id = attempt.bps_run_id
         assert released_run_id is not None
         launcher.mark_released(state["evaluation_id"], attempt.number, released_run_id)

@@ -20,7 +20,12 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 
 from bps_agent.artifacts import ArtifactStore
-from bps_agent.models import BpsConfig, PortReservation, RunCompletion
+from bps_agent.models import (
+    BpsConfig,
+    PortReservation,
+    PortReservationStatus,
+    RunCompletion,
+)
 from bps_agent.pdf_worker import PdfExportJob
 
 LOGGER = logging.getLogger(__name__)
@@ -332,7 +337,7 @@ class BpsClient:
             return None
         return owner
 
-    def port_reservations(self) -> tuple[PortReservation, ...]:
+    def port_reservation_status(self) -> PortReservationStatus:
         """Query BPS for the actual owners of every configured physical port."""
 
         topology = self._topology()
@@ -375,7 +380,7 @@ class BpsClient:
                     ),
                 )
             )
-        return tuple(reservations)
+        return PortReservationStatus.classify(tuple(reservations))
 
     def find_active_runs_for_ports(self) -> tuple[str, ...]:
         """Return active BPS Runs owned by this account or using configured ports."""
@@ -420,7 +425,14 @@ class BpsClient:
             matches.append(run_id)
         return tuple(dict.fromkeys(matches))
 
-    def release_ports(self) -> None:
+    def release_ports(self, ports: tuple[int, ...] | None = None) -> None:
+        selected_ports = self.config.ports if ports is None else ports
+        if not selected_ports:
+            raise ValueError("at least one BPS port must be selected for release")
+        if len(set(selected_ports)) != len(selected_ports) or not set(selected_ports).issubset(
+            self.config.ports
+        ):
+            raise ValueError("released BPS ports must be a unique subset of configured ports")
         attempts = self.config.port_release_attempts
         last_failure = "unknown failure"
         last_cause: Exception | None = None
@@ -431,7 +443,7 @@ class BpsClient:
                     "/bps/api/v2/core/topology/operations/unreserve",
                     json={
                         "unreservation": [
-                            {"slot": self.config.slot, "port": port} for port in self.config.ports
+                            {"slot": self.config.slot, "port": port} for port in selected_ports
                         ]
                     },
                     timeout=60,

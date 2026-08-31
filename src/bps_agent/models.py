@@ -123,6 +123,7 @@ class DutBackendConfig(StrictModel):
     interval_seconds: float = Field(default=10.0, gt=0)
     connect_timeout_seconds: float = Field(default=10.0, gt=0)
     command_timeout_seconds: float = Field(default=30.0, gt=0)
+    worker_stop_timeout_seconds: float = Field(default=5.0, gt=0)
     read_attempts: int = Field(default=3, ge=1)
     read_retry_backoff_seconds: float = Field(default=0.5, ge=0)
 
@@ -460,6 +461,47 @@ class PortReservation(StrictModel):
     owned_by_agent: bool = False
 
 
+class PortReservationState(StrEnum):
+    NONE = "none"
+    ALL_AGENT = "all_agent"
+    PARTIAL_AGENT = "partial_agent"
+    FOREIGN = "foreign"
+
+
+class PortReservationStatus(StrictModel):
+    """Complete reservation state for the configured BPS port set."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    state: PortReservationState
+    reservations: tuple[PortReservation, ...]
+
+    @classmethod
+    def classify(
+        cls, reservations: tuple[PortReservation, ...]
+    ) -> PortReservationStatus:
+        if any(
+            reservation.owner is not None and not reservation.owned_by_agent
+            for reservation in reservations
+        ):
+            state = PortReservationState.FOREIGN
+        else:
+            agent_count = sum(reservation.owned_by_agent for reservation in reservations)
+            if agent_count == 0:
+                state = PortReservationState.NONE
+            elif agent_count == len(reservations):
+                state = PortReservationState.ALL_AGENT
+            else:
+                state = PortReservationState.PARTIAL_AGENT
+        return cls(state=state, reservations=reservations)
+
+    @property
+    def agent_owned_ports(self) -> tuple[int, ...]:
+        return tuple(
+            reservation.port for reservation in self.reservations if reservation.owned_by_agent
+        )
+
+
 class PerformanceAnalysisThresholds(StrictModel):
     resample_interval_seconds: float = 1.0
     nearest_alignment_tolerance_seconds: float = 0.6
@@ -682,6 +724,7 @@ class AttemptRecord(StrictModel):
     verdict: VerdictDocument | None = None
     evidence_complete: bool = False
     ports_reserved: bool = False
+    port_reservation_state: PortReservationState = PortReservationState.NONE
     terminal_confirmed: bool = False
     errors: tuple[str, ...] = ()
 

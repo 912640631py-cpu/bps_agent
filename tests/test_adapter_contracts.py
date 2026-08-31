@@ -19,6 +19,7 @@ from bps_agent.models import (
     BpsConfig,
     DutConfig,
     ObservationPhase,
+    PortReservationState,
     ProviderConfig,
     SupplementalSnapshot,
 )
@@ -156,9 +157,10 @@ def test_bps_queries_actual_reservation_owners_and_active_runs() -> None:
         client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
 
-    reservations = client.port_reservations()
+    status = client.port_reservation_status()
 
-    assert [(item.port, item.owner, item.owned_by_agent) for item in reservations] == [
+    assert status.state == PortReservationState.PARTIAL_AGENT
+    assert [(item.port, item.owner, item.owned_by_agent) for item in status.reservations] == [
         (4, "agent-user", True),
         (5, None, False),
     ]
@@ -722,6 +724,33 @@ def test_bps_port_release_retries_a_transient_bad_request() -> None:
 
     assert len(requests) == 2
     assert statuses == []
+
+
+def test_bps_port_release_can_target_only_agent_owned_subset() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    client = BpsClient(
+        BpsConfig(
+            endpoint="https://bps.example.test",
+            template="template",
+            slot=4,
+            ports=(4, 5),
+            group=10,
+        ),
+        username="user",
+        password="password",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    client.release_ports((4,))
+
+    assert json.loads(requests[0].content) == {
+        "unreservation": [{"slot": 4, "port": 4}]
+    }
 
 
 def test_bps_port_release_reports_retry_exhaustion_separately() -> None:

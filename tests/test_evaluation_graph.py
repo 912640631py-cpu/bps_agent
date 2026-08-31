@@ -29,6 +29,8 @@ from bps_agent.models import (
     FrontendDutEvidence,
     ObservationPhase,
     PortReservation,
+    PortReservationState,
+    PortReservationStatus,
     ResourceObservation,
     RunCompletion,
     SupplementalSnapshot,
@@ -110,8 +112,9 @@ class FakeBps:
         self.run_count = 0
         self.reserve_count = 0
         self.release_count = 0
+        self.released_port_sets: list[tuple[int, ...]] = []
         self.stop_count = 0
-        self.reservation_owner: str | None = None
+        self.reservation_owners: dict[int, str | None] = {4: None, 5: None}
         self.active_run_ids: set[str] = set()
         self.export_section_ids: list[tuple[str, ...]] = []
         self.report_run_ids: list[str] = []
@@ -149,15 +152,26 @@ class FakeBps:
         self.reserve_count += 1
         self.reservation_owner = "agent-user"
 
-    def port_reservations(self) -> tuple[PortReservation, ...]:
-        return tuple(
-            PortReservation(
-                slot=4,
-                port=port,
-                owner=self.reservation_owner,
-                owned_by_agent=self.reservation_owner == "agent-user",
+    @property
+    def reservation_owner(self) -> str | None:
+        owners = set(self.reservation_owners.values())
+        return owners.pop() if len(owners) == 1 else None
+
+    @reservation_owner.setter
+    def reservation_owner(self, owner: str | None) -> None:
+        self.reservation_owners = dict.fromkeys((4, 5), owner)
+
+    def port_reservation_status(self) -> PortReservationStatus:
+        return PortReservationStatus.classify(
+            tuple(
+                PortReservation(
+                    slot=4,
+                    port=port,
+                    owner=owner,
+                    owned_by_agent=owner == "agent-user",
+                )
+                for port, owner in self.reservation_owners.items()
             )
-            for port in (4, 5)
         )
 
     def find_active_runs_for_ports(self) -> tuple[str, ...]:
@@ -238,9 +252,12 @@ class FakeBps:
 
         Thread(target=export, name="fake-bps-full-pdf", daemon=True).start()
 
-    def release_ports(self) -> None:
+    def release_ports(self, ports: tuple[int, ...] | None = None) -> None:
         self.release_count += 1
-        self.reservation_owner = None
+        selected_ports = ports or tuple(self.reservation_owners)
+        self.released_port_sets.append(selected_ports)
+        for port in selected_ports:
+            self.reservation_owners[port] = None
 
     def stop_run(self, run_id: str) -> None:
         self.stop_count += 1
@@ -681,6 +698,43 @@ def test_backend_without_a_successful_sample_is_inconclusive(
     assert judge.calls == 0
 
 
+def test_backend_worker_stop_timeout_makes_attempt_inconclusive(
+    app_config: AppConfig,
+) -> None:
+    class TimedOutBackendDut(FakeBackendDut):
+        def traffic_finished(self, finished_at: str) -> None:
+            super().traffic_finished(finished_at)
+            raise RuntimeError("collector worker did not stop")
+
+        def finalize_attempt(self) -> DutCaptureResult:
+            raise RuntimeError("collector worker did not stop")
+
+    config = app_config.model_copy(
+        update={
+            "dut": app_config.dut.model_copy(
+                update={"collection_method": DutCollectionMethod.BACKEND_SSH}
+            )
+        }
+    )
+    clock = FakeClock()
+    judge = FakeJudge([VerdictValue.PASS])
+
+    result = run_graph(
+        config,
+        FakeBps(clock),
+        TimedOutBackendDut(),
+        judge,
+        clock,
+    )
+
+    assert result["outcome"] == EvaluationOutcome.INCONCLUSIVE.value
+    assert judge.calls == 0
+    assert any(
+        "collector worker did not stop" in error
+        for error in result["attempts"][0]["errors"]
+    )
+
+
 def test_can_stop_after_evidence_without_calling_the_llm(app_config: AppConfig) -> None:
     clock = FakeClock()
     bps = FakeBps(clock)
@@ -796,6 +850,46 @@ def test_stale_agent_reservation_is_released_only_when_no_active_run_exists(
     assert result["outcome"] == EvaluationOutcome.PASSED.value
     assert bps.reserve_count == 1
     assert bps.release_count == 2  # stale reservation, then the completed BPS Run
+
+
+def test_partial_agent_reservation_without_active_run_is_cleaned_then_reserved(
+    app_config: AppConfig,
+) -> None:
+    bps = FakeBps(FakeClock())
+    bps.reservation_owners = {4: "agent-user", 5: None}
+
+    result = run_graph(
+        app_config,
+        bps,
+        FakeDut(),
+        FakeJudge([VerdictValue.PASS]),
+        bps.clock,
+    )
+
+    assert result["outcome"] == EvaluationOutcome.PASSED.value
+    assert bps.reserve_count == 1
+    assert bps.released_port_sets == [(4,), (4, 5)]
+    assert result["attempts"][0]["port_reservation_state"] == PortReservationState.NONE
+
+
+def test_partial_agent_reservation_with_active_run_is_inconclusive(
+    app_config: AppConfig,
+) -> None:
+    bps = FakeBps(FakeClock())
+    bps.reservation_owners = {4: "agent-user", 5: None}
+    bps.active_run_ids.add("partial-active-run")
+
+    result = run_graph(
+        app_config,
+        bps,
+        FakeDut(),
+        FakeJudge([VerdictValue.PASS]),
+        bps.clock,
+    )
+
+    assert result["outcome"] == EvaluationOutcome.INCONCLUSIVE.value
+    assert "partially reserved" in result["error"]
+    assert bps.reserve_count == bps.release_count == 0
 
 
 def test_agent_reservation_with_active_run_is_not_unreserved_without_journal(

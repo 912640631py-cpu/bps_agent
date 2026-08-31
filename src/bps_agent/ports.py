@@ -9,7 +9,7 @@ from typing import Any, Protocol
 from bps_agent.models import (
     DutCaptureResult,
     EvidenceBundle,
-    PortReservation,
+    PortReservationStatus,
     RunCompletion,
     VerdictDocument,
 )
@@ -26,7 +26,7 @@ class BpsPort(Protocol):
 
     def reserve_ports(self) -> None: ...
 
-    def port_reservations(self) -> tuple[PortReservation, ...]: ...
+    def port_reservation_status(self) -> PortReservationStatus: ...
 
     def find_active_runs_for_ports(self) -> tuple[str, ...]: ...
 
@@ -54,7 +54,7 @@ class BpsPort(Protocol):
         section_ids: tuple[str, ...],
     ) -> None: ...
 
-    def release_ports(self) -> None: ...
+    def release_ports(self, ports: tuple[int, ...] | None = None) -> None: ...
 
     def stop_run(self, run_id: str) -> None: ...
 

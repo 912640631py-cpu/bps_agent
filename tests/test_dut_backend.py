@@ -9,9 +9,11 @@ from pathlib import Path
 from typing import Any
 
 import paramiko
+import pytest
 
 from bps_agent.adapters.dut_backend import (
     DutBackendCollector,
+    DutBackendError,
     DutSshBackendClient,
     _extract_json,
     _missed_intervals,
@@ -46,7 +48,12 @@ def sample_snapshot() -> dict[str, Any]:
     }
 
 
-def backend_config(*, interval_seconds: float = 0.01) -> DutConfig:
+def backend_config(
+    *,
+    interval_seconds: float = 0.01,
+    command_timeout_seconds: float = 30.0,
+    worker_stop_timeout_seconds: float = 5.0,
+) -> DutConfig:
     return DutConfig(
         collection_method=DutCollectionMethod.BACKEND_SSH,
         interfaces=("T1/1", "T1/2"),
@@ -54,6 +61,8 @@ def backend_config(*, interval_seconds: float = 0.01) -> DutConfig:
             host="10.66.246.156",
             port=50023,
             interval_seconds=interval_seconds,
+            command_timeout_seconds=command_timeout_seconds,
+            worker_stop_timeout_seconds=worker_stop_timeout_seconds,
             read_attempts=1,
         ),
     )
@@ -61,6 +70,153 @@ def backend_config(*, interval_seconds: float = 0.01) -> DutConfig:
 
 def test_extract_json_accepts_an_informational_prefix() -> None:
     assert _extract_json("PHP notice\n" + json.dumps(sample_snapshot())) == sample_snapshot()
+
+
+def test_ssh_snapshot_drains_stdout_and_stderr_before_exit_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot_bytes = json.dumps(sample_snapshot()).encode()
+
+    class Channel:
+        def __init__(self) -> None:
+            self.stdout_chunks = [snapshot_bytes[:20], snapshot_bytes[20:]]
+            self.stderr_chunks = [b"diagnostic" * 10_000]
+            self.exit_status_requested = False
+
+        def recv_ready(self) -> bool:
+            return bool(self.stdout_chunks)
+
+        def recv(self, _size: int) -> bytes:
+            return self.stdout_chunks.pop(0)
+
+        def recv_stderr_ready(self) -> bool:
+            return bool(self.stderr_chunks)
+
+        def recv_stderr(self, _size: int) -> bytes:
+            return self.stderr_chunks.pop(0)
+
+        def exit_status_ready(self) -> bool:
+            return not self.stdout_chunks and not self.stderr_chunks
+
+        def recv_exit_status(self) -> int:
+            assert not self.stdout_chunks and not self.stderr_chunks
+            self.exit_status_requested = True
+            return 0
+
+        def close(self) -> None:
+            raise AssertionError("successful command channel must not be closed")
+
+    channel = Channel()
+
+    class Stream:
+        def __init__(self) -> None:
+            self.channel = channel
+
+        def read(self) -> bytes:
+            raise AssertionError("stream.read() must not be used")
+
+    class Stdin:
+        def close(self) -> None:
+            return None
+
+    class Transport:
+        def set_keepalive(self, _seconds: int) -> None:
+            return None
+
+        def is_active(self) -> bool:
+            return True
+
+    class SshClient:
+        def set_missing_host_key_policy(self, _policy: object) -> None:
+            return None
+
+        def connect(self, **_kwargs: Any) -> None:
+            return None
+
+        def get_transport(self) -> Transport:
+            return Transport()
+
+        def exec_command(self, *_args: Any, **_kwargs: Any) -> tuple[Stdin, Stream, Stream]:
+            return Stdin(), Stream(), Stream()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(paramiko, "SSHClient", SshClient)
+    client = DutSshBackendClient(
+        backend_config(command_timeout_seconds=0.1),
+        username="dutcollector",
+        password="password",
+    )
+    client.connect()
+
+    assert client.read_snapshot(("T1/1", "T1/2")) == sample_snapshot()
+    assert channel.exit_status_requested
+
+
+def test_ssh_snapshot_timeout_closes_channel_and_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"channel_closed": False, "client_closed": False}
+
+    class Channel:
+        def recv_ready(self) -> bool:
+            return False
+
+        def recv_stderr_ready(self) -> bool:
+            return False
+
+        def exit_status_ready(self) -> bool:
+            return False
+
+        def close(self) -> None:
+            calls["channel_closed"] = True
+
+    channel = Channel()
+
+    class Stream:
+        def __init__(self) -> None:
+            self.channel = channel
+
+    class Stdin:
+        def close(self) -> None:
+            return None
+
+    class Transport:
+        def set_keepalive(self, _seconds: int) -> None:
+            return None
+
+        def is_active(self) -> bool:
+            return True
+
+    class SshClient:
+        def set_missing_host_key_policy(self, _policy: object) -> None:
+            return None
+
+        def connect(self, **_kwargs: Any) -> None:
+            return None
+
+        def get_transport(self) -> Transport:
+            return Transport()
+
+        def exec_command(self, *_args: Any, **_kwargs: Any) -> tuple[Stdin, Stream, Stream]:
+            return Stdin(), Stream(), Stream()
+
+        def close(self) -> None:
+            calls["client_closed"] = True
+
+    monkeypatch.setattr(paramiko, "SSHClient", SshClient)
+    client = DutSshBackendClient(
+        backend_config(command_timeout_seconds=0.02),
+        username="dutcollector",
+        password="password",
+    )
+    client.connect()
+
+    with pytest.raises(DutBackendError, match=r"exceeded 0\.02 seconds"):
+        client.read_snapshot(("T1/1", "T1/2"))
+
+    assert calls == {"channel_closed": True, "client_closed": True}
 
 
 def test_csv_is_one_compact_row_per_sample_with_dynamic_interfaces() -> None:
@@ -173,6 +329,47 @@ def test_failed_sample_is_recorded_and_collection_continues(tmp_path: Path) -> N
     assert capture.evidence.successful_sample_count >= 1  # type: ignore[union-attr]
     assert capture.evidence.failed_sample_count == 1  # type: ignore[union-attr]
     assert "temporary failure" in capture.warnings[0]
+
+
+def test_worker_stop_timeout_closes_client_and_marks_capture_failed(tmp_path: Path) -> None:
+    class BlockingClient(FakeSnapshotClient):
+        def __init__(self) -> None:
+            super().__init__([sample_snapshot()])
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def read_snapshot(self, interfaces: tuple[str, ...]) -> dict[str, Any]:
+            assert interfaces == ("T1/1", "T1/2")
+            self.entered.set()
+            assert self.release.wait(1)
+            return sample_snapshot()
+
+    client = BlockingClient()
+    collector = DutBackendCollector(
+        backend_config(worker_stop_timeout_seconds=0.02),
+        username="dutcollector",
+        password="password",
+        client=client,  # type: ignore[arg-type]
+    )
+    collector.prepare_attempt(tmp_path)
+    collector.traffic_started("2026-08-27T13:53:30+08:00")
+    assert client.entered.wait(1)
+
+    started = time.monotonic()
+    with pytest.raises(
+        DutBackendError, match=r"worker did not stop within 0\.02 seconds"
+    ):
+        collector.traffic_finished("2026-08-27T13:54:00+08:00")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.3
+    assert client.closed >= 2  # forced close plus the initial Attempt reset
+    raw = ArtifactStore.read_json(tmp_path / "dut-metrics.json")
+    assert "worker did not stop" in raw["worker_failure"]
+    with pytest.raises(DutBackendError, match="worker did not stop"):
+        collector.finalize_attempt()
+    client.release.set()
+    collector.close()
 
 
 def test_missed_interval_calculation_advances_to_a_future_tick() -> None:
