@@ -34,10 +34,21 @@ def test_demo_configuration_matches_real_lab_defaults() -> None:
     assert config.llm.company.model == "deepseek-v4-flash-0731"
     assert config.llm.official.model == "deepseek-v4-flash"
     assert config.llm.reasoning_effort == "max"
-    assert config.evaluation.max_attempts == 6
+    assert "max_attempts" not in config.evaluation.model_dump()
     assert config.evaluation.mode == EvaluationMode.BPS_AND_DUT
     assert "BPS" in config.bps_only_assessment.goal
     assert "lock_dir" not in config.storage.model_dump()
+
+
+def test_deprecated_fixed_max_attempts_is_accepted_but_not_persisted(
+    app_config: AppConfig,
+) -> None:
+    document = app_config.model_dump(mode="python")
+    document["evaluation"]["max_attempts"] = 6
+
+    restored = AppConfig.model_validate(document)
+
+    assert "max_attempts" not in restored.evaluation.model_dump()
 
 
 def test_legacy_flat_dut_configuration_selects_frontend_collection() -> None:

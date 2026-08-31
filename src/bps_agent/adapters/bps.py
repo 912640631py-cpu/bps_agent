@@ -3,51 +3,32 @@
 from __future__ import annotations
 
 import json
-import logging
 import math
-import os
 import re
-import subprocess
-import sys
-import tempfile
 import time
 from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlsplit
 
 import httpx
 
-from bps_agent.artifacts import ArtifactStore
+from bps_agent.adapters.bps_reports import (
+    BpsProtocolError,
+    BpsReports,
+    require_success_payload,
+)
 from bps_agent.models import (
     BpsConfig,
     PortReservation,
     PortReservationStatus,
     RunCompletion,
 )
-from bps_agent.pdf_worker import PdfExportJob
-
-LOGGER = logging.getLogger(__name__)
+from bps_agent.pdf_export import schedule_full_report_pdf
 
 _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
-_RETRYABLE_REPORT_STATUSES = {404, 409, 500, 503}
 _RETRYABLE_PORT_RELEASE_STATUSES = {400, 409, 423, 500, 502, 503, 504}
-_PDF_WORKER_SYSTEM_ENVIRONMENT = frozenset(
-    {
-        "COMSPEC",
-        "LANG",
-        "LC_ALL",
-        "LC_CTYPE",
-        "PATH",
-        "PATHEXT",
-        "SYSTEMROOT",
-        "TEMP",
-        "TMP",
-        "TMPDIR",
-        "WINDIR",
-    }
-)
 _EXPLICIT_TERMINAL_STATES = {
     "aborted",
     "complete",
@@ -65,10 +46,6 @@ class PortOccupiedError(RuntimeError):
 
 
 class PortReleaseError(RuntimeError):
-    pass
-
-
-class BpsProtocolError(RuntimeError):
     pass
 
 
@@ -191,6 +168,7 @@ class BpsClient:
         self._owns_client = client is None
         self._session_id: str | None = None
         self._api_key: str | None = None
+        self._reports = BpsReports(config, client=self._client, request=self._request)
 
     def _url(self, path: str) -> str:
         return f"{self.config.endpoint}{path}"
@@ -218,21 +196,11 @@ class BpsClient:
         return response
 
     @staticmethod
-    def _decode(response: httpx.Response) -> Any:
-        if not response.content:
-            return None
-        try:
-            return response.json()
-        except json.JSONDecodeError:
-            return response.text
-
-    @classmethod
-    def _checked(cls, response: httpx.Response) -> Any:
-        response.raise_for_status()
-        return cls._decode(response)
+    def _require_success_payload(response: httpx.Response) -> Any:
+        return require_success_payload(response)
 
     def authenticate(self) -> None:
-        auth = self._checked(
+        auth = self._require_success_payload(
             self._request(
                 "POST",
                 "/bps/api/v1/auth/session",
@@ -245,7 +213,7 @@ class BpsClient:
         self._session_id = str(auth["sessionId"])
         self._api_key = str(auth["apiKey"])
         self._client.headers.update({"sessionId": self._session_id, "X-API-KEY": self._api_key})
-        self._checked(
+        self._require_success_payload(
             self._request(
                 "POST",
                 "/bps/api/v2/core/auth/login",
@@ -259,7 +227,7 @@ class BpsClient:
         )
 
     def find_template(self, name: str) -> dict[str, Any]:
-        payload = self._checked(
+        payload = self._require_success_payload(
             self._request(
                 "POST",
                 "/bps/api/v2/core/testmodel/operations/search",
@@ -279,7 +247,7 @@ class BpsClient:
                 f"expected exactly one BPS template named {name!r}, found {len(exact)}"
             )
         settings = _shared_component_settings(
-            self._checked(
+            self._require_success_payload(
                 self._request(
                     "POST",
                     "/api/v1/bps/tests/operations/getSharedComponentSettings",
@@ -315,7 +283,7 @@ class BpsClient:
         response.raise_for_status()
 
     def _topology(self) -> dict[str, Any]:
-        payload = self._checked(
+        payload = self._require_success_payload(
             self._request("GET", "/bps/api/v2/core/topology", timeout=30)
         )
         if not isinstance(payload, dict):
@@ -474,7 +442,7 @@ class BpsClient:
         param_value: int | float = (
             int(numeric_percentage) if numeric_percentage.is_integer() else numeric_percentage
         )
-        self._checked(
+        self._require_success_payload(
             self._request(
                 "POST",
                 "/api/v1/bps/tests/operations/setSharedComponentSettings",
@@ -492,7 +460,7 @@ class BpsClient:
         )
 
     def start_run(self) -> str:
-        payload = self._checked(
+        payload = self._require_success_payload(
             self._request(
                 "POST",
                 "/bps/api/v2/core/testmodel/operations/run",
@@ -507,7 +475,7 @@ class BpsClient:
         return _extract_run_id(payload)
 
     def find_running_runs(self, *, template: str, group: int) -> tuple[str, ...]:
-        payload = self._checked(
+        payload = self._require_success_payload(
             self._request("GET", "/bps/api/v2/core/topology/runningTest", timeout=30)
         )
         matches: list[str] = []
@@ -537,7 +505,7 @@ class BpsClient:
         return tuple(dict.fromkeys(matches))
 
     def _running_test(self, run_id: str) -> dict[str, Any] | None:
-        payload = self._checked(
+        payload = self._require_success_payload(
             self._request("GET", "/bps/api/v2/core/topology/runningTest", timeout=30)
         )
         aliases = _run_aliases(run_id)
@@ -549,15 +517,7 @@ class BpsClient:
         return None
 
     def _report_contents(self, run_id: str) -> Any:
-        response = self._request(
-            "POST",
-            "/bps/api/v2/core/reports/operations/getReportContents",
-            json={"runid": run_id, "getTableOfContents": True},
-            timeout=60,
-        )
-        if response.status_code in _RETRYABLE_REPORT_STATUSES:
-            return None
-        return self._checked(response)
+        return self._reports.report_contents(run_id)
 
     def wait_for_completion(self, run_id: str, on_poll: Callable[[], None]) -> RunCompletion:
         deadline = time.monotonic() + self.config.run_timeout_seconds
@@ -600,121 +560,7 @@ class BpsClient:
             time.sleep(min(self.config.poll_interval_seconds, remaining))
 
     def wait_for_report(self, run_id: str) -> Any:
-        for attempt in range(self.config.report_attempts):
-            contents = self._report_contents(run_id)
-            if contents is not None:
-                return contents
-            if attempt + 1 < self.config.report_attempts:
-                time.sleep(self.config.report_poll_interval_seconds)
-        raise TimeoutError(f"BPS report for run {run_id} did not become ready")
-
-    def _download(
-        self,
-        reference: str,
-        destination: Path,
-        *,
-        max_bytes: int,
-        timeout_seconds: float,
-        require_pdf: bool,
-    ) -> Path:
-        url = urljoin(f"{self.config.endpoint}/", reference)
-        for _ in range(6):
-            if self._origin(url) != self._origin(self.config.endpoint):
-                raise BpsProtocolError("BPS report download escaped the authenticated origin")
-            with self._client.stream(
-                "GET",
-                url,
-                follow_redirects=False,
-                timeout=timeout_seconds,
-            ) as response:
-                if response.is_redirect:
-                    location = response.headers.get("location")
-                    if not location:
-                        raise BpsProtocolError("BPS report redirect omitted Location")
-                    url = urljoin(url, location)
-                    continue
-                response.raise_for_status()
-                if response.headers.get("content-type", "").casefold().startswith("text/html"):
-                    raise BpsProtocolError("BPS report download unexpectedly returned HTML")
-                declared = response.headers.get("content-length")
-                if declared and declared.isdecimal() and int(declared) > max_bytes:
-                    raise BpsProtocolError("BPS report exceeds configured size limit")
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                temporary: Path | None = None
-                try:
-                    with tempfile.NamedTemporaryFile(
-                        mode="wb",
-                        prefix=f".{destination.name}.",
-                        suffix=".part",
-                        dir=destination.parent,
-                        delete=False,
-                    ) as handle:
-                        temporary = Path(handle.name)
-                        size = 0
-                        prefix = bytearray()
-                        for chunk in response.iter_bytes():
-                            size += len(chunk)
-                            if size > max_bytes:
-                                raise BpsProtocolError("BPS report exceeds configured size limit")
-                            if len(prefix) < 1024:
-                                prefix.extend(chunk[: 1024 - len(prefix)])
-                            handle.write(chunk)
-                        if size == 0:
-                            raise BpsProtocolError("BPS report download was empty")
-                        if require_pdf and b"%PDF-" not in prefix:
-                            raise BpsProtocolError("BPS PDF export did not contain a PDF signature")
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                    os.replace(temporary, destination)
-                    temporary = None
-                    return destination
-                finally:
-                    if temporary is not None:
-                        temporary.unlink(missing_ok=True)
-        raise BpsProtocolError("too many BPS report redirects")
-
-    def _export_report(
-        self,
-        run_id: str,
-        destination: Path,
-        section_ids: tuple[str, ...],
-        *,
-        report_type: str,
-        max_bytes: int,
-        timeout_seconds: float,
-        include_subsections: bool,
-    ) -> Path:
-        response = self._request(
-            "POST",
-            "/bps/api/v2/core/reports/operations/exportReport",
-            json={
-                "filepath": str(destination),
-                "runid": run_id,
-                "reportType": report_type,
-                "sectionIds": ",".join(section_ids),
-                "includeSubsections": include_subsections,
-                "dataType": self.config.report_data_type,
-            },
-            timeout=timeout_seconds,
-        )
-        payload = self._checked(response)
-        reference: str | None = None
-        if isinstance(payload, str):
-            reference = payload.strip().strip('"')
-        elif isinstance(payload, dict):
-            for key in ("url", "downloadUrl", "downloadURL", "download", "href", "path", "file"):
-                if isinstance(payload.get(key), str) and payload[key].strip():
-                    reference = payload[key].strip()
-                    break
-        if not reference:
-            raise BpsProtocolError("BPS export response omitted a download reference")
-        return self._download(
-            reference,
-            destination,
-            max_bytes=max_bytes,
-            timeout_seconds=timeout_seconds,
-            require_pdf=report_type == "PDF",
-        )
+        return self._reports.wait_for_report(run_id)
 
     def export_report(
         self,
@@ -722,15 +568,7 @@ class BpsClient:
         destination: Path,
         section_ids: tuple[str, ...],
     ) -> Path:
-        return self._export_report(
-            run_id,
-            destination,
-            section_ids,
-            report_type=self.config.report_type,
-            max_bytes=self.config.max_report_bytes,
-            timeout_seconds=300,
-            include_subsections=False,
-        )
+        return self._reports.export_report(run_id, destination, section_ids)
 
     def export_full_report_pdf(
         self,
@@ -738,15 +576,7 @@ class BpsClient:
         destination: Path,
         section_ids: tuple[str, ...],
     ) -> Path:
-        return self._export_report(
-            run_id,
-            destination,
-            section_ids,
-            report_type="PDF",
-            max_bytes=self.config.max_pdf_report_bytes,
-            timeout_seconds=self.config.pdf_report_timeout_seconds,
-            include_subsections=True,
-        )
+        return self._reports.export_full_report_pdf(run_id, destination, section_ids)
 
     def schedule_full_report_pdf(
         self,
@@ -754,53 +584,18 @@ class BpsClient:
         destination: Path,
         section_ids: tuple[str, ...],
     ) -> None:
-        """Persist and launch an independently authenticated supplementary export."""
-
-        if not self._session_id or not self._api_key or not self._password:
-            LOGGER.warning(
-                "Optional full PDF report export was not scheduled: BPS is not logged in"
-            )
-            return
-        job_path = destination.with_name("bps-report-full.job.json")
-        job = PdfExportJob.pending(
+        schedule_full_report_pdf(
             config=self.config,
+            username=self.username,
+            password=self._password,
+            authenticated=bool(self._session_id and self._api_key),
             run_id=run_id,
             destination=destination,
             section_ids=section_ids,
         )
-        ArtifactStore.write_json(job_path, job)
-        worker_environment = {
-            name.upper(): value
-            for name, value in os.environ.items()
-            if name.upper() in _PDF_WORKER_SYSTEM_ENVIRONMENT
-        }
-        worker_environment.update(
-            {"BPS_USERNAME": self.username, "BPS_PASSWORD": self._password}
-        )
-        creation_flags = 0
-        start_new_session = os.name != "nt"
-        if os.name == "nt":
-            creation_flags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
-        try:
-            subprocess.Popen(
-                [sys.executable, "-m", "bps_agent.pdf_worker", "--job", str(job_path)],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                close_fds=True,
-                env=worker_environment,
-                creationflags=creation_flags,
-                start_new_session=start_new_session,
-            )
-        except OSError as exc:
-            ArtifactStore.write_json(job_path, job.failed(f"could not launch PDF worker: {exc}"))
-            raise
-        finally:
-            worker_environment["BPS_USERNAME"] = ""
-            worker_environment["BPS_PASSWORD"] = ""
 
     def stop_run(self, run_id: str) -> None:
-        self._checked(
+        self._require_success_payload(
             self._request(
                 "POST",
                 "/bps/api/v2/core/testmodel/operations/stopRun",

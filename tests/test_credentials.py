@@ -5,7 +5,7 @@ from argparse import Namespace
 import keyring
 import pytest
 
-from bps_agent.cli import _parser, _run_credential_requirements, manage_credentials
+from bps_agent.cli import _parser, manage_credentials
 from bps_agent.credentials import (
     SUPPORTED_CREDENTIALS,
     CredentialRequirement,
@@ -13,6 +13,7 @@ from bps_agent.credentials import (
     CredentialStore,
 )
 from bps_agent.models import AppConfig, DutCollectionMethod, EvaluationMode
+from bps_agent.runtime import run_credential_requirements
 
 
 def test_credential_store_round_trip_without_exposing_values(monkeypatch: object) -> None:
@@ -176,7 +177,7 @@ def test_run_credentials_are_mode_aware(
         }
     )
 
-    requirements = _run_credential_requirements(
+    requirements = run_credential_requirements(
         config,
         stop_before_llm=stop_before_llm,
     )

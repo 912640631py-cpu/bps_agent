@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import pytest
 
-from bps_agent.models import DutObservations, ObservationPhase, ResourceObservation
+from bps_agent.models import (
+    AttemptRecord,
+    DutObservations,
+    ObservationPhase,
+    PortReservation,
+    PortReservationState,
+    PortReservationStatus,
+    ResourceObservation,
+)
 
 
 def observation(phase: ObservationPhase, started_at: str, finished_at: str) -> ResourceObservation:
@@ -42,3 +50,31 @@ def test_duplicate_observation_phase_is_rejected() -> None:
     )
     with pytest.raises(ValueError, match=r"duplicate.*baseline"):
         DutObservations.from_resource_observations((duplicate, duplicate))
+
+
+def test_legacy_attempt_reservation_boolean_migrates_to_the_single_state() -> None:
+    attempt = AttemptRecord.model_validate(
+        {
+            "number": 1,
+            "started_at": "2026-08-31T00:00:00+00:00",
+            "ports_reserved": True,
+        }
+    )
+
+    assert attempt.port_reservation_state == PortReservationState.ALL_AGENT
+    assert attempt.ports_reserved is True
+    assert "ports_reserved" not in attempt.model_dump()
+
+
+def test_reservation_status_exposes_owner_semantics_without_graph_traversal() -> None:
+    status = PortReservationStatus.classify(
+        (
+            PortReservation(slot=4, port=4, owner="agent", owned_by_agent=True),
+            PortReservation(slot=4, port=5, owner="other", owned_by_agent=False),
+        )
+    )
+
+    assert status.agent_owned_ports == (4,)
+    assert status.foreign_owners == ("other",)
+    assert status.has_foreign_reservation
+    assert not status.is_fully_agent_owned

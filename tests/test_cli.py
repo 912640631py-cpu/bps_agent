@@ -10,22 +10,23 @@ from langgraph.graph import END, START, StateGraph
 
 from bps_agent.cli import (
     EXIT_CODES,
-    _apply_bps_overrides,
     _configure_logging,
-    _configured_judge,
     _load_resume_config,
     _parser,
     _verdict_console_fields,
 )
+from bps_agent.config import apply_overrides
 from bps_agent.models import (
     AppConfig,
     AttemptRecord,
     DutCollectionMethod,
     EvaluationMode,
     EvaluationOutcome,
+    RunOverrides,
     VerdictDocument,
     VerdictValue,
 )
+from bps_agent.runtime import build_judge
 
 
 class _CheckpointConfigState(TypedDict):
@@ -73,11 +74,13 @@ def test_run_parser_accepts_template_and_port_overrides() -> None:
 def test_bps_overrides_are_validated_without_mutating_base_config(
     app_config: AppConfig,
 ) -> None:
-    overridden = _apply_bps_overrides(
+    overridden = apply_overrides(
         app_config,
-        template=" other-performance-template ",
-        ports=(6, 7),
-        total_bandwidth_mbps=300.0,
+        RunOverrides(
+            template=" other-performance-template ",
+            ports=(6, 7),
+            total_bandwidth_mbps=300.0,
+        ),
         resume_id=None,
     )
 
@@ -92,22 +95,18 @@ def test_bps_overrides_are_validated_without_mutating_base_config(
 @pytest.mark.parametrize("ports", [(), (-1,), (6, 6)])
 def test_invalid_port_overrides_are_rejected(app_config: AppConfig, ports: tuple[int, ...]) -> None:
     with pytest.raises(ValueError):
-        _apply_bps_overrides(
+        apply_overrides(
             app_config,
-            template=None,
-            ports=ports,
-            total_bandwidth_mbps=None,
+            RunOverrides(ports=ports),
             resume_id=None,
         )
 
 
 def test_resume_rejects_bps_overrides(app_config: AppConfig) -> None:
     with pytest.raises(ValueError, match="cannot be used with --resume"):
-        _apply_bps_overrides(
+        apply_overrides(
             app_config,
-            template="other-performance-template",
-            ports=None,
-            total_bandwidth_mbps=None,
+            RunOverrides(template="other-performance-template"),
             resume_id="evaluation-id",
         )
 
@@ -115,21 +114,17 @@ def test_resume_rejects_bps_overrides(app_config: AppConfig) -> None:
 @pytest.mark.parametrize("bandwidth", [0.0, -1.0])
 def test_invalid_bandwidth_overrides_are_rejected(app_config: AppConfig, bandwidth: float) -> None:
     with pytest.raises(ValueError):
-        _apply_bps_overrides(
+        apply_overrides(
             app_config,
-            template=None,
-            ports=None,
-            total_bandwidth_mbps=bandwidth,
+            RunOverrides(total_bandwidth_mbps=bandwidth),
             resume_id=None,
         )
 
 
 def test_cli_allows_target_above_400_for_larger_templates(app_config: AppConfig) -> None:
-    overridden = _apply_bps_overrides(
+    overridden = apply_overrides(
         app_config,
-        template=None,
-        ports=None,
-        total_bandwidth_mbps=800.0,
+        RunOverrides(total_bandwidth_mbps=800.0),
         resume_id=None,
     )
 
@@ -137,13 +132,10 @@ def test_cli_allows_target_above_400_for_larger_templates(app_config: AppConfig)
 
 
 def test_cli_can_override_the_evaluation_to_bps_only(app_config: AppConfig) -> None:
-    overridden = _apply_bps_overrides(
+    overridden = apply_overrides(
         app_config,
-        template=None,
-        ports=None,
-        total_bandwidth_mbps=None,
+        RunOverrides(evaluation_mode=EvaluationMode.BPS_ONLY),
         resume_id=None,
-        bps_only=True,
     )
 
     assert overridden.evaluation.mode == EvaluationMode.BPS_ONLY
@@ -151,17 +143,16 @@ def test_cli_can_override_the_evaluation_to_bps_only(app_config: AppConfig) -> N
 
 
 def test_cli_can_override_backend_dut_parameters(app_config: AppConfig) -> None:
-    overridden = _apply_bps_overrides(
+    overridden = apply_overrides(
         app_config,
-        template=None,
-        ports=None,
-        total_bandwidth_mbps=None,
+        RunOverrides(
+            dut_collection_method=DutCollectionMethod.BACKEND_SSH,
+            dut_host="10.66.246.156",
+            dut_port=50023,
+            dut_interfaces=("T1/1", "T1/2"),
+            dut_interval_seconds=10,
+        ),
         resume_id=None,
-        dut_collection_method=DutCollectionMethod.BACKEND_SSH,
-        dut_host="10.66.246.156",
-        dut_port=50023,
-        dut_interfaces=("T1/1", "T1/2"),
-        dut_interval_seconds=10,
     )
 
     assert overridden.dut.collection_method == DutCollectionMethod.BACKEND_SSH
@@ -196,36 +187,28 @@ def test_parser_accepts_repeatable_dut_backend_overrides() -> None:
 
 def test_resume_rejects_dut_override(app_config: AppConfig) -> None:
     with pytest.raises(ValueError, match="cannot be used with --resume"):
-        _apply_bps_overrides(
+        apply_overrides(
             app_config,
-            template=None,
-            ports=None,
-            total_bandwidth_mbps=None,
+            RunOverrides(dut_host="10.66.246.156"),
             resume_id="evaluation-id",
-            dut_host="10.66.246.156",
         )
 
 
 def test_resume_rejects_bandwidth_override(app_config: AppConfig) -> None:
     with pytest.raises(ValueError, match="cannot be used with --resume"):
-        _apply_bps_overrides(
+        apply_overrides(
             app_config,
-            template=None,
-            ports=None,
-            total_bandwidth_mbps=300.0,
+            RunOverrides(total_bandwidth_mbps=300.0),
             resume_id="evaluation-id",
         )
 
 
 def test_resume_rejects_bps_only_override(app_config: AppConfig) -> None:
     with pytest.raises(ValueError, match="cannot be used with --resume"):
-        _apply_bps_overrides(
+        apply_overrides(
             app_config,
-            template=None,
-            ports=None,
-            total_bandwidth_mbps=None,
+            RunOverrides(evaluation_mode=EvaluationMode.BPS_ONLY),
             resume_id="evaluation-id",
-            bps_only=True,
         )
 
 
@@ -237,6 +220,7 @@ def test_resume_loads_runtime_configuration_from_checkpoint(app_config: AppConfi
     invocation = {"configurable": {"thread_id": "resume-config"}}
     checkpoint_config = app_config.model_dump(mode="json")
     checkpoint_config["storage"]["lock_dir"] = ".state/legacy-locks"
+    checkpoint_config["evaluation"]["max_attempts"] = 6
     with SqliteSaver.from_conn_string(str(app_config.storage.checkpoint_db)) as saver:
         builder.compile(checkpointer=saver).invoke({"config": checkpoint_config}, config=invocation)
 
@@ -312,14 +296,14 @@ def test_live_and_replay_share_the_complete_llm_configuration(
                 }
             )
 
-    monkeypatch.setattr("bps_agent.cli.DeepSeekJudge", CapturingJudge)
+    monkeypatch.setattr("bps_agent.runtime.DeepSeekJudge", CapturingJudge)
     config = app_config.model_copy(
         update={"llm": app_config.llm.model_copy(update={"reasoning_effort": "high"})}
     )
     credentials = {config.llm.selected.token_env: "token"}
 
-    live_judge = _configured_judge(config, credentials)
-    replay_judge = _configured_judge(config, credentials)
+    live_judge = build_judge(config, credentials)
+    replay_judge = build_judge(config, credentials)
 
     assert live_judge is not replay_judge
     assert calls[0] == calls[1]

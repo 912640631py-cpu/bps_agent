@@ -951,13 +951,16 @@ def test_resume_reconciles_unreserved_ports_instead_of_trusting_checkpoint(
             if "start_attempt" in event:
                 break
         stream.close()
-        assert graph.get_state(invocation).values["attempts"][-1]["ports_reserved"] is True
+        assert (
+            graph.get_state(invocation).values["attempts"][-1]["port_reservation_state"]
+            == PortReservationState.ALL_AGENT
+        )
 
         bps.reservation_owner = None
         result = graph.invoke(None, config=invocation)
 
     assert result["outcome"] == EvaluationOutcome.PASSED.value
-    assert result["attempts"][0]["ports_reserved"] is False
+    assert result["attempts"][0]["port_reservation_state"] == PortReservationState.NONE
     assert bps.release_count == 0
 
 
@@ -984,7 +987,7 @@ def test_port_release_failure_does_not_erase_confirmed_run_terminal_state(
     assert result["outcome"] == EvaluationOutcome.INCONCLUSIVE.value
     assert attempt["terminal_confirmed"] is True
     assert attempt["traffic_finished_at"] is not None
-    assert attempt["ports_reserved"] is True
+    assert attempt["port_reservation_state"] == PortReservationState.ALL_AGENT
     assert bps.stop_count == 0
     assert result["error"].startswith("BPS port release failed after confirmed terminal state:")
 

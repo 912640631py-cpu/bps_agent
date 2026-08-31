@@ -33,7 +33,7 @@ def test_scheduler_persists_secret_free_job_and_launches_isolated_process(
         captured["environment"] = dict(kwargs["env"])
         return object()
 
-    monkeypatch.setattr("bps_agent.adapters.bps.subprocess.Popen", popen)
+    monkeypatch.setattr("bps_agent.pdf_export.subprocess.Popen", popen)
     client = BpsClient(bps_config(), username="bps-user", password="bps-password")
     client._session_id = "parent-session"
     client._api_key = "parent-key"

@@ -76,4 +76,3 @@ storage:
 
 evaluation:
   mode: bps_and_dut
-  max_attempts: 6

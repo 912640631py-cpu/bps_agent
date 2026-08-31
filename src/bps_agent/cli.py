@@ -7,9 +7,7 @@ import getpass
 import json
 import logging
 import os
-import subprocess
 import sys
-import tempfile
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -18,13 +16,9 @@ from uuid import uuid4
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from bps_agent.adapters.bps import BpsClient
-from bps_agent.adapters.deepseek import DeepSeekJudge
-from bps_agent.adapters.dut import DutClient
-from bps_agent.adapters.dut_backend import DutBackendCollector
 from bps_agent.adjudication import verdict_artifact
 from bps_agent.artifacts import ArtifactStore
-from bps_agent.config import load_config
+from bps_agent.config import apply_overrides, load_config
 from bps_agent.credentials import (
     SECRET_CREDENTIALS,
     SUPPORTED_CREDENTIALS,
@@ -32,7 +26,8 @@ from bps_agent.credentials import (
     CredentialResolver,
     CredentialStore,
 )
-from bps_agent.graph import EvaluationServices, SystemClock, build_graph, initial_state
+from bps_agent.dut_runtime import dut_runtime_spec
+from bps_agent.graph import build_graph, initial_state
 from bps_agent.models import (
     AppConfig,
     AttemptRecord,
@@ -41,6 +36,13 @@ from bps_agent.models import (
     EvaluationOutcome,
     EvidenceBundle,
     PortReservationState,
+    RunOverrides,
+)
+from bps_agent.runtime import (
+    RuntimeResources,
+    build_judge,
+    build_runtime,
+    run_credential_requirements,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -53,116 +55,13 @@ EXIT_CODES = {
 }
 
 
-class _EvidenceOnlyJudge:
-    provider_name = "not-called"
-    model_name = "not-called"
-
-    def adjudicate(self, evidence: EvidenceBundle) -> tuple[Any, dict[str, Any]]:
-        raise RuntimeError("LLM adjudication is disabled for this evidence-only run")
-
-    def close(self) -> None:
-        return None
-
-
-_BPS_CREDENTIALS = (
-    CredentialRequirement("BPS_USERNAME", "BPS username: "),
-    CredentialRequirement("BPS_PASSWORD", "BPS password: ", secret=True),
-)
-_BACKEND_DUT_CREDENTIALS = (
-    CredentialRequirement("DUT_BACKEND_USERNAME", "DUT backend SSH username: "),
-    CredentialRequirement("DUT_BACKEND_PASSWORD", "DUT backend SSH password: ", secret=True),
-)
-_FRONTEND_DUT_CREDENTIALS = (
-    CredentialRequirement("DUT_FRONTEND_USERNAME", "DUT frontend username: "),
-    CredentialRequirement("DUT_FRONTEND_PASSWORD", "DUT frontend password: ", secret=True),
-)
-
-
-def _run_credential_requirements(
-    config: AppConfig,
-    *,
-    stop_before_llm: bool,
-) -> tuple[CredentialRequirement, ...]:
-    requirements = list(_BPS_CREDENTIALS)
-    if config.evaluation.mode != EvaluationMode.BPS_ONLY:
-        assert config.dut is not None
-        requirements.extend(
-            _BACKEND_DUT_CREDENTIALS
-            if config.dut.collection_method == DutCollectionMethod.BACKEND_SSH
-            else _FRONTEND_DUT_CREDENTIALS
-        )
-    if not stop_before_llm:
-        provider_name = config.llm.provider
-        requirements.append(
-            CredentialRequirement(
-                config.llm.selected.token_env,
-                f"{provider_name} DeepSeek Bearer token: ",
-                secret=True,
-            )
-        )
-    return tuple(requirements)
-
-
-def _captcha_reader(image: bytes, media_type: str) -> str:
-    suffix = {
-        "image/gif": ".gif",
-        "image/jpeg": ".jpg",
-        "image/png": ".png",
-        "image/webp": ".webp",
-    }.get(media_type.casefold(), ".img")
-    path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb", prefix="dut-captcha-", suffix=suffix, delete=False
-        ) as handle:
-            handle.write(image)
-            path = Path(handle.name)
-        print(f"DUT CAPTCHA image: {path}")
-        try:
-            subprocess.Popen(
-                ["explorer.exe", f"/select,{path.resolve()}"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except OSError as exc:
-            LOGGER.warning("Could not open CAPTCHA image automatically: %s", exc)
-        value = input("DUT CAPTCHA: ").strip()
-        if not value:
-            raise ValueError("DUT CAPTCHA must not be empty")
-        return value
-    finally:
-        if path is not None:
-            path.unlink(missing_ok=True)
-
-
-def _provider(config: AppConfig, credentials: dict[str, str]) -> tuple[str, Any, str]:
-    name = config.llm.provider
-    selected = config.llm.selected
-    return name, selected, credentials[selected.token_env]
-
-
-def _configured_judge(config: AppConfig, credentials: dict[str, str]) -> DeepSeekJudge:
-    """Create the identically configured judge used by Live Evaluation and Replay."""
-
-    provider_name, provider_config, token = _provider(config, credentials)
-    return DeepSeekJudge(
-        provider_name,
-        provider_config,
-        token=token,
-        reasoning_effort=config.llm.reasoning_effort,
-    )
-
-
 def _has_unsafe_reservation(result: dict[str, Any]) -> bool:
     attempts = result.get("attempts")
     if not isinstance(attempts, list) or not attempts:
         return False
     try:
         attempt = AttemptRecord.model_validate(attempts[-1])
-        return (
-            attempt.ports_reserved
-            or attempt.port_reservation_state != PortReservationState.NONE
-        )
+        return attempt.port_reservation_state != PortReservationState.NONE
     except ValueError:
         return True
 
@@ -178,64 +77,6 @@ def _verdict_console_fields(result: dict[str, Any]) -> dict[str, Any] | None:
     if verdict is None:
         return None
     return {"parsed": verdict.model_dump(mode="json")}
-
-
-def _apply_bps_overrides(
-    config: AppConfig,
-    *,
-    template: str | None,
-    ports: tuple[int, ...] | None,
-    total_bandwidth_mbps: float | None,
-    resume_id: str | None,
-    bps_only: bool | None = None,
-    dut_collection_method: DutCollectionMethod | None = None,
-    dut_host: str | None = None,
-    dut_port: int | None = None,
-    dut_interfaces: tuple[str, ...] | None = None,
-    dut_interval_seconds: float | None = None,
-) -> AppConfig:
-    dut_overrides = (
-        dut_collection_method,
-        dut_host,
-        dut_port,
-        dut_interfaces,
-        dut_interval_seconds,
-    )
-    if resume_id and (
-        template is not None
-        or ports is not None
-        or total_bandwidth_mbps is not None
-        or bps_only
-        or any(value is not None for value in dut_overrides)
-    ):
-        raise ValueError("run configuration overrides cannot be used with --resume")
-    document = config.model_dump(mode="python")
-    if template is not None:
-        cleaned = template.strip()
-        if not cleaned:
-            raise ValueError("--template must not be empty")
-        document["bps"]["template"] = cleaned
-    if ports is not None:
-        document["bps"]["ports"] = ports
-    if total_bandwidth_mbps is not None:
-        document["bps"]["total_bandwidth_mbps"] = total_bandwidth_mbps
-    if bps_only:
-        document["evaluation"]["mode"] = EvaluationMode.BPS_ONLY.value
-    if any(value is not None for value in dut_overrides) and document.get("dut") is None:
-        raise ValueError("DUT overrides require a dut section in the configuration")
-    if dut_collection_method is not None:
-        document["dut"]["collection_method"] = dut_collection_method.value
-    if any(value is not None for value in (dut_host, dut_port, dut_interval_seconds)):
-        document["dut"]["backend"] = document["dut"].get("backend") or {}
-    if dut_host is not None:
-        document["dut"]["backend"]["host"] = dut_host
-    if dut_port is not None:
-        document["dut"]["backend"]["port"] = dut_port
-    if dut_interfaces is not None:
-        document["dut"]["interfaces"] = dut_interfaces
-    if dut_interval_seconds is not None:
-        document["dut"]["backend"]["interval_seconds"] = dut_interval_seconds
-    return AppConfig.model_validate(document)
 
 
 def _load_resume_config(current_config: AppConfig, resume_id: str) -> AppConfig:
@@ -273,97 +114,45 @@ def run_live(
     credential_store: CredentialStore | None = None,
     *,
     stop_before_llm: bool = False,
-    template: str | None = None,
-    ports: tuple[int, ...] | None = None,
-    total_bandwidth_mbps: float | None = None,
-    bps_only: bool | None = None,
-    dut_collection_method: DutCollectionMethod | None = None,
-    dut_host: str | None = None,
-    dut_port: int | None = None,
-    dut_interfaces: tuple[str, ...] | None = None,
-    dut_interval_seconds: float | None = None,
+    overrides: RunOverrides | None = None,
 ) -> int:
-    config = _apply_bps_overrides(
+    overrides = overrides or RunOverrides()
+    config = apply_overrides(
         load_config(
             config_path,
-            mode_override=EvaluationMode.BPS_ONLY if bps_only else None,
+            mode_override=overrides.evaluation_mode,
         ),
-        template=template,
-        ports=ports,
-        total_bandwidth_mbps=total_bandwidth_mbps,
+        overrides,
         resume_id=resume_id,
-        bps_only=bps_only,
-        dut_collection_method=dut_collection_method,
-        dut_host=dut_host,
-        dut_port=dut_port,
-        dut_interfaces=dut_interfaces,
-        dut_interval_seconds=dut_interval_seconds,
     )
     if resume_id:
         config = _load_resume_config(config, resume_id)
     store = credential_store or CredentialStore()
     credentials = CredentialResolver(store).resolve(
-        _run_credential_requirements(config, stop_before_llm=stop_before_llm)
+        run_credential_requirements(config, stop_before_llm=stop_before_llm)
     )
     evaluation_id = resume_id or str(uuid4())
-    artifacts = ArtifactStore(config.storage.artifact_dir)
-    judge: DeepSeekJudge | _EvidenceOnlyJudge | None = None
-    bps: BpsClient | None = None
-    dut: DutClient | DutBackendCollector | None = None
+    runtime: RuntimeResources | None = None
     result: dict[str, Any] | None = None
     try:
         if stop_before_llm:
-            judge = _EvidenceOnlyJudge()
             print("Evidence-only mode: DeepSeek will not be contacted.")
         else:
-            judge = _configured_judge(config, credentials)
             print(
-                f"Checking {judge.provider_name} provider compatibility with "
+                f"Checking {config.llm.provider} provider compatibility with "
                 f"reasoning_effort={config.llm.reasoning_effort}..."
             )
-            judge.validate_compatibility()
-        bps = BpsClient(
-            config.bps,
-            username=credentials["BPS_USERNAME"],
-            password=credentials["BPS_PASSWORD"],
-        )
         print("Authenticating to BPS...")
-        bps.authenticate()
         if config.evaluation.mode == EvaluationMode.BPS_ONLY:
             print("BPS-only mode: DUT authentication and monitoring are disabled.")
         else:
             assert config.dut is not None
-            if config.dut.collection_method == DutCollectionMethod.BACKEND_SSH:
-                dut = DutBackendCollector(
-                    config.dut,
-                    username=credentials["DUT_BACKEND_USERNAME"],
-                    password=credentials["DUT_BACKEND_PASSWORD"],
-                )
-                print(
-                    "DUT backend SSH collection enabled "
-                    "(host keys are not currently verified)."
-                )
-            else:
-                dut = DutClient(
-                    config.dut,
-                    username=credentials["DUT_FRONTEND_USERNAME"],
-                    password=credentials["DUT_FRONTEND_PASSWORD"],
-                    captcha_reader=_captcha_reader,
-                )
-                print("Authenticating to DUT (CAPTCHA required)...")
-                dut.authenticate()
+            print(dut_runtime_spec(config.dut.collection_method).startup_message)
+        runtime = build_runtime(config, credentials, stop_before_llm=stop_before_llm)
         config.storage.checkpoint_db.parent.mkdir(parents=True, exist_ok=True)
         with SqliteSaver.from_conn_string(str(config.storage.checkpoint_db)) as saver:
-            services = EvaluationServices(
-                config=config,
-                bps=bps,
-                dut=dut,
-                judge=judge,
-                artifacts=artifacts,
-                clock=SystemClock(),
-            )
             graph = build_graph(
-                services,
+                runtime,
                 checkpointer=saver,
                 interrupt_before=["adjudicate"] if stop_before_llm else None,
             )
@@ -387,7 +176,7 @@ def run_live(
                         active = AttemptRecord.model_validate(attempts[-1])
                         if active.bps_run_id and not active.terminal_confirmed:
                             with suppress(Exception):
-                                bps.stop_run(active.bps_run_id)
+                                runtime.bps.stop_run(active.bps_run_id)
                             LOGGER.error(
                                 "Stop requested for BPS run %s; terminal state remains unconfirmed",
                                 active.bps_run_id,
@@ -438,12 +227,8 @@ def run_live(
             LOGGER.error(
                 "BPS reservation state is ambiguous; inspect BPS before starting another Evaluation"
             )
-        if dut is not None:
-            dut.close()
-        if bps is not None:
-            bps.close()
-        if judge is not None:
-            judge.close()
+        if runtime is not None:
+            runtime.close()
 
 
 def replay(
@@ -464,7 +249,7 @@ def replay(
             ),
         )
     )
-    judge = _configured_judge(config, credentials)
+    judge = build_judge(config, credentials)
     try:
         verdict, raw = judge.adjudicate(evidence)
         output_path = evidence_path.parent / "replay-verdict.json"
@@ -614,19 +399,23 @@ def main(argv: list[str] | None = None) -> int:
                 arguments.config,
                 arguments.resume,
                 stop_before_llm=arguments.stop_before_llm,
-                template=arguments.template,
-                ports=tuple(arguments.ports) if arguments.ports is not None else None,
-                total_bandwidth_mbps=arguments.total_bandwidth_mbps,
-                bps_only=arguments.bps_only,
-                dut_collection_method=arguments.dut_collection_method,
-                dut_host=arguments.dut_host,
-                dut_port=arguments.dut_port,
-                dut_interfaces=(
-                    tuple(arguments.dut_interfaces)
-                    if arguments.dut_interfaces is not None
-                    else None
+                overrides=RunOverrides(
+                    template=arguments.template,
+                    ports=tuple(arguments.ports) if arguments.ports is not None else None,
+                    total_bandwidth_mbps=arguments.total_bandwidth_mbps,
+                    evaluation_mode=(
+                        EvaluationMode.BPS_ONLY if arguments.bps_only else None
+                    ),
+                    dut_collection_method=arguments.dut_collection_method,
+                    dut_host=arguments.dut_host,
+                    dut_port=arguments.dut_port,
+                    dut_interfaces=(
+                        tuple(arguments.dut_interfaces)
+                        if arguments.dut_interfaces is not None
+                        else None
+                    ),
+                    dut_interval_seconds=arguments.dut_interval_seconds,
                 ),
-                dut_interval_seconds=arguments.dut_interval_seconds,
             )
         return replay(arguments.config, arguments.evidence)
     except Exception as exc:

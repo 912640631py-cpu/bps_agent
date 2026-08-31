@@ -20,10 +20,16 @@ from bps_agent.adapters.dut_backend import (
     render_metrics_csv,
 )
 from bps_agent.artifacts import ArtifactStore
-from bps_agent.models import DutBackendConfig, DutCollectionMethod, DutConfig
+from bps_agent.models import (
+    BackendDutSample,
+    BackendDutSnapshot,
+    DutBackendConfig,
+    DutCollectionMethod,
+    DutConfig,
+)
 
 
-def sample_snapshot() -> dict[str, Any]:
+def sample_snapshot_document() -> dict[str, Any]:
     return {
         "collected_at": "2026-08-27T13:53:43+08:00",
         "cpu": {
@@ -48,6 +54,10 @@ def sample_snapshot() -> dict[str, Any]:
     }
 
 
+def sample_snapshot() -> BackendDutSnapshot:
+    return BackendDutSnapshot.model_validate(sample_snapshot_document())
+
+
 def backend_config(
     *,
     interval_seconds: float = 0.01,
@@ -69,13 +79,14 @@ def backend_config(
 
 
 def test_extract_json_accepts_an_informational_prefix() -> None:
-    assert _extract_json("PHP notice\n" + json.dumps(sample_snapshot())) == sample_snapshot()
+    document = sample_snapshot_document()
+    assert _extract_json("PHP notice\n" + json.dumps(document)) == document
 
 
 def test_ssh_snapshot_drains_stdout_and_stderr_before_exit_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshot_bytes = json.dumps(sample_snapshot()).encode()
+    snapshot_bytes = json.dumps(sample_snapshot_document()).encode()
 
     class Channel:
         def __init__(self) -> None:
@@ -150,7 +161,12 @@ def test_ssh_snapshot_drains_stdout_and_stderr_before_exit_status(
     )
     client.connect()
 
-    assert client.read_snapshot(("T1/1", "T1/2")) == sample_snapshot()
+    snapshot = client.read_snapshot(("T1/1", "T1/2"))
+
+    assert isinstance(snapshot, BackendDutSnapshot)
+    assert snapshot == sample_snapshot()
+    assert snapshot.cpu.latest is not None
+    assert snapshot.cpu.latest.mgt == 11
     assert channel.exit_status_requested
 
 
@@ -222,16 +238,16 @@ def test_ssh_snapshot_timeout_closes_channel_and_transport(
 def test_csv_is_one_compact_row_per_sample_with_dynamic_interfaces() -> None:
     text = render_metrics_csv(
         [
-            {
-                "started_at": "2026-08-27T13:53:33+08:00",
-                "finished_at": "2026-08-27T13:53:34+08:00",
-                "resources": sample_snapshot(),
-            },
-            {
-                "started_at": "2026-08-27T13:53:43.125+08:00",
-                "finished_at": "2026-08-27T13:53:44+08:00",
-                "resources": sample_snapshot(),
-            },
+            BackendDutSample(
+                started_at="2026-08-27T13:53:33+08:00",
+                finished_at="2026-08-27T13:53:34+08:00",
+                resources=sample_snapshot(),
+            ),
+            BackendDutSample(
+                started_at="2026-08-27T13:53:43.125+08:00",
+                finished_at="2026-08-27T13:53:44+08:00",
+                resources=sample_snapshot(),
+            ),
         ],
         ("T1/1", "T1/2"),
     )
@@ -254,7 +270,7 @@ def test_csv_is_one_compact_row_per_sample_with_dynamic_interfaces() -> None:
 
 
 class FakeSnapshotClient:
-    def __init__(self, results: list[dict[str, Any] | Exception]) -> None:
+    def __init__(self, results: list[BackendDutSnapshot | Exception]) -> None:
         self.results = results
         self.connected = 0
         self.closed = 0
@@ -271,7 +287,7 @@ class FakeSnapshotClient:
     def clear_credentials(self) -> None:
         self.cleared += 1
 
-    def read_snapshot(self, interfaces: tuple[str, ...]) -> dict[str, Any]:
+    def read_snapshot(self, interfaces: tuple[str, ...]) -> BackendDutSnapshot:
         assert interfaces == ("T1/1", "T1/2")
         result = self.results[min(self.calls, len(self.results) - 1)]
         self.calls += 1
@@ -338,7 +354,7 @@ def test_worker_stop_timeout_closes_client_and_marks_capture_failed(tmp_path: Pa
             self.entered = threading.Event()
             self.release = threading.Event()
 
-        def read_snapshot(self, interfaces: tuple[str, ...]) -> dict[str, Any]:
+        def read_snapshot(self, interfaces: tuple[str, ...]) -> BackendDutSnapshot:
             assert interfaces == ("T1/1", "T1/2")
             self.entered.set()
             assert self.release.wait(1)
@@ -384,7 +400,7 @@ def test_slow_sample_skips_missed_ticks_without_catch_up_burst(tmp_path: Path) -
             super().__init__([sample_snapshot()])
             self.call_times: list[float] = []
 
-        def read_snapshot(self, interfaces: tuple[str, ...]) -> dict[str, Any]:
+        def read_snapshot(self, interfaces: tuple[str, ...]) -> BackendDutSnapshot:
             self.call_times.append(time.monotonic())
             if len(self.call_times) == 1:
                 time.sleep(0.055)

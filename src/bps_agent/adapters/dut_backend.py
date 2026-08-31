@@ -14,10 +14,15 @@ from pathlib import Path
 from typing import Any
 
 import paramiko
+from pydantic import ValidationError
 
 from bps_agent.artifacts import ArtifactStore
 from bps_agent.models import (
+    BackendDutCaptureArtifact,
     BackendDutEvidence,
+    BackendDutSample,
+    BackendDutSampleError,
+    BackendDutSnapshot,
     BackendDutTarget,
     DutBackendConfig,
     DutCaptureResult,
@@ -123,26 +128,12 @@ def _extract_json(stdout: str) -> dict[str, Any]:
     return document
 
 
-def _validate_snapshot(document: dict[str, Any], interfaces: tuple[str, ...]) -> None:
-    required = {
-        "collected_at",
-        "cpu",
-        "memory",
-        "new_sessions",
-        "concurrent_sessions",
-        "traffic",
-    }
-    missing = sorted(required.difference(document))
-    if missing:
-        raise DutBackendError(f"DUT backend snapshot omitted fields: {', '.join(missing)}")
-    traffic = document.get("traffic")
-    if not isinstance(traffic, dict):
-        raise DutBackendError("DUT backend traffic field is not an object")
-    missing_interfaces = [interface for interface in interfaces if interface not in traffic]
-    if missing_interfaces:
-        raise DutBackendError(
-            "DUT backend snapshot omitted interfaces: " + ", ".join(missing_interfaces)
-        )
+def _parse_snapshot(stdout: str, interfaces: tuple[str, ...]) -> BackendDutSnapshot:
+    try:
+        snapshot = BackendDutSnapshot.model_validate(_extract_json(stdout))
+        return snapshot.require_interfaces(interfaces)
+    except (ValidationError, ValueError) as exc:
+        raise DutBackendError(f"DUT backend returned an invalid metrics snapshot: {exc}") from exc
 
 
 def _read_channel_output(
@@ -254,7 +245,7 @@ class DutSshBackendClient:
         assert self._client is not None
         return self._client
 
-    def read_snapshot(self, interfaces: tuple[str, ...]) -> dict[str, Any]:
+    def read_snapshot(self, interfaces: tuple[str, ...]) -> BackendDutSnapshot:
         backend = self._backend
         command = _remote_command(interfaces)
         last_error: BaseException | None = None
@@ -283,9 +274,7 @@ class DutSshBackendClient:
                     raise DutBackendError(
                         f"remote PHP collector exited with status {exit_status}: {detail[:1000]}"
                     )
-                document = _extract_json(stdout_text)
-                _validate_snapshot(document, interfaces)
-                return document
+                return _parse_snapshot(stdout_text, interfaces)
             except (
                 paramiko.SSHException,
                 TimeoutError,
@@ -309,12 +298,8 @@ class DutSshBackendClient:
         ) from last_error
 
 
-def _object(value: Any) -> dict[str, Any]:
-    return value if isinstance(value, dict) else {}
-
-
-def _elapsed_seconds(origin: str, current: Any) -> str:
-    if not isinstance(current, str) or not origin:
+def _elapsed_seconds(origin: str, current: str) -> str:
+    if not origin:
         return ""
     try:
         elapsed = (datetime.fromisoformat(current) - datetime.fromisoformat(origin)).total_seconds()
@@ -331,7 +316,7 @@ def _missed_intervals(next_deadline: float, now: float, interval: float) -> int:
     return int((now - next_deadline) // interval) + 1
 
 
-def render_metrics_csv(samples: list[dict[str, Any]], interfaces: tuple[str, ...]) -> str:
+def render_metrics_csv(samples: list[BackendDutSample], interfaces: tuple[str, ...]) -> str:
     fixed_columns = [
         "sample_index",
         "time_origin",
@@ -351,33 +336,35 @@ def render_metrics_csv(samples: list[dict[str, Any]], interfaces: tuple[str, ...
     output = io.StringIO(newline="")
     writer = csv.writer(output, lineterminator="\n")
     writer.writerow([*fixed_columns, *interface_columns])
-    origin = str(samples[0].get("started_at") or "") if samples else ""
+    origin = samples[0].started_at if samples else ""
     for index, sample in enumerate(samples, start=1):
-        resources = _object(sample.get("resources"))
-        cpu = _object(resources.get("cpu"))
-        cpu_latest = _object(cpu.get("latest"))
-        cpu_threshold = _object(cpu.get("threshold"))
-        memory = _object(resources.get("memory"))
-        memory_latest = _object(memory.get("latest"))
-        new_sessions = _object(resources.get("new_sessions"))
-        concurrent_sessions = _object(resources.get("concurrent_sessions"))
-        traffic = _object(resources.get("traffic"))
+        resources = sample.resources
+        cpu_latest = resources.cpu.latest
+        cpu_threshold = resources.cpu.threshold
+        memory_latest = resources.memory.latest
+        new_sessions = resources.new_sessions
+        concurrent_sessions = resources.concurrent_sessions
         row: list[Any] = [
             index,
             origin if index == 1 else "",
-            _elapsed_seconds(origin, sample.get("started_at")),
-            cpu_latest.get("mgt"),
-            cpu_latest.get("data"),
-            cpu_threshold.get("mgt"),
-            cpu_threshold.get("data"),
-            memory_latest.get("percent"),
-            memory.get("threshold"),
-            new_sessions.get("count"),
-            concurrent_sessions.get("count"),
+            _elapsed_seconds(origin, sample.started_at),
+            cpu_latest.mgt if cpu_latest else None,
+            cpu_latest.data if cpu_latest else None,
+            cpu_threshold.mgt if cpu_threshold else None,
+            cpu_threshold.data if cpu_threshold else None,
+            memory_latest.percent if memory_latest else None,
+            resources.memory.threshold,
+            new_sessions.count if new_sessions else None,
+            concurrent_sessions.count if concurrent_sessions else None,
         ]
         for interface in interfaces:
-            interface_traffic = _object(traffic.get(interface))
-            row.extend(interface_traffic.get(field) for field in ("ibps", "obps"))
+            interface_traffic = resources.traffic.get(interface)
+            row.extend(
+                (
+                    interface_traffic.ibps if interface_traffic else None,
+                    interface_traffic.obps if interface_traffic else None,
+                )
+            )
         writer.writerow(row)
     return output.getvalue()
 
@@ -400,8 +387,8 @@ class DutBackendCollector:
             username=username,
             password=password,
         )
-        self._samples: list[dict[str, Any]] = []
-        self._errors: list[dict[str, Any]] = []
+        self._samples: list[BackendDutSample] = []
+        self._errors: list[BackendDutSampleError] = []
         self._missed_sample_count = 0
         self._attempt_dir: Path | None = None
         self._raw_path: Path | None = None
@@ -461,34 +448,21 @@ class DutBackendCollector:
         self._raise_worker_failure()
         if not raw_path.is_file():
             raise RuntimeError("resumed backend DUT Attempt omitted dut-metrics.json")
-        document = ArtifactStore.read_json(raw_path)
-        if not isinstance(document, dict):
-            raise RuntimeError("resumed backend DUT metrics artifact is not an object")
-        target = _object(document.get("target"))
-        if (
-            target.get("host") != self._backend.host
-            or target.get("port") != self._backend.port
-        ):
+        try:
+            document = BackendDutCaptureArtifact.model_validate(ArtifactStore.read_json(raw_path))
+        except ValidationError as exc:
+            raise RuntimeError("resumed backend DUT metrics artifact is invalid") from exc
+        if document.target.host != self._backend.host or document.target.port != self._backend.port:
             raise RuntimeError("resumed backend DUT target differs from the checkpoint")
-        if tuple(document.get("interfaces", ())) != self.config.interfaces:
+        if document.interfaces != self.config.interfaces:
             raise RuntimeError("resumed backend DUT interfaces differ from the checkpoint")
-        raw_samples = document.get("samples")
-        raw_errors = document.get("errors")
-        if not isinstance(raw_samples, list) or not isinstance(raw_errors, list):
-            raise RuntimeError("resumed backend DUT artifact omitted samples or errors")
         self._attempt_dir = attempt_dir
         self._raw_path = raw_path
         self._csv_path = attempt_dir / "dut-metrics.csv"
-        self._samples = [item for item in raw_samples if isinstance(item, dict)]
-        self._errors = [item for item in raw_errors if isinstance(item, dict)]
-        missed_sample_count = document.get("missed_sample_count", 0)
-        if not isinstance(missed_sample_count, int) or missed_sample_count < 0:
-            raise RuntimeError("resumed backend DUT artifact has invalid missed_sample_count")
-        self._missed_sample_count = missed_sample_count
-        worker_failure = document.get("worker_failure")
-        if worker_failure is not None and not isinstance(worker_failure, str):
-            raise RuntimeError("resumed backend DUT artifact has invalid worker_failure")
-        self._worker_failure = worker_failure
+        self._samples = list(document.samples)
+        self._errors = list(document.errors)
+        self._missed_sample_count = document.missed_sample_count
+        self._worker_failure = document.worker_failure
         self._traffic_started_at = started_at
         self._traffic_finished_at = finished_at
         if finished_at is None:
@@ -508,11 +482,11 @@ class DutBackendCollector:
                 snapshot = self._client.read_snapshot(self.config.interfaces)
                 if self._stop.is_set():
                     break
-                sample = {
-                    "started_at": started_at,
-                    "finished_at": _iso_now(),
-                    "resources": snapshot,
-                }
+                sample = BackendDutSample(
+                    started_at=started_at,
+                    finished_at=_iso_now(),
+                    resources=snapshot,
+                )
                 sample_number += 1
                 missed = _missed_intervals(
                     origin + sample_number * self._backend.interval_seconds,
@@ -527,12 +501,12 @@ class DutBackendCollector:
             except Exception as exc:
                 if self._stop.is_set():
                     break
-                failure = {
-                    "scheduled_at": started_at,
-                    "started_at": started_at,
-                    "finished_at": _iso_now(),
-                    "error": str(exc),
-                }
+                failure = BackendDutSampleError(
+                    scheduled_at=started_at,
+                    started_at=started_at,
+                    finished_at=_iso_now(),
+                    error=str(exc),
+                )
                 sample_number += 1
                 missed = _missed_intervals(
                     origin + sample_number * self._backend.interval_seconds,
@@ -569,12 +543,12 @@ class DutBackendCollector:
                     now = _iso_now()
                     with self._lock:
                         self._errors.append(
-                            {
-                                "scheduled_at": now,
-                                "started_at": now,
-                                "finished_at": now,
-                                "error": message,
-                            }
+                            BackendDutSampleError(
+                                scheduled_at=now,
+                                started_at=now,
+                                finished_at=now,
+                                error=message,
+                            )
                         )
                         self._write_checkpoint_locked()
         self._thread = None
@@ -583,23 +557,18 @@ class DutBackendCollector:
         if self._worker_failure is not None:
             raise DutBackendError(self._worker_failure)
 
-    def _result_document(self) -> dict[str, Any]:
-        return {
-            "target": {
-                "host": self._backend.host,
-                "port": self._backend.port,
-                "transport": "ssh",
-                "backend": "PHP Dashboard/SystemChart.php",
-            },
-            "interfaces": list(self.config.interfaces),
-            "traffic_started_at": self._traffic_started_at,
-            "traffic_finished_at": self._traffic_finished_at,
-            "interval_seconds": self._backend.interval_seconds,
-            "missed_sample_count": self._missed_sample_count,
-            "worker_failure": self._worker_failure,
-            "samples": list(self._samples),
-            "errors": list(self._errors),
-        }
+    def _result_document(self) -> BackendDutCaptureArtifact:
+        return BackendDutCaptureArtifact(
+            target=BackendDutTarget(host=self._backend.host, port=self._backend.port),
+            interfaces=self.config.interfaces,
+            traffic_started_at=self._traffic_started_at,
+            traffic_finished_at=self._traffic_finished_at,
+            interval_seconds=self._backend.interval_seconds,
+            missed_sample_count=self._missed_sample_count,
+            worker_failure=self._worker_failure,
+            samples=tuple(self._samples),
+            errors=tuple(self._errors),
+        )
 
     def _write_checkpoint(self) -> None:
         with self._lock:
@@ -638,7 +607,7 @@ class DutBackendCollector:
             metrics_csv=metrics_csv,
         )
         warnings = tuple(
-            f"DUT backend sample failed at {item['started_at']}: {item['error']}"
+            f"DUT backend sample failed at {item.started_at}: {item.error}"
             for item in self._errors
         )
         return DutCaptureResult(

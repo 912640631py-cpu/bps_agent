@@ -4,17 +4,15 @@ from __future__ import annotations
 
 import logging
 import math
-import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
 from bps_agent.adjudication import verdict_artifact
-from bps_agent.artifacts import ArtifactStore
 from bps_agent.launch import LaunchReconciliationError, RunLaunchCoordinator
 from bps_agent.models import (
+    ATTEMPT_BANDWIDTH_FACTORS,
     AppConfig,
     AttemptRecord,
     BackendDutEvidence,
@@ -32,25 +30,14 @@ from bps_agent.models import (
     utc_now,
 )
 from bps_agent.performance_timeseries import analyze_performance_timeseries
-from bps_agent.ports import BpsPort, Clock, DutPort, JudgePort
 from bps_agent.report_sections import (
     extract_report_sections,
     resolve_minimal_analysis_sections,
     resolve_performance_timeseries_sections,
 )
+from bps_agent.runtime import RuntimeResources
 
 LOGGER = logging.getLogger(__name__)
-
-_ATTEMPT_BANDWIDTH_FACTORS = (1.0, 0.8, 0.6, 0.4, 0.2, 0.1)
-
-
-class SystemClock:
-    def monotonic(self) -> float:
-        return time.monotonic()
-
-    def sleep(self, seconds: float) -> None:
-        time.sleep(seconds)
-
 
 class EvaluationState(TypedDict):
     evaluation_id: str
@@ -62,14 +49,7 @@ class EvaluationState(TypedDict):
     final_artifact: str | None
 
 
-@dataclass(frozen=True)
-class EvaluationServices:
-    config: AppConfig
-    bps: BpsPort
-    dut: DutPort | None
-    judge: JudgePort
-    artifacts: ArtifactStore
-    clock: Clock
+EvaluationServices = RuntimeResources
 
 
 def initial_state(evaluation_id: str, config: AppConfig) -> EvaluationState:
@@ -135,16 +115,16 @@ def _attempt_bandwidth_target(
     template_total_bandwidth_mbps: float,
     attempt_number: int,
 ) -> tuple[float, float]:
-    if not 1 <= attempt_number <= len(_ATTEMPT_BANDWIDTH_FACTORS):
+    if not 1 <= attempt_number <= len(ATTEMPT_BANDWIDTH_FACTORS):
         raise ValueError(f"unsupported Attempt number: {attempt_number}")
-    factor = _ATTEMPT_BANDWIDTH_FACTORS[attempt_number - 1]
+    factor = ATTEMPT_BANDWIDTH_FACTORS[attempt_number - 1]
     target_mbps = round(configured_mbps * factor, 6)
     percentage = round(target_mbps / template_total_bandwidth_mbps * 100, 6)
     return target_mbps, percentage
 
 
 def build_graph(
-    services: EvaluationServices,
+    services: RuntimeResources,
     checkpointer: Any | None = None,
     *,
     interrupt_before: list[str] | None = None,
@@ -162,25 +142,15 @@ def build_graph(
         return services.bps.port_reservation_status()
 
     def reject_foreign_reservation(status: PortReservationStatus) -> None:
-        if status.state != PortReservationState.FOREIGN:
+        if not status.has_foreign_reservation:
             return
-        other_owners = sorted(
-            {
-                reservation.owner
-                for reservation in status.reservations
-                if reservation.owner is not None and not reservation.owned_by_agent
-            }
-        )
         raise RuntimeError(
             "configured BPS ports are reserved by another account: "
-            + ", ".join(other_owners)
+            + ", ".join(status.foreign_owners)
         )
 
     def attempt_reservation_update(status: PortReservationStatus) -> dict[str, Any]:
-        return {
-            "ports_reserved": status.state == PortReservationState.ALL_AGENT,
-            "port_reservation_state": status.state,
-        }
+        return {"port_reservation_state": status.state}
 
     def release_agent_reservation_if_inactive(
         status: PortReservationStatus | None = None,
@@ -236,7 +206,7 @@ def build_graph(
     def reserve_all_ports() -> PortReservationStatus:
         services.bps.reserve_ports()
         status = actual_reservation_status()
-        if status.state != PortReservationState.ALL_AGENT:
+        if not status.is_fully_agent_owned:
             if status.state == PortReservationState.PARTIAL_AGENT:
                 release_agent_reservation_if_inactive(status)
             raise RuntimeError(
@@ -743,7 +713,7 @@ def build_graph(
         assert attempt.verdict is not None
         if attempt.verdict.verdict == VerdictValue.PASS:
             return "finalize"
-        if len(state["attempts"]) < cfg.evaluation.max_attempts:
+        if len(state["attempts"]) < len(ATTEMPT_BANDWIDTH_FACTORS):
             return "start_attempt"
         return "finalize"
 
