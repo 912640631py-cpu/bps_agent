@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -16,8 +17,29 @@ from bps_agent.adapters.deepseek import (
 )
 from bps_agent.adapters.dut import DutClient
 from bps_agent.models.bps import PortReservationState
+from bps_agent.models.common import DutCollectionMethod, ReasoningEffort
 from bps_agent.models.config import BpsConfig, DutConfig, DutFrontendConfig, ProviderConfig
-from bps_agent.models.dut import DutCollectionMethod, ObservationPhase, SupplementalSnapshot
+from bps_agent.models.dut import ObservationPhase, SupplementalSnapshot
+
+
+def make_deepseek_judge(
+    handler: Callable[[httpx.Request], httpx.Response],
+    *,
+    attempts: int = 3,
+    reasoning_effort: ReasoningEffort = "max",
+) -> DeepSeekJudge:
+    return DeepSeekJudge(
+        "official",
+        ProviderConfig(
+            base_url="https://api.deepseek.com",
+            model="deepseek-v4-flash",
+            token_env="DEEPSEEK_API_KEY",
+            attempts=attempts,
+        ),
+        token="secret",
+        reasoning_effort=reasoning_effort,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
 
 
 def test_bps_run_contract_never_forces_reservation() -> None:
@@ -350,19 +372,7 @@ def test_deepseek_contract_sends_configured_reasoning_effort() -> None:
             },
         )
 
-    http = httpx.Client(transport=httpx.MockTransport(handler))
-    judge = DeepSeekJudge(
-        "official",
-        ProviderConfig(
-            base_url="https://api.deepseek.com",
-            model="deepseek-v4-flash",
-            token_env="DEEPSEEK_API_KEY",
-            attempts=1,
-        ),
-        token="secret",
-        reasoning_effort="high",
-        client=http,
-    )
+    judge = make_deepseek_judge(handler, attempts=1, reasoning_effort="high")
 
     judge.validate_compatibility()
 
@@ -381,17 +391,7 @@ def test_deepseek_retries_invalid_json_at_most_three_times() -> None:
         content = "not-json" if calls < 3 else '{"verdict":"pass"}'
         return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
 
-    judge = DeepSeekJudge(
-        "official",
-        ProviderConfig(
-            base_url="https://api.deepseek.com",
-            model="deepseek-v4-flash",
-            token_env="DEEPSEEK_API_KEY",
-            attempts=3,
-        ),
-        token="secret",
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
+    judge = make_deepseek_judge(handler)
 
     judge.validate_compatibility()
 
@@ -403,17 +403,7 @@ def test_deepseek_wraps_non_retryable_http_status(status_code: int) -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(status_code, text="rejected")
 
-    judge = DeepSeekJudge(
-        "official",
-        ProviderConfig(
-            base_url="https://api.deepseek.com",
-            model="deepseek-v4-flash",
-            token_env="DEEPSEEK_API_KEY",
-            attempts=3,
-        ),
-        token="secret",
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
+    judge = make_deepseek_judge(handler)
 
     with pytest.raises(ProviderRequestError, match=f"HTTP {status_code}"):
         judge.validate_compatibility()
@@ -427,17 +417,7 @@ def test_deepseek_wraps_invalid_response_after_retries() -> None:
         calls += 1
         return httpx.Response(200, json={"choices": []})
 
-    judge = DeepSeekJudge(
-        "official",
-        ProviderConfig(
-            base_url="https://api.deepseek.com",
-            model="deepseek-v4-flash",
-            token_env="DEEPSEEK_API_KEY",
-            attempts=2,
-        ),
-        token="secret",
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
+    judge = make_deepseek_judge(handler, attempts=2)
 
     with pytest.raises(ProviderResponseError, match="omitted choices"):
         judge.validate_compatibility()
@@ -452,96 +432,61 @@ def test_deepseek_wraps_transport_failure_after_retries() -> None:
         calls += 1
         raise httpx.ConnectError("connection refused", request=request)
 
-    judge = DeepSeekJudge(
-        "official",
-        ProviderConfig(
-            base_url="https://api.deepseek.com",
-            model="deepseek-v4-flash",
-            token_env="DEEPSEEK_API_KEY",
-            attempts=2,
-        ),
-        token="secret",
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
+    judge = make_deepseek_judge(handler, attempts=2)
 
     with pytest.raises(ProviderRequestError, match="transport failed"):
         judge.validate_compatibility()
     assert calls == 2
 
 
-def test_deepseek_preserves_compatibility_error_type() -> None:
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(400, text="unsupported reasoning")
-
-    judge = DeepSeekJudge(
-        "official",
-        ProviderConfig(
-            base_url="https://api.deepseek.com",
-            model="deepseek-v4-flash",
-            token_env="DEEPSEEK_API_KEY",
-            attempts=3,
+@pytest.mark.parametrize(
+    ("phase", "response_body", "error_type", "message_fragments"),
+    [
+        (
+            "probe",
+            {"text": "unsupported reasoning"},
+            ProviderCompatibilityError,
+            ("unsupported reasoning",),
         ),
-        token="secret",
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
-
-    with pytest.raises(ProviderCompatibilityError, match="unsupported reasoning"):
-        judge.validate_compatibility()
-
-
-def test_deepseek_normal_400_is_a_request_error_with_provider_details() -> None:
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            400,
-            json={
-                "error": {
-                    "code": "context_length_exceeded",
-                    "message": "input exceeds the model context window",
+        (
+            "adjudication",
+            {
+                "json": {
+                    "error": {
+                        "code": "context_length_exceeded",
+                        "message": "input exceeds the model context window",
+                    }
                 }
             },
-        )
-
-    judge = DeepSeekJudge(
-        "official",
-        ProviderConfig(
-            base_url="https://api.deepseek.com",
-            model="deepseek-v4-flash",
-            token_env="DEEPSEEK_API_KEY",
-            attempts=3,
+            ProviderRequestError,
+            ("HTTP 400", "context_length_exceeded", "input exceeds the model context window"),
         ),
-        token="secret",
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
-
-    with pytest.raises(ProviderRequestError) as captured:
-        judge._request_verdict([{"role": "user", "content": "real Evidence Bundle"}])
-
-    assert "HTTP 400" in str(captured.value)
-    assert "context_length_exceeded" in str(captured.value)
-    assert "input exceeds the model context window" in str(captured.value)
-
-
-def test_deepseek_probe_400_without_compatibility_signal_is_a_request_error() -> None:
+        (
+            "probe",
+            {"json": {"error": {"code": "invalid_request", "message": "malformed messages"}}},
+            ProviderRequestError,
+            ("malformed messages",),
+        ),
+    ],
+)
+def test_deepseek_classifies_bad_requests_by_call_phase(
+    phase: str,
+    response_body: dict[str, Any],
+    error_type: type[Exception],
+    message_fragments: tuple[str, ...],
+) -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            400,
-            json={"error": {"code": "invalid_request", "message": "malformed messages"}},
-        )
+        return httpx.Response(400, **response_body)
 
-    judge = DeepSeekJudge(
-        "official",
-        ProviderConfig(
-            base_url="https://api.deepseek.com",
-            model="deepseek-v4-flash",
-            token_env="DEEPSEEK_API_KEY",
-            attempts=1,
-        ),
-        token="secret",
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
+    judge = make_deepseek_judge(handler, attempts=1)
 
-    with pytest.raises(ProviderRequestError, match="malformed messages"):
-        judge.validate_compatibility()
+    with pytest.raises(error_type) as captured:
+        if phase == "probe":
+            judge.validate_compatibility()
+        else:
+            judge._request_verdict([{"role": "user", "content": "real Evidence Bundle"}])
+
+    assert all(fragment in str(captured.value) for fragment in message_fragments)
 
 
 def test_bps_completion_requires_report_when_run_was_never_observed() -> None:

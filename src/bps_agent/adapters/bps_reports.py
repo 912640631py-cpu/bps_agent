@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import tempfile
 import time
@@ -13,29 +12,11 @@ from urllib.parse import urljoin
 
 import httpx
 
+from bps_agent.adapters.bps_protocol import BpsProtocolError, require_success_payload
 from bps_agent.http_safety import require_same_origin
 from bps_agent.models.config import BpsConfig
 
 _RETRYABLE_REPORT_STATUSES = {404, 409, 500, 503}
-
-
-class BpsProtocolError(RuntimeError):
-    pass
-
-
-def decode_payload(response: httpx.Response) -> Any:
-    if not response.content:
-        return None
-    try:
-        return response.json()
-    except json.JSONDecodeError:
-        return response.text
-
-
-def require_success_payload(response: httpx.Response) -> Any:
-    response.raise_for_status()
-    return decode_payload(response)
-
 
 class BpsReports:
     """Deep internal module for the complete report export workflow."""

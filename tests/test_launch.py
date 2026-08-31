@@ -28,6 +28,9 @@ class LaunchingBps:
         assert group == 10
         return self.running
 
+    def close(self) -> None:
+        return None
+
 
 def coordinator(tmp_path: Path, bps: LaunchingBps) -> RunLaunchCoordinator:
     return RunLaunchCoordinator(bps, ArtifactStore(tmp_path))  # type: ignore[arg-type]

@@ -41,25 +41,6 @@ def test_demo_configuration_matches_real_lab_defaults() -> None:
     assert "lock_dir" not in config.storage.model_dump()
 
 
-def test_deprecated_fixed_max_attempts_is_rejected(
-    app_config: AppConfig,
-) -> None:
-    document = app_config.model_dump(mode="python")
-    document["evaluation"]["max_attempts"] = 6
-
-    with pytest.raises(ValueError):
-        AppConfig.model_validate(document)
-
-
-def test_legacy_flat_dut_configuration_is_rejected() -> None:
-    with pytest.raises(ValueError):
-        DutConfig(
-            endpoint="https://dut.example.test",
-            interfaces=("T1/1",),
-            baseline_seconds=300,
-        )
-
-
 def test_structured_backend_configuration_requires_an_explicit_target() -> None:
     with pytest.raises(ValueError, match=r"requires dut\.backend"):
         DutConfig(

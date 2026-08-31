@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from bps_agent.models.bps import PortReservation, PortReservationStatus
+from bps_agent.models.bps import (
+    PortReservation,
+    PortReservationState,
+    PortReservationStatus,
+)
 from bps_agent.models.common import ObservationPhase
 from bps_agent.models.dut import DutObservations, ResourceObservation
-from bps_agent.models.evaluation import AttemptRecord
 
 
 def observation(phase: ObservationPhase, started_at: str, finished_at: str) -> ResourceObservation:
@@ -47,26 +50,35 @@ def test_duplicate_observation_phase_is_rejected() -> None:
         DutObservations.from_resource_observations((duplicate, duplicate))
 
 
-def test_legacy_attempt_reservation_boolean_is_rejected() -> None:
-    with pytest.raises(ValueError):
-        AttemptRecord.model_validate(
-            {
-                "number": 1,
-                "started_at": "2026-08-31T00:00:00+00:00",
-                "ports_reserved": True,
-            }
-        )
-
-
-def test_reservation_status_exposes_owner_semantics_without_graph_traversal() -> None:
+@pytest.mark.parametrize(
+    ("owners", "expected_state", "agent_ports", "foreign_owners"),
+    [
+        ((None, None), PortReservationState.NONE, (), ()),
+        (("agent", "agent"), PortReservationState.ALL_AGENT, (4, 5), ()),
+        (("agent", None), PortReservationState.PARTIAL_AGENT, (4,), ()),
+        (("agent", "other"), PortReservationState.FOREIGN, (4,), ("other",)),
+    ],
+)
+def test_reservation_status_classifies_owner_semantics(
+    owners: tuple[str | None, str | None],
+    expected_state: PortReservationState,
+    agent_ports: tuple[int, ...],
+    foreign_owners: tuple[str, ...],
+) -> None:
     status = PortReservationStatus.classify(
-        (
-            PortReservation(slot=4, port=4, owner="agent", owned_by_agent=True),
-            PortReservation(slot=4, port=5, owner="other", owned_by_agent=False),
+        tuple(
+            PortReservation(
+                slot=4,
+                port=port,
+                owner=owner,
+                owned_by_agent=owner == "agent",
+            )
+            for port, owner in zip((4, 5), owners, strict=True)
         )
     )
 
-    assert status.agent_owned_ports == (4,)
-    assert status.foreign_owners == ("other",)
-    assert status.has_foreign_reservation
-    assert not status.is_fully_agent_owned
+    assert status.state == expected_state
+    assert status.agent_owned_ports == agent_ports
+    assert status.foreign_owners == foreign_owners
+    assert status.has_foreign_reservation == (expected_state == PortReservationState.FOREIGN)
+    assert status.is_fully_agent_owned == (expected_state == PortReservationState.ALL_AGENT)

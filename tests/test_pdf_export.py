@@ -10,18 +10,10 @@ from bps_agent.models.config import BpsConfig
 from bps_agent.pdf_export import PdfExportJob, run_pdf_job
 
 
-def bps_config() -> BpsConfig:
-    return BpsConfig(
-        endpoint="https://bps.example.test",
-        template="template",
-        slot=4,
-        ports=(4, 5),
-        group=10,
-    )
-
-
 def test_scheduler_persists_secret_free_job_and_launches_isolated_process(
-    tmp_path: Path, monkeypatch: Any
+    tmp_path: Path,
+    monkeypatch: Any,
+    bps_config: BpsConfig,
 ) -> None:
     captured: dict[str, Any] = {}
     monkeypatch.setenv("DEEPSEEK_API_KEY", "must-not-leak")
@@ -34,7 +26,7 @@ def test_scheduler_persists_secret_free_job_and_launches_isolated_process(
         return object()
 
     monkeypatch.setattr("bps_agent.pdf_export.subprocess.Popen", popen)
-    client = BpsClient(bps_config(), username="bps-user", password="bps-password")
+    client = BpsClient(bps_config, username="bps-user", password="bps-password")
     client._session_id = "parent-session"
     client._api_key = "parent-key"
     destination = tmp_path / "bps-report-full.pdf"
@@ -70,8 +62,10 @@ def test_scheduler_persists_secret_free_job_and_launches_isolated_process(
     assert captured["arguments"][1:3] == ["-m", "bps_agent.pdf_export"]
 
 
-def test_pdf_worker_authenticates_exports_and_logs_out(
-    tmp_path: Path, monkeypatch: Any
+def test_pdf_export_job_authenticates_exports_and_logs_out(
+    tmp_path: Path,
+    monkeypatch: Any,
+    bps_config: BpsConfig,
 ) -> None:
     calls: list[Any] = []
 
@@ -100,7 +94,7 @@ def test_pdf_worker_authenticates_exports_and_logs_out(
     ArtifactStore.write_json(
         job_path,
         PdfExportJob.pending(
-            config=bps_config(),
+            config=bps_config,
             run_id="run-8",
             destination=destination,
             section_ids=("1",),

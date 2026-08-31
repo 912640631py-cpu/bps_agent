@@ -103,11 +103,18 @@ def test_invalid_port_overrides_are_rejected(app_config: AppConfig, ports: tuple
         )
 
 
-def test_resume_rejects_bps_overrides(app_config: AppConfig) -> None:
+@pytest.mark.parametrize(
+    "override_values",
+    [
+        {"template": "other-performance-template"},
+        {"dut_host": "10.66.246.156"},
+        {"total_bandwidth_mbps": 300.0},
+        {"evaluation_mode": EvaluationMode.BPS_ONLY},
+    ],
+)
+def test_resume_rejects_run_overrides(override_values: dict[str, Any]) -> None:
     with pytest.raises(ValueError, match="cannot be used with --resume"):
-        validate_resume_request(
-            "evaluation-id", RunOverrides(template="other-performance-template")
-        )
+        validate_resume_request("evaluation-id", RunOverrides.model_validate(override_values))
 
 
 @pytest.mark.parametrize("bandwidth", [0.0, -1.0])
@@ -178,25 +185,6 @@ def test_parser_accepts_repeatable_dut_backend_overrides() -> None:
 
     assert arguments.dut_collection_method == DutCollectionMethod.BACKEND_SSH
     assert arguments.dut_interfaces == ["T1/1", "T1/2"]
-
-
-def test_resume_rejects_dut_override(app_config: AppConfig) -> None:
-    with pytest.raises(ValueError, match="cannot be used with --resume"):
-        validate_resume_request("evaluation-id", RunOverrides(dut_host="10.66.246.156"))
-
-
-def test_resume_rejects_bandwidth_override(app_config: AppConfig) -> None:
-    with pytest.raises(ValueError, match="cannot be used with --resume"):
-        validate_resume_request(
-            "evaluation-id", RunOverrides(total_bandwidth_mbps=300.0)
-        )
-
-
-def test_resume_rejects_bps_only_override(app_config: AppConfig) -> None:
-    with pytest.raises(ValueError, match="cannot be used with --resume"):
-        validate_resume_request(
-            "evaluation-id", RunOverrides(evaluation_mode=EvaluationMode.BPS_ONLY)
-        )
 
 
 def test_resume_loads_runtime_configuration_from_checkpoint(app_config: AppConfig) -> None:
@@ -312,6 +300,9 @@ def test_live_and_replay_share_the_complete_llm_configuration(
                     "reasoning_effort": reasoning_effort,
                 }
             )
+
+        def close(self) -> None:
+            return None
 
     monkeypatch.setattr("bps_agent.runtime.DeepSeekJudge", CapturingJudge)
     config = app_config.model_copy(

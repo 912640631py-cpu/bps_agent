@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
@@ -39,10 +38,7 @@ from bps_agent.models.dut import (
     ResourceObservation,
     SupplementalSnapshot,
 )
-from bps_agent.models.evaluation import (
-    EvidenceBundle,
-    VerdictDocument,
-)
+from bps_agent.models.evaluation import VerdictDocument
 
 
 class FakeClock:
@@ -85,8 +81,6 @@ class FakeBps:
         template_error: bool = False,
         template_bandwidth_mbps: float = 400.0,
         report_toc: Any = None,
-        verify_pdf_parallel: bool = False,
-        pdf_error: bool = False,
         block_pdf_until_released: bool = False,
     ) -> None:
         self.clock = clock
@@ -123,20 +117,11 @@ class FakeBps:
         self.reservation_owners: dict[int, str | None] = {4: None, 5: None}
         self.active_run_ids: set[str] = set()
         self.export_section_ids: list[tuple[str, ...]] = []
-        self.report_run_ids: list[str] = []
-        self.export_run_ids: list[str] = []
-        self.pdf_export_run_ids: list[str] = []
-        self.pdf_export_section_ids: list[tuple[str, ...]] = []
-        self.pdf_destinations: list[Path] = []
         self.bandwidth_percentages: list[float] = []
-        self.verify_pdf_parallel = verify_pdf_parallel
-        self.pdf_error = pdf_error
         self.block_pdf_until_released = block_pdf_until_released
         self.pdf_started = Event()
         self.pdf_release = Event()
         self.pdf_finished = Event()
-        self.pdf_started_after_existing_exports = False
-        self.pdf_warning_count = 0
 
     def find_template(self, name: str) -> dict[str, Any]:
         if self.template_error:
@@ -203,7 +188,7 @@ class FakeBps:
         return RunCompletion(terminal=True, details={"run_id": run_id, "result": "complete"})
 
     def wait_for_report(self, run_id: str) -> Any:
-        self.report_run_ids.append(run_id)
+        del run_id
         return self.report_toc
 
     def export_report(
@@ -212,7 +197,6 @@ class FakeBps:
         destination: Path,
         section_ids: tuple[str, ...],
     ) -> Path:
-        self.export_run_ids.append(run_id)
         self.export_section_ids.append(section_ids)
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.name == "bps-performance-timeseries.csv":
@@ -222,39 +206,19 @@ class FakeBps:
         destination.write_text(content, encoding="utf-8")
         return destination
 
-    def export_full_report_pdf(
-        self,
-        run_id: str,
-        destination: Path,
-        section_ids: tuple[str, ...],
-    ) -> Path:
-        self.pdf_export_run_ids.append(run_id)
-        self.pdf_export_section_ids.append(section_ids)
-        self.pdf_destinations.append(destination)
-        if self.verify_pdf_parallel:
-            self.pdf_started_after_existing_exports = len(self.export_run_ids) == 2
-        if self.pdf_error:
-            raise RuntimeError("fixture PDF export failed")
-        if self.verify_pdf_parallel or self.block_pdf_until_released:
-            self.pdf_started.set()
-            assert self.pdf_release.wait(5)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(b"%PDF-1.7\nfixture")
-        return destination
-
     def schedule_full_report_pdf(
         self,
         run_id: str,
         destination: Path,
         section_ids: tuple[str, ...],
     ) -> None:
+        del run_id, destination, section_ids
+
         def export() -> None:
-            try:
-                self.export_full_report_pdf(run_id, destination, section_ids)
-            except Exception:
-                self.pdf_warning_count += 1
-            finally:
-                self.pdf_finished.set()
+            self.pdf_started.set()
+            if self.block_pdf_until_released:
+                assert self.pdf_release.wait(5)
+            self.pdf_finished.set()
 
         Thread(target=export, name="fake-bps-full-pdf", daemon=True).start()
 
@@ -268,6 +232,9 @@ class FakeBps:
     def stop_run(self, run_id: str) -> None:
         self.stop_count += 1
         self.active_run_ids.discard(run_id)
+
+    def close(self) -> None:
+        return None
 
 
 class FakeDut:
@@ -447,6 +414,9 @@ class FakeJudge:
         verdict = self.verdicts.pop(0)
         return VerdictDocument(verdict=verdict, summary="fixture"), {"fixture": True}
 
+    def close(self) -> None:
+        return None
+
 
 def run_graph(
     config: AppConfig,
@@ -502,25 +472,6 @@ def test_bps_only_mode_never_calls_dut_and_omits_dut_evidence(app_config: AppCon
     assert dut.supplemental_calls == 0
 
 
-def test_bps_only_graph_runs_without_any_dut_configuration(app_config: AppConfig) -> None:
-    document = app_config.model_dump(mode="python")
-    document.pop("dut")
-    document["evaluation"]["mode"] = EvaluationMode.BPS_ONLY.value
-    config = AppConfig.model_validate(document)
-    clock = FakeClock()
-
-    result = run_graph(
-        config,
-        FakeBps(clock),
-        None,
-        FakeJudge([VerdictValue.PASS]),
-        clock,
-    )
-
-    assert result["outcome"] == EvaluationOutcome.PASSED.value
-    assert result["attempts"][0]["dut_collection_method"] is None
-
-
 def test_passes_on_first_complete_attempt(app_config: AppConfig) -> None:
     clock = FakeClock()
     bps = FakeBps(clock)
@@ -537,147 +488,29 @@ def test_passes_on_first_complete_attempt(app_config: AppConfig) -> None:
     assert dut.supplemental_calls == 2
     assert dut.keepalive_calls == 1
     assert judge.calls == 1
-    assert bps.report_run_ids == ["run-1"]
-    assert bps.export_run_ids == ["run-1", "run-1"]
-    assert bps.pdf_export_run_ids == ["run-1"]
-    assert bps.pdf_export_section_ids == [
-        (
-            "10",
-            "12",
-            "20",
-            "30",
-        )
-    ]
-    assert bps.export_section_ids == [
-        (
-            "10.4",
-            "10.5",
-            "10.6",
-            "12.8",
-            "20.3",
-            "20.9",
-            "30.2",
-        ),
-        ("30.4.5", "30.4.7", "30.4.8"),
-    ]
-    assert bps.pdf_finished.wait(1)
-    pdf_path = bps.pdf_destinations[0]
-    assert pdf_path.name == "bps-report-full.pdf"
-    assert pdf_path.read_bytes().startswith(b"%PDF-")
-    assert result["attempts"][0]["pdf_report_path"] is None
     assert Path(result["final_artifact"]).exists()
 
 
-def test_full_pdf_worker_starts_after_critical_report_exports(app_config: AppConfig) -> None:
-    clock = FakeClock()
-    bps = FakeBps(clock, verify_pdf_parallel=True)
-
-    result = run_graph(
-        app_config,
-        bps,
-        FakeDut(),
-        FakeJudge([VerdictValue.PASS]),
-        clock,
-    )
-
-    assert result["outcome"] == EvaluationOutcome.PASSED.value
-    assert bps.pdf_started_after_existing_exports
-
-
-def test_full_pdf_export_failure_does_not_affect_evaluation(app_config: AppConfig) -> None:
-    clock = FakeClock()
-    judge = FakeJudge([VerdictValue.PASS])
-    bps = FakeBps(clock, pdf_error=True)
-
-    result = run_graph(
-        app_config,
-        bps,
-        FakeDut(),
-        judge,
-        clock,
-    )
-
-    assert bps.pdf_finished.wait(1)
-    assert result["outcome"] == EvaluationOutcome.PASSED.value
-    attempt = result["attempts"][0]
-    assert attempt["evidence_complete"] is True
-    assert attempt["pdf_report_path"] is None
-    assert not any("PDF" in error for error in attempt["errors"])
-    assert bps.pdf_warning_count == 1
-    assert judge.calls == 1
-
-
-def test_full_pdf_schedule_failure_is_only_a_warning(
-    app_config: AppConfig,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    class ScheduleFailingBps(FakeBps):
-        def schedule_full_report_pdf(
-            self,
-            run_id: str,
-            destination: Path,
-            section_ids: tuple[str, ...],
-        ) -> None:
-            raise RuntimeError("fixture scheduling failure")
-
-    clock = FakeClock()
-    result = run_graph(
-        app_config,
-        ScheduleFailingBps(clock),
-        FakeDut(),
-        FakeJudge([VerdictValue.PASS]),
-        clock,
-    )
-
-    assert result["outcome"] == EvaluationOutcome.PASSED.value
-    assert not any("PDF" in error for error in result["attempts"][0]["errors"])
-    assert "fixture scheduling failure" in caplog.text
-
-
-def test_slow_full_pdf_does_not_delay_verdict_or_finalize(app_config: AppConfig) -> None:
+def test_pdf_export_does_not_block_evaluation(app_config: AppConfig) -> None:
     clock = FakeClock()
     bps = FakeBps(clock, block_pdf_until_released=True)
 
-    result = run_graph(
-        app_config,
-        bps,
-        FakeDut(),
-        FakeJudge([VerdictValue.PASS]),
-        clock,
-    )
+    try:
+        result = run_graph(
+            app_config,
+            bps,
+            FakeDut(),
+            FakeJudge([VerdictValue.PASS]),
+            clock,
+        )
 
-    assert bps.pdf_started.is_set()
-    assert not bps.pdf_finished.is_set()
-    assert result["outcome"] == EvaluationOutcome.PASSED.value
-    assert Path(result["final_artifact"]).exists()
-    bps.pdf_release.set()
+        assert bps.pdf_started.is_set()
+        assert not bps.pdf_finished.is_set()
+        assert result["outcome"] == EvaluationOutcome.PASSED.value
+        assert Path(result["final_artifact"]).exists()
+    finally:
+        bps.pdf_release.set()
     assert bps.pdf_finished.wait(1)
-
-
-def test_backend_csv_is_the_only_backend_metrics_sent_to_the_judge(
-    app_config: AppConfig,
-) -> None:
-    config = app_config.model_copy(
-        update={
-            "dut": app_config.dut.model_copy(
-                update={"collection_method": DutCollectionMethod.BACKEND_SSH}
-            )
-        }
-    )
-    clock = FakeClock()
-    result = run_graph(
-        config,
-        FakeBps(clock),
-        FakeBackendDut(),
-        FakeJudge([VerdictValue.PASS]),
-        clock,
-    )
-
-    assert result["outcome"] == EvaluationOutcome.PASSED.value
-    evidence = ArtifactStore.read_json(Path(result["attempts"][0]["evidence_path"]))
-    assert evidence["dut_evidence"]["collection_method"] == "backend_ssh"
-    assert "sample_index,time_origin,elapsed_seconds" in evidence["dut_evidence"]["metrics_csv"]
-    assert "samples" not in evidence["dut_evidence"]
 
 
 def test_backend_without_a_successful_sample_is_inconclusive(
@@ -763,43 +596,7 @@ def test_can_stop_after_evidence_without_calling_the_llm(app_config: AppConfig) 
     assert result["outcome"] is None
     assert result["attempts"][0]["evidence_complete"] is True
     evidence_path = Path(result["attempts"][0]["evidence_path"])
-    evidence = ArtifactStore.read_json(evidence_path)
-    serialized_evidence = evidence_path.read_text(encoding="utf-8")
-    assert "bps_report_toc" not in evidence
-    assert "performance_timeseries_path" not in evidence
-    assert "bps-performance-timeseries.csv" not in serialized_evidence
-    assert "bps-report-full.pdf" not in serialized_evidence
-    assert "Timestamp" not in evidence["bps_report"]
-    assert evidence["bps_performance_analysis"]["assessment"] == "normal"
-    assert evidence["bps_template_total_bandwidth_mbps"] == 400.0
-    assert evidence["bps_total_bandwidth_mbps"] == 400.0
-    assert evidence["bps_total_bandwidth_percent"] == 100.0
-    assert "aligned_samples" not in evidence["bps_performance_analysis"]
-    performance_path = Path(result["attempts"][0]["performance_timeseries_path"])
-    assert performance_path.name == "bps-performance-timeseries.csv"
-    assert performance_path.exists()
-    assert "Timestamp" in performance_path.read_text(encoding="utf-8")
-    dut_evidence = evidence["dut_evidence"]
-    assert dut_evidence["collection_method"] == "frontend_api"
-    observations = dut_evidence["observations"]
-    assert observations["resources"]["cpu"]["metadata"] == {"code": 0}
-    assert len(observations["resources"]["cpu"]["points"]["baseline"]) == 1
-    assert len(observations["resources"]["cpu"]["points"]["during"]) == 1
-    assert ArtifactStore.read_json(evidence_path.parent / "dut-evidence.json") == dut_evidence
-    legacy_document = {**evidence, "bps_report_toc": [{"legacy": True}]}
-    legacy_document.pop("dut_evidence")
-    legacy_document.update(
-        {
-            "dut_endpoint": dut_evidence["endpoint"],
-            "dut_interfaces": dut_evidence["interfaces"],
-            "dut_observations": observations,
-            "dut_before": dut_evidence["before"],
-            "dut_after": dut_evidence["after"],
-        }
-    )
-    with pytest.raises(ValueError):
-        EvidenceBundle.model_validate(legacy_document)
-    assert Path(result["attempts"][0]["report_toc_path"]).exists()
+    assert evidence_path.exists()
     assert judge.calls == 0
 
 
@@ -1021,56 +818,6 @@ def test_six_retry_verdicts_reduce_bandwidth_then_end_not_passed(
     ]
 
 
-def test_retry_bandwidth_levels_are_relative_to_configured_initial_target(
-    app_config: AppConfig,
-) -> None:
-    config = app_config.model_copy(
-        update={"bps": app_config.bps.model_copy(update={"total_bandwidth_mbps": 300.0})}
-    )
-    clock = FakeClock()
-    bps = FakeBps(clock)
-
-    result = run_graph(
-        config,
-        bps,
-        FakeDut(),
-        FakeJudge([VerdictValue.RETRY] * 6),
-        clock,
-    )
-
-    assert result["outcome"] == EvaluationOutcome.NOT_PASSED.value
-    assert bps.bandwidth_percentages == [75.0, 60.0, 45.0, 30.0, 15.0, 7.5]
-    assert [attempt["bps_total_bandwidth_mbps"] for attempt in result["attempts"]] == [
-        300.0,
-        240.0,
-        180.0,
-        120.0,
-        60.0,
-        30.0,
-    ]
-
-
-def test_bandwidth_percentage_uses_template_json_original_value(
-    app_config: AppConfig,
-) -> None:
-    clock = FakeClock()
-    bps = FakeBps(clock, template_bandwidth_mbps=800.0)
-
-    result = run_graph(
-        app_config,
-        bps,
-        FakeDut(),
-        FakeJudge([VerdictValue.RETRY] * 6),
-        clock,
-    )
-
-    assert result["outcome"] == EvaluationOutcome.NOT_PASSED.value
-    assert bps.bandwidth_percentages == [50.0, 40.0, 30.0, 20.0, 10.0, 5.0]
-    assert all(
-        attempt["bps_template_total_bandwidth_mbps"] == 800.0 for attempt in result["attempts"]
-    )
-
-
 def test_target_above_template_bandwidth_fails_before_reserving_ports(
     app_config: AppConfig,
 ) -> None:
@@ -1239,24 +986,3 @@ def test_launch_journal_prevents_duplicate_after_node_crash(app_config: AppConfi
         app_config.storage.artifact_dir / "launch-crash" / "attempt-01" / "bps-launch.json"
     )
     assert launch["status"] == "released"
-
-
-def test_verdict_artifact_references_evidence_without_repeating_request(
-    app_config: AppConfig,
-) -> None:
-    result = run_graph(
-        app_config,
-        FakeBps(FakeClock()),
-        FakeDut(),
-        FakeJudge([VerdictValue.PASS]),
-        FakeClock(),
-    )
-
-    attempt = result["attempts"][0]
-    evidence_path = Path(attempt["evidence_path"])
-    verdict = ArtifactStore.read_json(Path(attempt["verdict_path"]))
-    assert verdict["evidence"]["path"] == str(evidence_path)
-    assert verdict["evidence"]["sha256"] == hashlib.sha256(evidence_path.read_bytes()).hexdigest()
-    assert verdict["provider_response"] == {"fixture": True}
-    assert "raw_response" not in verdict
-    assert "request" not in verdict

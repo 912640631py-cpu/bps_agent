@@ -56,13 +56,9 @@ class RuntimeResources:
             with suppress(Exception):
                 self.dut.close()
         with suppress(Exception):
-            close_bps = getattr(self.bps, "close", None)
-            if close_bps is not None:
-                close_bps()
+            self.bps.close()
         with suppress(Exception):
-            close_judge = getattr(self.judge, "close", None)
-            if close_judge is not None:
-                close_judge()
+            self.judge.close()
 
 
 def run_credential_requirements(

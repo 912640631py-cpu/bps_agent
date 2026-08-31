@@ -5,7 +5,18 @@ from typing import Any
 
 import pytest
 
-from bps_agent.models.config import AppConfig
+from bps_agent.models.config import AppConfig, BpsConfig
+
+
+@pytest.fixture
+def bps_config() -> BpsConfig:
+    return BpsConfig(
+        endpoint="https://bps.example.test",
+        template="template",
+        slot=4,
+        ports=(4, 5),
+        group=10,
+    )
 
 
 @pytest.fixture

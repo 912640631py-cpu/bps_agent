@@ -13,11 +13,8 @@ from typing import Any
 
 import httpx
 
-from bps_agent.adapters.bps_reports import (
-    BpsProtocolError,
-    BpsReports,
-    require_success_payload,
-)
+from bps_agent.adapters.bps_protocol import BpsProtocolError, require_success_payload
+from bps_agent.adapters.bps_reports import BpsReports
 from bps_agent.http_safety import require_same_origin
 from bps_agent.models.bps import PortReservation, PortReservationStatus, RunCompletion
 from bps_agent.models.config import BpsConfig
@@ -183,12 +180,8 @@ class BpsClient:
             )
         return response
 
-    @staticmethod
-    def _require_success_payload(response: httpx.Response) -> Any:
-        return require_success_payload(response)
-
     def authenticate(self) -> None:
-        auth = self._require_success_payload(
+        auth = require_success_payload(
             self._request(
                 "POST",
                 "/bps/api/v1/auth/session",
@@ -201,7 +194,7 @@ class BpsClient:
         self._session_id = str(auth["sessionId"])
         self._api_key = str(auth["apiKey"])
         self._client.headers.update({"sessionId": self._session_id, "X-API-KEY": self._api_key})
-        self._require_success_payload(
+        require_success_payload(
             self._request(
                 "POST",
                 "/bps/api/v2/core/auth/login",
@@ -215,7 +208,7 @@ class BpsClient:
         )
 
     def find_template(self, name: str) -> dict[str, Any]:
-        payload = self._require_success_payload(
+        payload = require_success_payload(
             self._request(
                 "POST",
                 "/bps/api/v2/core/testmodel/operations/search",
@@ -235,7 +228,7 @@ class BpsClient:
                 f"expected exactly one BPS template named {name!r}, found {len(exact)}"
             )
         settings = _shared_component_settings(
-            self._require_success_payload(
+            require_success_payload(
                 self._request(
                     "POST",
                     "/api/v1/bps/tests/operations/getSharedComponentSettings",
@@ -271,7 +264,7 @@ class BpsClient:
         response.raise_for_status()
 
     def _topology(self) -> dict[str, Any]:
-        payload = self._require_success_payload(
+        payload = require_success_payload(
             self._request("GET", "/bps/api/v2/core/topology", timeout=30)
         )
         if not isinstance(payload, dict):
@@ -430,7 +423,7 @@ class BpsClient:
         param_value: int | float = (
             int(numeric_percentage) if numeric_percentage.is_integer() else numeric_percentage
         )
-        self._require_success_payload(
+        require_success_payload(
             self._request(
                 "POST",
                 "/api/v1/bps/tests/operations/setSharedComponentSettings",
@@ -448,7 +441,7 @@ class BpsClient:
         )
 
     def start_run(self) -> str:
-        payload = self._require_success_payload(
+        payload = require_success_payload(
             self._request(
                 "POST",
                 "/bps/api/v2/core/testmodel/operations/run",
@@ -463,7 +456,7 @@ class BpsClient:
         return _extract_run_id(payload)
 
     def find_running_runs(self, *, template: str, group: int) -> tuple[str, ...]:
-        payload = self._require_success_payload(
+        payload = require_success_payload(
             self._request("GET", "/bps/api/v2/core/topology/runningTest", timeout=30)
         )
         matches: list[str] = []
@@ -493,7 +486,7 @@ class BpsClient:
         return tuple(dict.fromkeys(matches))
 
     def _running_test(self, run_id: str) -> dict[str, Any] | None:
-        payload = self._require_success_payload(
+        payload = require_success_payload(
             self._request("GET", "/bps/api/v2/core/topology/runningTest", timeout=30)
         )
         aliases = _run_aliases(run_id)
@@ -583,7 +576,7 @@ class BpsClient:
         )
 
     def stop_run(self, run_id: str) -> None:
-        self._require_success_payload(
+        require_success_payload(
             self._request(
                 "POST",
                 "/bps/api/v2/core/testmodel/operations/stopRun",

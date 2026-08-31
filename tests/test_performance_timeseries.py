@@ -95,26 +95,36 @@ def test_classifies_deterministic_throughput_patterns(
     assert analysis.events
 
 
-def test_flow_rate_only_corroborates_a_throughput_event(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("throughput_overrides", "expected", "corroborates_event"),
+    [
+        (
+            {9: 85, 10: 85, 11: 85},
+            PerformanceAssessment.PERFORMANCE_ANOMALY,
+            True,
+        ),
+        ({}, PerformanceAssessment.NORMAL, False),
+    ],
+)
+def test_flow_rate_is_only_auxiliary_to_throughput_events(
+    tmp_path: Path,
+    throughput_overrides: dict[int, float],
+    expected: PerformanceAssessment,
+    corroborates_event: bool,
+) -> None:
     analysis = analyze_performance_timeseries(
         _report(
             tmp_path,
-            throughput_overrides={9: 85, 10: 85, 11: 85},
+            throughput_overrides=throughput_overrides,
             flow_rate_overrides={9: 5, 10: 5, 11: 5},
         )
     )
 
-    assert analysis.assessment == PerformanceAssessment.PERFORMANCE_ANOMALY
-    assert analysis.events[0].flow_rate_auxiliary_change is True
-
-
-def test_flow_rate_change_alone_is_not_a_performance_anomaly(tmp_path: Path) -> None:
-    analysis = analyze_performance_timeseries(
-        _report(tmp_path, flow_rate_overrides={9: 2, 10: 2, 11: 2})
-    )
-
-    assert analysis.assessment == PerformanceAssessment.NORMAL
-    assert analysis.events == ()
+    assert analysis.assessment == expected
+    if corroborates_event:
+        assert analysis.events[0].flow_rate_auxiliary_change is True
+    else:
+        assert analysis.events == ()
 
 
 def test_early_stable_baseline_is_not_polluted_by_a_long_degradation(
