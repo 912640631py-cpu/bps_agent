@@ -5,7 +5,8 @@ from pathlib import Path
 import pytest
 
 from bps_agent.config import load_config
-from bps_agent.models import AppConfig, DutCollectionMethod, DutConfig, EvaluationMode
+from bps_agent.models.common import DutCollectionMethod, EvaluationMode
+from bps_agent.models.config import AppConfig, DutConfig
 
 
 def test_demo_configuration_matches_real_lab_defaults() -> None:
@@ -40,28 +41,23 @@ def test_demo_configuration_matches_real_lab_defaults() -> None:
     assert "lock_dir" not in config.storage.model_dump()
 
 
-def test_deprecated_fixed_max_attempts_is_accepted_but_not_persisted(
+def test_deprecated_fixed_max_attempts_is_rejected(
     app_config: AppConfig,
 ) -> None:
     document = app_config.model_dump(mode="python")
     document["evaluation"]["max_attempts"] = 6
 
-    restored = AppConfig.model_validate(document)
+    with pytest.raises(ValueError):
+        AppConfig.model_validate(document)
 
-    assert "max_attempts" not in restored.evaluation.model_dump()
 
-
-def test_legacy_flat_dut_configuration_selects_frontend_collection() -> None:
-    config = DutConfig(
-        endpoint="https://dut.example.test",
-        interfaces=("T1/1",),
-        baseline_seconds=300,
-    )
-
-    assert config.collection_method == DutCollectionMethod.FRONTEND_API
-    assert config.frontend is not None
-    assert config.frontend.endpoint == "https://dut.example.test"
-    assert config.frontend.baseline_seconds == 300
+def test_legacy_flat_dut_configuration_is_rejected() -> None:
+    with pytest.raises(ValueError):
+        DutConfig(
+            endpoint="https://dut.example.test",
+            interfaces=("T1/1",),
+            baseline_seconds=300,
+        )
 
 
 def test_structured_backend_configuration_requires_an_explicit_target() -> None:

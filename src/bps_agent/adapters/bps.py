@@ -10,7 +10,6 @@ from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 import httpx
 
@@ -19,12 +18,9 @@ from bps_agent.adapters.bps_reports import (
     BpsReports,
     require_success_payload,
 )
-from bps_agent.models import (
-    BpsConfig,
-    PortReservation,
-    PortReservationStatus,
-    RunCompletion,
-)
+from bps_agent.http_safety import require_same_origin
+from bps_agent.models.bps import PortReservation, PortReservationStatus, RunCompletion
+from bps_agent.models.config import BpsConfig
 from bps_agent.pdf_export import schedule_full_report_pdf
 
 _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
@@ -173,20 +169,12 @@ class BpsClient:
     def _url(self, path: str) -> str:
         return f"{self.config.endpoint}{path}"
 
-    @staticmethod
-    def _origin(url: str) -> tuple[str, str, int]:
-        parsed = urlsplit(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            raise BpsProtocolError(f"invalid BPS URL: {url!r}")
-        if parsed.username is not None or parsed.password is not None:
-            raise BpsProtocolError("BPS URL must not contain credentials")
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        return parsed.scheme, parsed.hostname.casefold(), port
-
     def _request(self, method: str, path_or_url: str, **kwargs: Any) -> httpx.Response:
         url = path_or_url if path_or_url.startswith("http") else self._url(path_or_url)
-        if self._origin(url) != self._origin(self.config.endpoint):
-            raise BpsProtocolError("refusing to send BPS credentials to another origin")
+        try:
+            require_same_origin(url, self.config.endpoint)
+        except ValueError as exc:
+            raise BpsProtocolError("refusing to send BPS credentials to another origin") from exc
         response = self._client.request(method, url, follow_redirects=False, **kwargs)
         if response.is_redirect:
             raise BpsProtocolError(

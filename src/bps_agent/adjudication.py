@@ -6,7 +6,7 @@ import hashlib
 from pathlib import Path
 from typing import Any
 
-from bps_agent.models import VerdictDocument
+from bps_agent.models.evaluation import VerdictDocument
 
 
 def verdict_artifact(

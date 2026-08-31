@@ -18,12 +18,12 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from bps_agent.artifacts import ArtifactStore
-from bps_agent.models import (
+from bps_agent.models.common import ObservationPhase
+from bps_agent.models.config import DutConfig
+from bps_agent.models.dut import (
     DutCaptureResult,
-    DutConfig,
     DutObservations,
     FrontendDutEvidence,
-    ObservationPhase,
     ResourceObservation,
     SupplementalSnapshot,
 )

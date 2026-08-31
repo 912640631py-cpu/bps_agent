@@ -2,15 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-from bps_agent.models import (
-    AttemptRecord,
-    DutObservations,
-    ObservationPhase,
-    PortReservation,
-    PortReservationState,
-    PortReservationStatus,
-    ResourceObservation,
-)
+from bps_agent.models.bps import PortReservation, PortReservationStatus
+from bps_agent.models.common import ObservationPhase
+from bps_agent.models.dut import DutObservations, ResourceObservation
+from bps_agent.models.evaluation import AttemptRecord
 
 
 def observation(phase: ObservationPhase, started_at: str, finished_at: str) -> ResourceObservation:
@@ -52,18 +47,15 @@ def test_duplicate_observation_phase_is_rejected() -> None:
         DutObservations.from_resource_observations((duplicate, duplicate))
 
 
-def test_legacy_attempt_reservation_boolean_migrates_to_the_single_state() -> None:
-    attempt = AttemptRecord.model_validate(
-        {
-            "number": 1,
-            "started_at": "2026-08-31T00:00:00+00:00",
-            "ports_reserved": True,
-        }
-    )
-
-    assert attempt.port_reservation_state == PortReservationState.ALL_AGENT
-    assert attempt.ports_reserved is True
-    assert "ports_reserved" not in attempt.model_dump()
+def test_legacy_attempt_reservation_boolean_is_rejected() -> None:
+    with pytest.raises(ValueError):
+        AttemptRecord.model_validate(
+            {
+                "number": 1,
+                "started_at": "2026-08-31T00:00:00+00:00",
+                "ports_reserved": True,
+            }
+        )
 
 
 def test_reservation_status_exposes_owner_semantics_without_graph_traversal() -> None:

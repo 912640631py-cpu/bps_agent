@@ -6,8 +6,8 @@ from typing import Any
 
 from bps_agent.adapters.bps import BpsClient
 from bps_agent.artifacts import ArtifactStore
-from bps_agent.models import BpsConfig
-from bps_agent.pdf_worker import PdfExportJob, run_pdf_job
+from bps_agent.models.config import BpsConfig
+from bps_agent.pdf_export import PdfExportJob, run_pdf_job
 
 
 def bps_config() -> BpsConfig:
@@ -67,6 +67,7 @@ def test_scheduler_persists_secret_free_job_and_launches_isolated_process(
         "WINDIR",
     }
     assert captured["arguments"][-2:] == ["--job", str(job_path)]
+    assert captured["arguments"][1:3] == ["-m", "bps_agent.pdf_export"]
 
 
 def test_pdf_worker_authenticates_exports_and_logs_out(

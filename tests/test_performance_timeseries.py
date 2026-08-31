@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from bps_agent.models import PerformanceAnalysisThresholds, PerformanceAssessment
+from bps_agent.models.common import PerformanceAssessment
+from bps_agent.models.performance import PerformanceAnalysisThresholds
 from bps_agent.performance_timeseries import _align, analyze_performance_timeseries
 
 

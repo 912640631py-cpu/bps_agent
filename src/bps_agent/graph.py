@@ -11,24 +11,28 @@ from langgraph.graph import END, START, StateGraph
 
 from bps_agent.adjudication import verdict_artifact
 from bps_agent.launch import LaunchReconciliationError, RunLaunchCoordinator
-from bps_agent.models import (
+from bps_agent.models.bps import PortReservationState, PortReservationStatus
+from bps_agent.models.common import (
     ATTEMPT_BANDWIDTH_FACTORS,
-    AppConfig,
-    AttemptRecord,
-    BackendDutEvidence,
-    DutEvidence,
-    DutObservations,
     EvaluationMode,
     EvaluationOutcome,
-    EvidenceBundle,
-    FrontendDutEvidence,
     ObservationPhase,
-    PerformanceTimeseriesAnalysis,
-    PortReservationState,
-    PortReservationStatus,
     VerdictValue,
     utc_now,
 )
+from bps_agent.models.config import AppConfig
+from bps_agent.models.dut import (
+    BackendDutEvidence,
+    DutEvidence,
+    DutObservations,
+    FrontendDutEvidence,
+)
+from bps_agent.models.evaluation import (
+    CHECKPOINT_SCHEMA_VERSION,
+    AttemptRecord,
+    EvidenceBundle,
+)
+from bps_agent.models.performance import PerformanceTimeseriesAnalysis
 from bps_agent.performance_timeseries import analyze_performance_timeseries
 from bps_agent.report_sections import (
     extract_report_sections,
@@ -40,6 +44,7 @@ from bps_agent.runtime import RuntimeResources
 LOGGER = logging.getLogger(__name__)
 
 class EvaluationState(TypedDict):
+    schema_version: str
     evaluation_id: str
     config: dict[str, Any]
     template_metadata: dict[str, Any]
@@ -54,6 +59,7 @@ EvaluationServices = RuntimeResources
 
 def initial_state(evaluation_id: str, config: AppConfig) -> EvaluationState:
     return {
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "evaluation_id": evaluation_id,
         "config": config.model_dump(mode="json"),
         "template_metadata": {},

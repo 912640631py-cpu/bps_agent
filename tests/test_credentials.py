@@ -12,7 +12,8 @@ from bps_agent.credentials import (
     CredentialResolver,
     CredentialStore,
 )
-from bps_agent.models import AppConfig, DutCollectionMethod, EvaluationMode
+from bps_agent.models.common import DutCollectionMethod, EvaluationMode
+from bps_agent.models.config import AppConfig
 from bps_agent.runtime import run_credential_requirements
 
 

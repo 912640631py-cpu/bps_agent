@@ -6,9 +6,15 @@ from copy import deepcopy
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 from bps_agent.models.common import DutCollectionMethod, ObservationPhase, StrictModel
+
+
+class ExternalDutPayloadModel(BaseModel):
+    """Typed fields consumed by the Agent; device-version additions are ignored."""
+
+    model_config = ConfigDict(extra="ignore")
 
 
 def _document_has_points(value: Any) -> bool:
@@ -178,45 +184,45 @@ class SupplementalSnapshot(StrictModel):
         return {"interfaces", "hardware", "system"}.issubset(self.values)
 
 
-class CpuReading(StrictModel):
+class CpuReading(ExternalDutPayloadModel):
     timestamp: str | int | None = None
     time: str | None = None
     mgt: int | float | None = None
     data: int | float | None = None
 
 
-class CpuThresholds(StrictModel):
+class CpuThresholds(ExternalDutPayloadModel):
     mgt: int | float | None = None
     data: int | float | None = None
 
 
-class CpuMetrics(StrictModel):
+class CpuMetrics(ExternalDutPayloadModel):
     latest: CpuReading | None = None
     threshold: CpuThresholds | None = None
 
 
-class MemoryReading(StrictModel):
+class MemoryReading(ExternalDutPayloadModel):
     time: str | None = None
     percent: int | float | None = None
 
 
-class MemoryMetrics(StrictModel):
+class MemoryMetrics(ExternalDutPayloadModel):
     latest: MemoryReading | None = None
     threshold: int | float | None = None
 
 
-class SessionMetrics(StrictModel):
+class SessionMetrics(ExternalDutPayloadModel):
     time: str | None = None
     count: int | float | None = None
 
 
-class InterfaceTraffic(StrictModel):
+class InterfaceTraffic(ExternalDutPayloadModel):
     time: str | None = None
     ibps: int | float | None = None
     obps: int | float | None = None
 
 
-class BackendDutSnapshot(StrictModel):
+class BackendDutSnapshot(ExternalDutPayloadModel):
     collected_at: str
     cpu: CpuMetrics
     memory: MemoryMetrics
@@ -252,6 +258,7 @@ class BackendDutTarget(StrictModel):
 
 
 class BackendDutCaptureArtifact(StrictModel):
+    schema_version: Literal["1"]
     target: BackendDutTarget
     interfaces: tuple[str, ...]
     traffic_started_at: str | None = None
@@ -287,15 +294,6 @@ class FrontendDutEvidence(StrictModel):
     before: SupplementalSnapshot
     after: SupplementalSnapshot
     warnings: tuple[str, ...] = ()
-
-    @field_validator("observations", mode="before")
-    @classmethod
-    def upgrade_legacy_observations(cls, value: Any) -> Any:
-        if isinstance(value, (list, tuple)):
-            observations = tuple(ResourceObservation.model_validate(item) for item in value)
-            return DutObservations.from_resource_observations(observations)
-        return value
-
 
 DutEvidence = Annotated[
     BackendDutEvidence | FrontendDutEvidence,

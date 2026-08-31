@@ -9,11 +9,12 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin
 
 import httpx
 
-from bps_agent.models import BpsConfig
+from bps_agent.http_safety import require_same_origin
+from bps_agent.models.config import BpsConfig
 
 _RETRYABLE_REPORT_STATUSES = {404, 409, 500, 503}
 
@@ -50,16 +51,6 @@ class BpsReports:
         self._client = client
         self._request = request
 
-    @staticmethod
-    def _origin(url: str) -> tuple[str, str, int]:
-        parsed = urlsplit(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            raise BpsProtocolError(f"invalid BPS URL: {url!r}")
-        if parsed.username is not None or parsed.password is not None:
-            raise BpsProtocolError("BPS URL must not contain credentials")
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        return parsed.scheme, parsed.hostname.casefold(), port
-
     def report_contents(self, run_id: str) -> Any | None:
         response = self._request(
             "POST",
@@ -91,8 +82,12 @@ class BpsReports:
     ) -> Path:
         url = urljoin(f"{self._config.endpoint}/", reference)
         for _ in range(6):
-            if self._origin(url) != self._origin(self._config.endpoint):
-                raise BpsProtocolError("BPS report download escaped the authenticated origin")
+            try:
+                require_same_origin(url, self._config.endpoint)
+            except ValueError as exc:
+                raise BpsProtocolError(
+                    "BPS report download escaped the authenticated origin"
+                ) from exc
             with self._client.stream(
                 "GET", url, follow_redirects=False, timeout=timeout_seconds
             ) as response:

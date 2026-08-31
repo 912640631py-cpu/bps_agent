@@ -11,25 +11,28 @@ from langgraph.graph import END, START, StateGraph
 from bps_agent.cli import (
     EXIT_CODES,
     _configure_logging,
-    _load_resume_config,
     _parser,
     _verdict_console_fields,
 )
 from bps_agent.config import apply_overrides
-from bps_agent.models import (
-    AppConfig,
-    AttemptRecord,
+from bps_agent.models.common import (
     DutCollectionMethod,
     EvaluationMode,
     EvaluationOutcome,
-    RunOverrides,
-    VerdictDocument,
     VerdictValue,
 )
+from bps_agent.models.config import AppConfig, RunOverrides
+from bps_agent.models.evaluation import (
+    CHECKPOINT_SCHEMA_VERSION,
+    AttemptRecord,
+    VerdictDocument,
+)
+from bps_agent.resume import load_resume_config, validate_resume_request
 from bps_agent.runtime import build_judge
 
 
 class _CheckpointConfigState(TypedDict):
+    schema_version: str
     config: dict[str, Any]
 
 
@@ -81,7 +84,6 @@ def test_bps_overrides_are_validated_without_mutating_base_config(
             ports=(6, 7),
             total_bandwidth_mbps=300.0,
         ),
-        resume_id=None,
     )
 
     assert overridden.bps.template == "other-performance-template"
@@ -98,16 +100,13 @@ def test_invalid_port_overrides_are_rejected(app_config: AppConfig, ports: tuple
         apply_overrides(
             app_config,
             RunOverrides(ports=ports),
-            resume_id=None,
         )
 
 
 def test_resume_rejects_bps_overrides(app_config: AppConfig) -> None:
     with pytest.raises(ValueError, match="cannot be used with --resume"):
-        apply_overrides(
-            app_config,
-            RunOverrides(template="other-performance-template"),
-            resume_id="evaluation-id",
+        validate_resume_request(
+            "evaluation-id", RunOverrides(template="other-performance-template")
         )
 
 
@@ -117,7 +116,6 @@ def test_invalid_bandwidth_overrides_are_rejected(app_config: AppConfig, bandwid
         apply_overrides(
             app_config,
             RunOverrides(total_bandwidth_mbps=bandwidth),
-            resume_id=None,
         )
 
 
@@ -125,7 +123,6 @@ def test_cli_allows_target_above_400_for_larger_templates(app_config: AppConfig)
     overridden = apply_overrides(
         app_config,
         RunOverrides(total_bandwidth_mbps=800.0),
-        resume_id=None,
     )
 
     assert overridden.bps.total_bandwidth_mbps == 800.0
@@ -135,7 +132,6 @@ def test_cli_can_override_the_evaluation_to_bps_only(app_config: AppConfig) -> N
     overridden = apply_overrides(
         app_config,
         RunOverrides(evaluation_mode=EvaluationMode.BPS_ONLY),
-        resume_id=None,
     )
 
     assert overridden.evaluation.mode == EvaluationMode.BPS_ONLY
@@ -152,7 +148,6 @@ def test_cli_can_override_backend_dut_parameters(app_config: AppConfig) -> None:
             dut_interfaces=("T1/1", "T1/2"),
             dut_interval_seconds=10,
         ),
-        resume_id=None,
     )
 
     assert overridden.dut.collection_method == DutCollectionMethod.BACKEND_SSH
@@ -187,28 +182,20 @@ def test_parser_accepts_repeatable_dut_backend_overrides() -> None:
 
 def test_resume_rejects_dut_override(app_config: AppConfig) -> None:
     with pytest.raises(ValueError, match="cannot be used with --resume"):
-        apply_overrides(
-            app_config,
-            RunOverrides(dut_host="10.66.246.156"),
-            resume_id="evaluation-id",
-        )
+        validate_resume_request("evaluation-id", RunOverrides(dut_host="10.66.246.156"))
 
 
 def test_resume_rejects_bandwidth_override(app_config: AppConfig) -> None:
     with pytest.raises(ValueError, match="cannot be used with --resume"):
-        apply_overrides(
-            app_config,
-            RunOverrides(total_bandwidth_mbps=300.0),
-            resume_id="evaluation-id",
+        validate_resume_request(
+            "evaluation-id", RunOverrides(total_bandwidth_mbps=300.0)
         )
 
 
 def test_resume_rejects_bps_only_override(app_config: AppConfig) -> None:
     with pytest.raises(ValueError, match="cannot be used with --resume"):
-        apply_overrides(
-            app_config,
-            RunOverrides(evaluation_mode=EvaluationMode.BPS_ONLY),
-            resume_id="evaluation-id",
+        validate_resume_request(
+            "evaluation-id", RunOverrides(evaluation_mode=EvaluationMode.BPS_ONLY)
         )
 
 
@@ -219,23 +206,53 @@ def test_resume_loads_runtime_configuration_from_checkpoint(app_config: AppConfi
     builder.add_edge("finish", END)
     invocation = {"configurable": {"thread_id": "resume-config"}}
     checkpoint_config = app_config.model_dump(mode="json")
-    checkpoint_config["storage"]["lock_dir"] = ".state/legacy-locks"
-    checkpoint_config["evaluation"]["max_attempts"] = 6
     with SqliteSaver.from_conn_string(str(app_config.storage.checkpoint_db)) as saver:
-        builder.compile(checkpointer=saver).invoke({"config": checkpoint_config}, config=invocation)
+        builder.compile(checkpointer=saver).invoke(
+            {"schema_version": CHECKPOINT_SCHEMA_VERSION, "config": checkpoint_config},
+            config=invocation,
+        )
 
     changed = app_config.model_copy(
         update={
             "bps": app_config.bps.model_copy(
                 update={"endpoint": "https://new-bps.example.test", "ports": (8, 9)}
             ),
-            "dut": app_config.dut.model_copy(update={"endpoint": "https://new-dut.example.test"}),
+            "dut": app_config.dut.model_copy(
+                update={
+                    "frontend": app_config.dut.frontend.model_copy(
+                        update={"endpoint": "https://new-dut.example.test"}
+                    )
+                }
+            ),
         }
     )
 
-    restored = _load_resume_config(changed, "resume-config")
+    restored = load_resume_config(changed, "resume-config")
 
     assert restored == app_config
+
+
+@pytest.mark.parametrize("checkpoint_version", [None, "0"])
+def test_resume_rejects_unsupported_checkpoint_schema(
+    app_config: AppConfig,
+    checkpoint_version: str | None,
+) -> None:
+    builder = StateGraph(_CheckpointConfigState)
+    builder.add_node("finish", lambda _state: {})
+    builder.add_edge(START, "finish")
+    builder.add_edge("finish", END)
+    thread_id = f"unsupported-schema-{checkpoint_version}"
+    state: dict[str, Any] = {"config": app_config.model_dump(mode="json")}
+    if checkpoint_version is not None:
+        state["schema_version"] = checkpoint_version
+    with SqliteSaver.from_conn_string(str(app_config.storage.checkpoint_db)) as saver:
+        builder.compile(checkpointer=saver).invoke(
+            state,  # type: ignore[arg-type]
+            config={"configurable": {"thread_id": thread_id}},
+        )
+
+    with pytest.raises(ValueError, match="Unsupported checkpoint version"):
+        load_resume_config(app_config, thread_id)
 
 
 def test_console_verdict_contains_the_complete_parsed_document() -> None:

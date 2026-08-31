@@ -11,11 +11,10 @@ from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
 
-from bps_agent.models import (
+from bps_agent.models.common import PerformanceAssessment, PerformancePhase
+from bps_agent.models.performance import (
     PerformanceAnalysisThresholds,
-    PerformanceAssessment,
     PerformanceDiagnosticEvent,
-    PerformancePhase,
     PerformancePhaseWindow,
     PerformanceStableBaseline,
     PerformanceTimeseriesAnalysis,

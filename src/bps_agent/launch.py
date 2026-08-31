@@ -8,7 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 from bps_agent.artifacts import ArtifactStore
-from bps_agent.models import utc_now
+from bps_agent.models.common import utc_now
 from bps_agent.ports import BpsPort
 
 

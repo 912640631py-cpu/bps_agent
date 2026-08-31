@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from bps_agent.artifacts import ArtifactStore
-from bps_agent.models import BpsConfig
+from bps_agent.models.config import BpsConfig
 
 
 def test_artifact_store_rejects_path_traversal(tmp_path: Path) -> None:

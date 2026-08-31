@@ -1,6 +1,6 @@
 """LangGraph BPS performance-test evaluation agent."""
 
-from bps_agent.models import EvaluationOutcome, VerdictValue
+from bps_agent.models.common import EvaluationOutcome, VerdictValue
 
 __all__ = ["EvaluationOutcome", "VerdictValue"]
 

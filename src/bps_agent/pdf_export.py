@@ -14,7 +14,8 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 from bps_agent.artifacts import ArtifactStore
-from bps_agent.models import BpsConfig, utc_now
+from bps_agent.models.common import utc_now
+from bps_agent.models.config import BpsConfig
 
 LOGGER = logging.getLogger(__name__)
 
@@ -139,7 +140,7 @@ def schedule_full_report_pdf(
         creation_flags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
     try:
         subprocess.Popen(
-            [sys.executable, "-m", "bps_agent.pdf_worker", "--job", str(job_path)],
+            [sys.executable, "-m", "bps_agent.pdf_export", "--job", str(job_path)],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -161,3 +162,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--job", type=Path, required=True)
     arguments = parser.parse_args(argv)
     return run_pdf_job(arguments.job)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from bps_agent.models import AppConfig
+from bps_agent.models.config import AppConfig
 from bps_agent.runtime import RuntimeResources, build_runtime
 
 
@@ -70,6 +70,7 @@ def test_build_runtime_constructs_and_closes_the_selected_resources(
             "DUT_FRONTEND_PASSWORD": "dut-password",
             app_config.llm.selected.token_env: "token",
         },
+        captcha_reader=lambda _image, _media_type: "captcha",
     )
 
     assert isinstance(resources, RuntimeResources)

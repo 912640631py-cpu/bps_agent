@@ -8,7 +8,9 @@ from typing import Any
 
 import httpx
 
-from bps_agent.models import EvidenceBundle, ProviderConfig, ReasoningEffort, VerdictDocument
+from bps_agent.models.common import ReasoningEffort
+from bps_agent.models.config import ProviderConfig
+from bps_agent.models.evaluation import EvidenceBundle, VerdictDocument
 
 _RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504}
 _COMPATIBILITY_FEATURE_MARKERS = (

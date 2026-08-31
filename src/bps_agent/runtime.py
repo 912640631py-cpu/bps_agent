@@ -11,8 +11,10 @@ from bps_agent.adapters.bps import BpsClient
 from bps_agent.adapters.deepseek import DeepSeekJudge
 from bps_agent.artifacts import ArtifactStore
 from bps_agent.credentials import CredentialRequirement
-from bps_agent.dut_runtime import dut_runtime_spec, read_captcha
-from bps_agent.models import AppConfig, EvaluationMode, EvidenceBundle
+from bps_agent.dut_runtime import CaptchaReader, dut_runtime_spec
+from bps_agent.models.common import EvaluationMode
+from bps_agent.models.config import AppConfig
+from bps_agent.models.evaluation import EvidenceBundle
 from bps_agent.ports import BpsPort, Clock, DutPort, JudgePort
 
 _BPS_CREDENTIALS = (
@@ -99,6 +101,7 @@ def build_runtime(
     config: AppConfig,
     credentials: dict[str, str],
     *,
+    captcha_reader: CaptchaReader,
     stop_before_llm: bool = False,
 ) -> RuntimeResources:
     judge: DeepSeekJudge | EvidenceOnlyJudge = EvidenceOnlyJudge()
@@ -118,7 +121,7 @@ def build_runtime(
         if config.evaluation.mode == EvaluationMode.BPS_AND_DUT:
             assert config.dut is not None
             dut = dut_runtime_spec(config.dut.collection_method).build_adapter(
-                config.dut, credentials, read_captcha
+                config.dut, credentials, captcha_reader
             )
         return RuntimeResources(
             config=config,

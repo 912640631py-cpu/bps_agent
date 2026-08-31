@@ -15,14 +15,9 @@ from bps_agent.adapters.deepseek import (
     ProviderResponseError,
 )
 from bps_agent.adapters.dut import DutClient
-from bps_agent.models import (
-    BpsConfig,
-    DutConfig,
-    ObservationPhase,
-    PortReservationState,
-    ProviderConfig,
-    SupplementalSnapshot,
-)
+from bps_agent.models.bps import PortReservationState
+from bps_agent.models.config import BpsConfig, DutConfig, DutFrontendConfig, ProviderConfig
+from bps_agent.models.dut import DutCollectionMethod, ObservationPhase, SupplementalSnapshot
 
 
 def test_bps_run_contract_never_forces_reservation() -> None:
@@ -266,10 +261,13 @@ def test_dut_contract_reads_history_once_and_filters_the_traffic_window() -> Non
     http = httpx.Client(transport=httpx.MockTransport(handler))
     client = DutClient(
         DutConfig(
-            endpoint="https://dut.example.test",
+            collection_method=DutCollectionMethod.FRONTEND_API,
             interfaces=("T1/1", "T1/2"),
-            period="three-hour-fixture",
-            read_retry_backoff_seconds=0,
+            frontend=DutFrontendConfig(
+                endpoint="https://dut.example.test",
+                period="three-hour-fixture",
+                read_retry_backoff_seconds=0,
+            ),
         ),
         username="user",
         password="password",

@@ -6,13 +6,9 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
 
-from bps_agent.models import (
-    DutCaptureResult,
-    EvidenceBundle,
-    PortReservationStatus,
-    RunCompletion,
-    VerdictDocument,
-)
+from bps_agent.models.bps import PortReservationStatus, RunCompletion
+from bps_agent.models.dut import DutCaptureResult
+from bps_agent.models.evaluation import EvidenceBundle, VerdictDocument
 
 
 class Clock(Protocol):

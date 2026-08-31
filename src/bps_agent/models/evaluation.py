@@ -18,10 +18,10 @@ from bps_agent.models.common import (
 from bps_agent.models.config import AssessmentConfig
 from bps_agent.models.dut import (
     DutEvidence,
-    ResourceObservation,
-    SupplementalSnapshot,
 )
 from bps_agent.models.performance import PerformanceTimeseriesAnalysis
+
+CHECKPOINT_SCHEMA_VERSION = "1"
 
 
 class VerdictDocument(BaseModel):
@@ -50,35 +50,6 @@ class EvidenceBundle(StrictModel):
     dut_evidence: DutEvidence | None = None
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
 
-    @model_validator(mode="before")
-    @classmethod
-    def upgrade_legacy_dut_evidence(cls, value: Any) -> Any:
-        if not isinstance(value, dict):
-            return value
-        document = dict(value)
-        legacy_names = (
-            "dut_endpoint",
-            "dut_interfaces",
-            "dut_observations",
-            "dut_before",
-            "dut_after",
-        )
-        has_legacy_evidence = all(document.get(name) is not None for name in legacy_names)
-        if "dut_evidence" not in document and has_legacy_evidence:
-            document["dut_evidence"] = {
-                "collection_method": DutCollectionMethod.FRONTEND_API.value,
-                "endpoint": document["dut_endpoint"],
-                "interfaces": document["dut_interfaces"],
-                "traffic_started_at": document.get("traffic_started_at"),
-                "traffic_finished_at": document.get("traffic_finished_at"),
-                "observations": document["dut_observations"],
-                "before": document["dut_before"],
-                "after": document["dut_after"],
-            }
-        for name in legacy_names:
-            document.pop(name, None)
-        return document
-
     @model_validator(mode="after")
     def validate_evidence_for_mode(self) -> EvidenceBundle:
         if self.evaluation_mode == EvaluationMode.BPS_AND_DUT and self.dut_evidence is None:
@@ -105,9 +76,6 @@ class AttemptRecord(StrictModel):
     traffic_finished_at: str | None = None
     bps_template_metadata: dict[str, Any] = Field(default_factory=dict)
     bps_run_details: dict[str, Any] = Field(default_factory=dict)
-    dut_observations: tuple[ResourceObservation, ...] = ()
-    dut_before: SupplementalSnapshot | None = None
-    dut_after: SupplementalSnapshot | None = None
     dut_collection_method: DutCollectionMethod | None = None
     dut_raw_artifact_path: str | None = None
     dut_csv_artifact_path: str | None = None
@@ -125,21 +93,6 @@ class AttemptRecord(StrictModel):
     port_reservation_state: PortReservationState = PortReservationState.NONE
     terminal_confirmed: bool = False
     errors: tuple[str, ...] = ()
-
-    @model_validator(mode="before")
-    @classmethod
-    def upgrade_legacy_port_reservation(cls, value: Any) -> Any:
-        if not isinstance(value, dict):
-            return value
-        document = dict(value)
-        legacy_reserved = document.pop("ports_reserved", None)
-        if "port_reservation_state" not in document and legacy_reserved is True:
-            document["port_reservation_state"] = PortReservationState.ALL_AGENT.value
-        return document
-
-    @property
-    def ports_reserved(self) -> bool:
-        return self.port_reservation_state == PortReservationState.ALL_AGENT
 
     @model_validator(mode="after")
     def valid_number(self) -> AttemptRecord:

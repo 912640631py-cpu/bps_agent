@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
 from bps_agent.models.common import (
-    ATTEMPT_BANDWIDTH_FACTORS,
     DutCollectionMethod,
     EvaluationMode,
     ReasoningEffort,
@@ -97,27 +96,6 @@ class DutConfig(StrictModel):
     backend: DutBackendConfig | None = None
     frontend: DutFrontendConfig | None = None
 
-    @model_validator(mode="before")
-    @classmethod
-    def upgrade_legacy_frontend_config(cls, value: Any) -> Any:
-        if not isinstance(value, dict) or "endpoint" not in value:
-            return value
-        document = dict(value)
-        legacy_names = {
-            "endpoint",
-            "verify_tls",
-            "cooldown_seconds",
-            "keepalive_interval_seconds",
-            "baseline_seconds",
-            "read_attempts",
-            "read_retry_backoff_seconds",
-            "period",
-        }
-        frontend = {name: document.pop(name) for name in legacy_names if name in document}
-        document.setdefault("collection_method", DutCollectionMethod.FRONTEND_API.value)
-        document.setdefault("frontend", frontend)
-        return document
-
     @field_validator("interfaces")
     @classmethod
     def validate_interfaces(cls, value: tuple[str, ...]) -> tuple[str, ...]:
@@ -130,9 +108,10 @@ class DutConfig(StrictModel):
 
     @model_validator(mode="after")
     def require_selected_configuration(self) -> DutConfig:
-        from bps_agent.dut_runtime import dut_runtime_spec
-
-        dut_runtime_spec(self.collection_method).validate_config(self)
+        if self.collection_method == DutCollectionMethod.BACKEND_SSH and self.backend is None:
+            raise ValueError("backend_ssh DUT collection requires dut.backend")
+        if self.collection_method == DutCollectionMethod.FRONTEND_API and self.frontend is None:
+            raise ValueError("frontend_api DUT collection requires dut.frontend")
         return self
 
 
@@ -195,19 +174,6 @@ class StorageConfig(StrictModel):
 
 class EvaluationConfig(StrictModel):
     mode: EvaluationMode = EvaluationMode.BPS_AND_DUT
-
-    @model_validator(mode="before")
-    @classmethod
-    def discard_deprecated_fixed_attempt_count(cls, value: Any) -> Any:
-        if not isinstance(value, dict) or "max_attempts" not in value:
-            return value
-        document = dict(value)
-        configured = document.pop("max_attempts")
-        if configured != len(ATTEMPT_BANDWIDTH_FACTORS):
-            raise ValueError(
-                "the bandwidth fallback policy requires max_attempts to match its fixed length"
-            )
-        return document
 
 
 class AppConfig(StrictModel):

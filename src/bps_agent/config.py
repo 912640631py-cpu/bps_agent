@@ -7,7 +7,8 @@ from typing import Any
 
 import yaml
 
-from bps_agent.models import AppConfig, EvaluationMode, RunOverrides
+from bps_agent.models.common import EvaluationMode
+from bps_agent.models.config import AppConfig, RunOverrides
 
 
 def load_config(
@@ -37,13 +38,9 @@ def load_config(
 def apply_overrides(
     config: AppConfig,
     overrides: RunOverrides,
-    *,
-    resume_id: str | None = None,
 ) -> AppConfig:
     """Apply the complete CLI override group through one validated interface."""
 
-    if resume_id and overrides.has_values:
-        raise ValueError("run configuration overrides cannot be used with --resume")
     document = config.model_dump(mode="python")
     if overrides.template is not None:
         cleaned = overrides.template.strip()

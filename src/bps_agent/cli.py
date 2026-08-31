@@ -8,16 +8,15 @@ import json
 import logging
 import os
 import sys
-from contextlib import suppress
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from bps_agent.adjudication import verdict_artifact
 from bps_agent.artifacts import ArtifactStore
+from bps_agent.captcha import read_captcha
 from bps_agent.config import apply_overrides, load_config
 from bps_agent.credentials import (
     SECRET_CREDENTIALS,
@@ -26,17 +25,19 @@ from bps_agent.credentials import (
     CredentialResolver,
     CredentialStore,
 )
-from bps_agent.dut_runtime import dut_runtime_spec
-from bps_agent.graph import build_graph, initial_state
-from bps_agent.models import (
-    AppConfig,
-    AttemptRecord,
+from bps_agent.graph import build_graph
+from bps_agent.models.common import (
     DutCollectionMethod,
     EvaluationMode,
     EvaluationOutcome,
-    EvidenceBundle,
-    PortReservationState,
-    RunOverrides,
+)
+from bps_agent.models.config import RunOverrides
+from bps_agent.models.evaluation import AttemptRecord, EvidenceBundle
+from bps_agent.resume import (
+    has_unsafe_reservation,
+    invoke_evaluation,
+    load_resume_config,
+    validate_resume_request,
 )
 from bps_agent.runtime import (
     RuntimeResources,
@@ -55,17 +56,6 @@ EXIT_CODES = {
 }
 
 
-def _has_unsafe_reservation(result: dict[str, Any]) -> bool:
-    attempts = result.get("attempts")
-    if not isinstance(attempts, list) or not attempts:
-        return False
-    try:
-        attempt = AttemptRecord.model_validate(attempts[-1])
-        return attempt.port_reservation_state != PortReservationState.NONE
-    except ValueError:
-        return True
-
-
 def _verdict_console_fields(result: dict[str, Any]) -> dict[str, Any] | None:
     attempts = result.get("attempts")
     if not isinstance(attempts, list) or not attempts:
@@ -79,35 +69,6 @@ def _verdict_console_fields(result: dict[str, Any]) -> dict[str, Any] | None:
     return {"parsed": verdict.model_dump(mode="json")}
 
 
-def _load_resume_config(current_config: AppConfig, resume_id: str) -> AppConfig:
-    checkpoint_db = current_config.storage.checkpoint_db
-    invocation_config: RunnableConfig = {"configurable": {"thread_id": resume_id}}
-    with SqliteSaver.from_conn_string(str(checkpoint_db)) as saver:
-        checkpoint_tuple = saver.get_tuple(invocation_config)
-    if checkpoint_tuple is None:
-        raise ValueError(f"no checkpoint exists for Evaluation Run {resume_id}")
-    channel_values = checkpoint_tuple.checkpoint.get("channel_values")
-    if not isinstance(channel_values, dict) or not isinstance(channel_values.get("config"), dict):
-        raise ValueError(f"checkpoint for Evaluation Run {resume_id} omitted its configuration")
-    checkpoint_config = dict(channel_values["config"])
-    storage = checkpoint_config.get("storage")
-    if isinstance(storage, dict) and "lock_dir" in storage:
-        checkpoint_config["storage"] = {
-            name: value for name, value in storage.items() if name != "lock_dir"
-        }
-    try:
-        restored = AppConfig.model_validate(checkpoint_config)
-    except ValueError as exc:
-        raise ValueError(
-            f"checkpoint for Evaluation Run {resume_id} contains an invalid configuration"
-        ) from exc
-    if restored.storage.checkpoint_db.resolve() != checkpoint_db.resolve():
-        raise ValueError(
-            f"checkpoint for Evaluation Run {resume_id} refers to a different checkpoint database"
-        )
-    return restored
-
-
 def run_live(
     config_path: Path,
     resume_id: str | None,
@@ -117,16 +78,16 @@ def run_live(
     overrides: RunOverrides | None = None,
 ) -> int:
     overrides = overrides or RunOverrides()
+    validate_resume_request(resume_id, overrides)
     config = apply_overrides(
         load_config(
             config_path,
             mode_override=overrides.evaluation_mode,
         ),
         overrides,
-        resume_id=resume_id,
     )
     if resume_id:
-        config = _load_resume_config(config, resume_id)
+        config = load_resume_config(config, resume_id)
     store = credential_store or CredentialStore()
     credentials = CredentialResolver(store).resolve(
         run_credential_requirements(config, stop_before_llm=stop_before_llm)
@@ -147,8 +108,13 @@ def run_live(
             print("BPS-only mode: DUT authentication and monitoring are disabled.")
         else:
             assert config.dut is not None
-            print(dut_runtime_spec(config.dut.collection_method).startup_message)
-        runtime = build_runtime(config, credentials, stop_before_llm=stop_before_llm)
+            print(f"DUT collection enabled: {config.dut.collection_method.value}")
+        runtime = build_runtime(
+            config,
+            credentials,
+            captcha_reader=read_captcha,
+            stop_before_llm=stop_before_llm,
+        )
         config.storage.checkpoint_db.parent.mkdir(parents=True, exist_ok=True)
         with SqliteSaver.from_conn_string(str(config.storage.checkpoint_db)) as saver:
             graph = build_graph(
@@ -156,32 +122,14 @@ def run_live(
                 checkpointer=saver,
                 interrupt_before=["adjudicate"] if stop_before_llm else None,
             )
+            result = invoke_evaluation(
+                graph,
+                evaluation_id,
+                config,
+                resume=resume_id is not None,
+                bps=runtime.bps,
+            )
             invocation_config = {"configurable": {"thread_id": evaluation_id}}
-            if resume_id:
-                snapshot = graph.get_state(invocation_config)
-                if not snapshot.values:
-                    raise ValueError(f"no checkpoint exists for Evaluation Run {evaluation_id}")
-            try:
-                if resume_id:
-                    result = graph.invoke(None, config=invocation_config)
-                else:
-                    result = graph.invoke(
-                        initial_state(evaluation_id, config), config=invocation_config
-                    )
-            except BaseException:
-                with suppress(Exception):
-                    snapshot = graph.get_state(invocation_config)
-                    attempts = snapshot.values.get("attempts", []) if snapshot.values else []
-                    if attempts:
-                        active = AttemptRecord.model_validate(attempts[-1])
-                        if active.bps_run_id and not active.terminal_confirmed:
-                            with suppress(Exception):
-                                runtime.bps.stop_run(active.bps_run_id)
-                            LOGGER.error(
-                                "Stop requested for BPS run %s; terminal state remains unconfirmed",
-                                active.bps_run_id,
-                            )
-                raise
             if stop_before_llm and result.get("outcome") is None:
                 snapshot = graph.get_state(invocation_config)
                 if snapshot.next != ("adjudicate",):
@@ -223,7 +171,7 @@ def run_live(
         )
         return 130
     finally:
-        if result is not None and _has_unsafe_reservation(result):
+        if result is not None and has_unsafe_reservation(result):
             LOGGER.error(
                 "BPS reservation state is ambiguous; inspect BPS before starting another Evaluation"
             )

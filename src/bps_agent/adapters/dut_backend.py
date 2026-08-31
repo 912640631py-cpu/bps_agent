@@ -17,16 +17,15 @@ import paramiko
 from pydantic import ValidationError
 
 from bps_agent.artifacts import ArtifactStore
-from bps_agent.models import (
+from bps_agent.models.config import DutBackendConfig, DutConfig
+from bps_agent.models.dut import (
     BackendDutCaptureArtifact,
     BackendDutEvidence,
     BackendDutSample,
     BackendDutSampleError,
     BackendDutSnapshot,
     BackendDutTarget,
-    DutBackendConfig,
     DutCaptureResult,
-    DutConfig,
 )
 
 _REMOTE_API_DIR = "/opt/nsfocus/web/www/api"
@@ -559,6 +558,7 @@ class DutBackendCollector:
 
     def _result_document(self) -> BackendDutCaptureArtifact:
         return BackendDutCaptureArtifact(
+            schema_version="1",
             target=BackendDutTarget(host=self._backend.host, port=self._backend.port),
             interfaces=self.config.interfaces,
             traffic_started_at=self._traffic_started_at,

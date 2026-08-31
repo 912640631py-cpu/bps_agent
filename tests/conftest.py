@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from bps_agent.models import AppConfig
+from bps_agent.models.config import AppConfig
 
 
 @pytest.fixture
@@ -24,11 +24,14 @@ def app_config(tmp_path: Path) -> AppConfig:
             "report_attempts": 2,
         },
         "dut": {
-            "endpoint": "https://dut.example.test",
+            "collection_method": "frontend_api",
             "interfaces": ["T1/1", "T1/2"],
-            "cooldown_seconds": 10,
-            "keepalive_interval_seconds": 5,
-            "read_retry_backoff_seconds": 0,
+            "frontend": {
+                "endpoint": "https://dut.example.test",
+                "cooldown_seconds": 10,
+                "keepalive_interval_seconds": 5,
+                "read_retry_backoff_seconds": 0,
+            },
         },
         "storage": {
             "artifact_dir": tmp_path / "artifacts",

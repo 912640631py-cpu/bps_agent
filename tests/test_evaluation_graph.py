@@ -16,26 +16,32 @@ from bps_agent.graph import (
     build_graph,
     initial_state,
 )
-from bps_agent.models import (
-    AppConfig,
-    BackendDutEvidence,
-    BackendDutTarget,
-    DutCaptureResult,
-    DutCollectionMethod,
-    DutObservations,
-    EvaluationMode,
-    EvaluationOutcome,
-    EvidenceBundle,
-    FrontendDutEvidence,
-    ObservationPhase,
+from bps_agent.models.bps import (
     PortReservation,
     PortReservationState,
     PortReservationStatus,
-    ResourceObservation,
     RunCompletion,
-    SupplementalSnapshot,
-    VerdictDocument,
+)
+from bps_agent.models.common import (
+    DutCollectionMethod,
+    EvaluationMode,
+    EvaluationOutcome,
+    ObservationPhase,
     VerdictValue,
+)
+from bps_agent.models.config import AppConfig
+from bps_agent.models.dut import (
+    BackendDutEvidence,
+    BackendDutTarget,
+    DutCaptureResult,
+    DutObservations,
+    FrontendDutEvidence,
+    ResourceObservation,
+    SupplementalSnapshot,
+)
+from bps_agent.models.evaluation import (
+    EvidenceBundle,
+    VerdictDocument,
 )
 
 
@@ -791,10 +797,8 @@ def test_can_stop_after_evidence_without_calling_the_llm(app_config: AppConfig) 
             "dut_after": dut_evidence["after"],
         }
     )
-    legacy_evidence = EvidenceBundle.model_validate(legacy_document)
-    upgraded = legacy_evidence.model_dump(mode="json")
-    assert "bps_report_toc" not in upgraded
-    assert isinstance(upgraded["dut_evidence"]["observations"], dict)
+    with pytest.raises(ValueError):
+        EvidenceBundle.model_validate(legacy_document)
     assert Path(result["attempts"][0]["report_toc_path"]).exists()
     assert judge.calls == 0
 
