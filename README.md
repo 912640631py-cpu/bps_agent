@@ -59,6 +59,9 @@ python -m bps_agent run -m backend_ssh `
   -dh 10.66.246.133 -dp 50023 `
   -i T1/1 -i T1/2 -s 10
 
+# 使用 DUT 前端 API 采集
+python -m bps_agent run -m frontend_api
+
 # 完成实机测试和 Evidence，在调用 LLM 前停止
 python -m bps_agent run -sb
 
@@ -135,7 +138,7 @@ python -m bps_agent replay -e artifacts\EVALUATION_ID\attempt-01\evidence.json
 
 - **BPS 时序数据**：从 BPS 报告中提取 Tx/Rx、Concurrent Flows 和 Flow Rate，按最近采样点对齐到 1 秒时间轴。程序根据 Concurrent Flows 划分 Ramp-up、Stable 和 Ramp-down，并用 Stable 开始后的前 5 个样本冻结基线；Stable 阶段约 10% 的持续下降判为异常，约 20% 的持续下降判为严重异常，Ramp-down 中吞吐随负载下降视为正常变化。
 - **DUT 前端采集**：打流前后分别采集设备、接口和系统快照；打流结束并等待冷却后，一次性读取前端 API 已记录的 CPU、内存、会话和接口流量历史数据，校正设备时钟后切分为 Baseline、During 和 Recovery 三个阶段。打流期间仅维持登录会话，不由本程序定时轮询指标。
-- **DUT 后端采集**：打流期间由独立线程按 `dut.backend.interval_seconds` 定时通过 SSH 读取 CPU、内存、会话和指定接口流量。耗时过长而错过的周期直接跳过并计入 `missed_sample_count`；完整采样和失败记录写入 JSON，紧凑时序写入 CSV。
+- **DUT 后端采集（默认）**：打流期间由独立线程按 `dut.backend.interval_seconds` 定时通过 SSH 读取 CPU、内存、会话和指定接口流量。耗时过长而错过的周期直接跳过并计入 `missed_sample_count`；完整采样和失败记录写入 JSON，紧凑时序写入 CSV。
 
 ## 产物与判定
 
