@@ -424,6 +424,8 @@ def run_graph(
     dut: FakeDut | None,
     judge: FakeJudge,
     clock: FakeClock,
+    *,
+    download_full_pdf: bool = False,
 ) -> dict[str, Any]:
     graph = build_graph(
         EvaluationServices(
@@ -433,6 +435,7 @@ def run_graph(
             judge=judge,
             artifacts=ArtifactStore(config.storage.artifact_dir),
             clock=clock,
+            download_full_pdf=download_full_pdf,
         )
     )
     return graph.invoke(initial_state("evaluation-1", config))
@@ -489,6 +492,7 @@ def test_passes_on_first_complete_attempt(app_config: AppConfig) -> None:
     assert dut.keepalive_calls == 1
     assert judge.calls == 1
     assert Path(result["final_artifact"]).exists()
+    assert not bps.pdf_started.is_set()
 
 
 def test_pdf_export_does_not_block_evaluation(app_config: AppConfig) -> None:
@@ -502,6 +506,7 @@ def test_pdf_export_does_not_block_evaluation(app_config: AppConfig) -> None:
             FakeDut(),
             FakeJudge([VerdictValue.PASS]),
             clock,
+            download_full_pdf=True,
         )
 
         assert bps.pdf_started.is_set()

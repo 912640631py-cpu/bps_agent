@@ -55,6 +55,7 @@ class RuntimeResources:
     judge: JudgePort
     clock: Clock
     artifacts: ArtifactStore
+    download_full_pdf: bool = False
 
     def close(self) -> None:
         if self.dut is not None:
@@ -102,6 +103,7 @@ def build_runtime(
     *,
     captcha_reader: CaptchaReader,
     stop_before_llm: bool = False,
+    download_full_pdf: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> RuntimeResources:
     judge: DeepSeekJudge | EvidenceOnlyJudge = EvidenceOnlyJudge()
@@ -155,6 +157,7 @@ def build_runtime(
             judge=judge,
             clock=SystemClock(),
             artifacts=ArtifactStore(config.storage.artifact_dir),
+            download_full_pdf=download_full_pdf,
         )
     except BaseException:
         if dut is not None:

@@ -62,6 +62,9 @@ python -m bps_agent run -m backend_ssh `
 # 完成实机测试和 Evidence，在调用 LLM 前停止
 python -m bps_agent run -sb
 
+# 在后台下载完整 BPS PDF 报告
+python -m bps_agent run -f
+
 # 只使用 BPS，不登录或读取 DUT
 python -m bps_agent run -bo
 
@@ -88,6 +91,7 @@ python -m bps_agent replay -e artifacts\EVALUATION_ID\attempt-01\evidence.json
 | `-i IFACE` | `--dut-interface IFACE` | DUT interface，可重复 |
 | `-s SEC` | `--dut-interval-seconds SEC` | DUT 采样周期 |
 | `-sb` | `--stop-before-llm` | Evidence-only 模式 |
+| `-f` | `--full-pdf` | 在后台下载完整 BPS PDF 报告 |
 
 `replay` 参数：
 
@@ -130,10 +134,10 @@ python -m bps_agent replay -e artifacts\EVALUATION_ID\attempt-01\evidence.json
 
 ## 产物与判定
 
-每次 Attempt 默认生成：
+每次 Attempt 的产物包括：
 
 - `bps-report.csv`：测试参数、判据和结果，内容进入 `evidence.json`。
-- `bps-report-full.pdf`：best-effort 的 BPS 完整 PDF 结果报告；关键 CSV 导出完成后，
+- `bps-report-full.pdf`：使用 `-f` 时生成的 best-effort BPS 完整 PDF 结果报告；关键 CSV 导出完成后，
   由独立进程使用自己的 BPS Session 下载，不进入 LLM Evidence。任务状态写入
   `bps-report-full.job.json`，慢速下载不会阻塞 Evidence、Verdict 或 finalize。
 - `bps-launch.json`：BPS 外部 Run 的 durable launch journal；Resume 使用它接管已启动

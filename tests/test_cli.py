@@ -59,6 +59,7 @@ def test_run_parser_accepts_template_and_port_overrides() -> None:
             "300",
             "--stop-before-llm",
             "--bps-only",
+            "-f",
         ]
     )
 
@@ -67,6 +68,7 @@ def test_run_parser_accepts_template_and_port_overrides() -> None:
     assert arguments.total_bandwidth_mbps == 300.0
     assert arguments.stop_before_llm is True
     assert arguments.bps_only is True
+    assert arguments.full_pdf is True
 
 
 def test_bps_overrides_are_validated_without_mutating_base_config(

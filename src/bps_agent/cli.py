@@ -83,6 +83,7 @@ def run_live(
     credential_store: CredentialStore | None = None,
     *,
     stop_before_llm: bool = False,
+    download_full_pdf: bool = False,
     overrides: RunOverrides | None = None,
 ) -> int:
     overrides = overrides or RunOverrides()
@@ -111,6 +112,7 @@ def run_live(
             credentials,
             captcha_reader=read_captcha,
             stop_before_llm=stop_before_llm,
+            download_full_pdf=download_full_pdf,
             progress=print,
         )
         with checkpoint_store(config.storage.checkpoint_db) as saver:
@@ -361,6 +363,12 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="collect complete live evidence, then stop before contacting the LLM",
     )
+    live.add_argument(
+        "-f",
+        "--full-pdf",
+        action="store_true",
+        help="download the complete BPS PDF report in the background",
+    )
     replay_parser = subparsers.add_parser("replay", help="re-adjudicate saved evidence")
     replay_parser.add_argument(
         "-c",
@@ -415,6 +423,7 @@ def main(argv: list[str] | None = None) -> int:
                 arguments.config,
                 arguments.resume,
                 stop_before_llm=arguments.stop_before_llm,
+                download_full_pdf=arguments.full_pdf,
                 overrides=RunOverrides(
                     template=arguments.template,
                     ports=tuple(arguments.ports) if arguments.ports is not None else None,

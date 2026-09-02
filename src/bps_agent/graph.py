@@ -659,18 +659,21 @@ def build_graph(
                     "could not read the exported BPS report",
                     code=ErrorCode.BPS_REPORT_ERROR,
                 ) from exc
-            pdf_destination = attempt_dir / "bps-report-full.pdf"
-            full_section_ids = tuple(
-                section.section_id for section in report_sections if section.parent_id is None
-            )
-            try:
-                services.bps.schedule_full_report_pdf(
-                    run_id,
-                    pdf_destination,
-                    full_section_ids,
+            if services.download_full_pdf:
+                pdf_destination = attempt_dir / "bps-report-full.pdf"
+                full_section_ids = tuple(
+                    section.section_id for section in report_sections if section.parent_id is None
                 )
-            except Exception as exc:
-                LOGGER.warning("Optional full PDF report export could not be scheduled: %s", exc)
+                try:
+                    services.bps.schedule_full_report_pdf(
+                        run_id,
+                        pdf_destination,
+                        full_section_ids,
+                    )
+                except Exception as exc:
+                    LOGGER.warning(
+                        "Optional full PDF report export could not be scheduled: %s", exc
+                    )
         except Exception as exc:
             attempt = _record_exception(attempt, "evidence collection failed", exc)
 
