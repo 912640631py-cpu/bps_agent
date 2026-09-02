@@ -39,9 +39,7 @@ def coordinator(tmp_path: Path, bps: LaunchingBps) -> RunLaunchCoordinator:
 def test_known_run_id_is_reused_without_another_start(tmp_path: Path) -> None:
     bps = LaunchingBps()
     first = coordinator(tmp_path, bps).start("evaluation", 1, template="template", group=10)
-    recovered = coordinator(tmp_path, bps).recover(
-        "evaluation", 1, template="template", group=10
-    )
+    recovered = coordinator(tmp_path, bps).recover("evaluation", 1, template="template", group=10)
 
     assert recovered == first
     assert bps.start_calls == 1

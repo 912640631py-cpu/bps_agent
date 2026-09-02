@@ -617,9 +617,7 @@ def test_bps_port_release_can_target_only_agent_owned_subset(bps_config: BpsConf
 
     client.release_ports((4,))
 
-    assert json.loads(requests[0].content) == {
-        "unreservation": [{"slot": 4, "port": 4}]
-    }
+    assert json.loads(requests[0].content) == {"unreservation": [{"slot": 4, "port": 4}]}
 
 
 def test_bps_port_release_reports_retry_exhaustion_separately(

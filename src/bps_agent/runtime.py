@@ -69,9 +69,7 @@ def run_credential_requirements(
     requirements = list(_BPS_CREDENTIALS)
     if config.evaluation.mode == EvaluationMode.BPS_AND_DUT:
         assert config.dut is not None
-        requirements.extend(
-            dut_runtime_spec(config.dut.collection_method).credential_requirements
-        )
+        requirements.extend(dut_runtime_spec(config.dut.collection_method).credential_requirements)
     if not stop_before_llm:
         requirements.append(
             CredentialRequirement(

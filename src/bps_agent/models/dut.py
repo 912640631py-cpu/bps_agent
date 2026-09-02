@@ -96,9 +96,7 @@ class DutObservations(StrictModel):
         if not observations:
             raise ValueError("at least one DUT resource observation is required")
         phases = [item.phase for item in observations]
-        duplicate_phases = sorted(
-            {phase.value for phase in phases if phases.count(phase) > 1}
-        )
+        duplicate_phases = sorted({phase.value for phase in phases if phases.count(phase) > 1})
         if duplicate_phases:
             raise ValueError(
                 "duplicate DUT resource observation phases: " + ", ".join(duplicate_phases)
@@ -293,6 +291,7 @@ class FrontendDutEvidence(StrictModel):
     before: SupplementalSnapshot
     after: SupplementalSnapshot
     warnings: tuple[str, ...] = ()
+
 
 DutEvidence = Annotated[
     BackendDutEvidence | FrontendDutEvidence,

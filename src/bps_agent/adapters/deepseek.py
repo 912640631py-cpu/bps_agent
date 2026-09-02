@@ -183,12 +183,8 @@ class DeepSeekJudge:
     @classmethod
     def _is_compatibility_rejection(cls, response: httpx.Response) -> bool:
         details = cls._provider_error(response).casefold()
-        mentions_feature = any(
-            marker in details for marker in _COMPATIBILITY_FEATURE_MARKERS
-        )
-        rejects_feature = any(
-            marker in details for marker in _COMPATIBILITY_REJECTION_MARKERS
-        )
+        mentions_feature = any(marker in details for marker in _COMPATIBILITY_FEATURE_MARKERS)
+        rejects_feature = any(marker in details for marker in _COMPATIBILITY_REJECTION_MARKERS)
         return mentions_feature and rejects_feature
 
     def validate_compatibility(self) -> None:

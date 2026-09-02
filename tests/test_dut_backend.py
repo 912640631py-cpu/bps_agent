@@ -387,9 +387,7 @@ def test_worker_stop_timeout_closes_client_and_marks_capture_failed(tmp_path: Pa
     assert client.entered.wait(1)
 
     started = time.monotonic()
-    with pytest.raises(
-        DutBackendError, match=r"worker did not stop within 0\.02 seconds"
-    ):
+    with pytest.raises(DutBackendError, match=r"worker did not stop within 0\.02 seconds"):
         collector.traffic_finished("2026-08-27T13:54:00+08:00")
     elapsed = time.monotonic() - started
 
@@ -472,9 +470,10 @@ def test_completed_attempt_can_restore_from_atomic_metrics_artifact(tmp_path: Pa
     assert restored_client.connected == 0
 
 
-def test_restore_rejects_malformed_metrics_artifact(tmp_path: Path) -> None:
+@pytest.mark.parametrize("content", [b"{", b"\xff"], ids=["malformed-json", "invalid-utf8"])
+def test_restore_rejects_malformed_metrics_artifact(tmp_path: Path, content: bytes) -> None:
     raw_path = tmp_path / "dut-metrics.json"
-    raw_path.write_text("{", encoding="utf-8")
+    raw_path.write_bytes(content)
     collector = DutBackendCollector(
         backend_config(),
         username="dutcollector",

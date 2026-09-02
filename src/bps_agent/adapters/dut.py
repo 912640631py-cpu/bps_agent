@@ -484,7 +484,12 @@ class DutClient:
             self._before = SupplementalSnapshot.model_validate(
                 ArtifactStore.read_json(self._before_path)
             )
-        except (ValidationError, json.JSONDecodeError, OSError) as exc:
+        except (
+            ValidationError,
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            OSError,
+        ) as exc:
             raise RuntimeError("resumed frontend DUT artifact is invalid") from exc
         self._warnings = []
         self._traffic_started_at = started_at

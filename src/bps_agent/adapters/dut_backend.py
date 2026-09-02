@@ -161,9 +161,7 @@ def _read_channel_output(
         if remaining <= 0:
             with suppress(Exception):
                 channel.close()
-            raise TimeoutError(
-                f"DUT backend command exceeded {timeout_seconds:g} seconds"
-            )
+            raise TimeoutError(f"DUT backend command exceeded {timeout_seconds:g} seconds")
         time.sleep(min(_CHANNEL_POLL_INTERVAL_SECONDS, remaining))
 
     # SSH channel messages are ordered; once exit-status is visible, all preceding
@@ -449,7 +447,12 @@ class DutBackendCollector:
             raise RuntimeError("resumed backend DUT Attempt omitted dut-metrics.json")
         try:
             document = BackendDutCaptureArtifact.model_validate(ArtifactStore.read_json(raw_path))
-        except (ValidationError, json.JSONDecodeError, OSError) as exc:
+        except (
+            ValidationError,
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            OSError,
+        ) as exc:
             raise RuntimeError("resumed backend DUT metrics artifact is invalid") from exc
         if document.target.host != self._backend.host or document.target.port != self._backend.port:
             raise RuntimeError("resumed backend DUT target differs from the checkpoint")
@@ -606,8 +609,7 @@ class DutBackendCollector:
             metrics_csv=metrics_csv,
         )
         warnings = tuple(
-            f"DUT backend sample failed at {item.started_at}: {item.error}"
-            for item in self._errors
+            f"DUT backend sample failed at {item.started_at}: {item.error}" for item in self._errors
         )
         return DutCaptureResult(
             evidence=evidence,

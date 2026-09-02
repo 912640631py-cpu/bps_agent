@@ -72,9 +72,7 @@ def invoke_evaluation(
         else:
             from bps_agent.graph import initial_state
 
-            result = graph.invoke(
-                initial_state(evaluation_id, config), config=invocation_config
-            )
+            result = graph.invoke(initial_state(evaluation_id, config), config=invocation_config)
     except BaseException:
         _request_interrupted_run_stop(graph, invocation_config, bps)
         raise

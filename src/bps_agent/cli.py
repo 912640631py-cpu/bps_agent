@@ -351,9 +351,7 @@ def main(argv: list[str] | None = None) -> int:
                     template=arguments.template,
                     ports=tuple(arguments.ports) if arguments.ports is not None else None,
                     total_bandwidth_mbps=arguments.total_bandwidth_mbps,
-                    evaluation_mode=(
-                        EvaluationMode.BPS_ONLY if arguments.bps_only else None
-                    ),
+                    evaluation_mode=(EvaluationMode.BPS_ONLY if arguments.bps_only else None),
                     dut_collection_method=arguments.dut_collection_method,
                     dut_host=arguments.dut_host,
                     dut_port=arguments.dut_port,

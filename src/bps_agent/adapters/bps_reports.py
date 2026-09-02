@@ -18,6 +18,7 @@ from bps_agent.models.config import BpsConfig
 
 _RETRYABLE_REPORT_STATUSES = {404, 409, 500, 503}
 
+
 class BpsReports:
     """Deep internal module for the complete report export workflow."""
 
@@ -107,9 +108,7 @@ class BpsReports:
                         if size == 0:
                             raise BpsProtocolError("BPS report download was empty")
                         if require_pdf and b"%PDF-" not in prefix:
-                            raise BpsProtocolError(
-                                "BPS PDF export did not contain a PDF signature"
-                            )
+                            raise BpsProtocolError("BPS PDF export did not contain a PDF signature")
                         handle.flush()
                         os.fsync(handle.fileno())
                     os.replace(temporary, destination)

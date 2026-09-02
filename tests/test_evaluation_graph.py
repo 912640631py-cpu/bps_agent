@@ -569,8 +569,7 @@ def test_backend_worker_stop_timeout_makes_attempt_inconclusive(
     assert result["outcome"] == EvaluationOutcome.INCONCLUSIVE.value
     assert judge.calls == 0
     assert any(
-        "collector worker did not stop" in error
-        for error in result["attempts"][0]["errors"]
+        "collector worker did not stop" in error for error in result["attempts"][0]["errors"]
     )
 
 

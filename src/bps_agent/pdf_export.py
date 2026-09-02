@@ -77,7 +77,12 @@ class PdfExportJob(BaseModel):
 def run_pdf_job(job_path: Path) -> int:
     try:
         job = PdfExportJob.model_validate(ArtifactStore.read_json(job_path))
-    except (ValidationError, json.JSONDecodeError, OSError) as exc:
+    except (
+        ValidationError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        OSError,
+    ) as exc:
         raise RuntimeError("invalid PDF export artifact") from exc
     running = job.model_copy(update={"status": "running", "started_at": utc_now()})
     ArtifactStore.write_json(job_path, running)
@@ -103,9 +108,7 @@ def run_pdf_job(job_path: Path) -> int:
                 client.close()
     ArtifactStore.write_json(
         job_path,
-        running.model_copy(
-            update={"status": "succeeded", "finished_at": utc_now(), "error": None}
-        ),
+        running.model_copy(update={"status": "succeeded", "finished_at": utc_now(), "error": None}),
     )
     return 0
 

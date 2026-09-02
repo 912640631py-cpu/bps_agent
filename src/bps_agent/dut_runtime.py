@@ -73,9 +73,7 @@ _DUT_RUNTIME_SPECS = {
         method=DutCollectionMethod.FRONTEND_API,
         credential_requirements=(
             CredentialRequirement("DUT_FRONTEND_USERNAME", "DUT frontend username: "),
-            CredentialRequirement(
-                "DUT_FRONTEND_PASSWORD", "DUT frontend password: ", secret=True
-            ),
+            CredentialRequirement("DUT_FRONTEND_PASSWORD", "DUT frontend password: ", secret=True),
         ),
         adapter_builder=_build_frontend,
     ),

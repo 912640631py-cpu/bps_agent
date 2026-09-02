@@ -42,6 +42,7 @@ from bps_agent.runtime import RuntimeResources
 
 LOGGER = logging.getLogger(__name__)
 
+
 class EvaluationState(TypedDict):
     evaluation_id: str
     config: dict[str, Any]
@@ -171,13 +172,10 @@ def build_graph(
             )
             raise RuntimeError(
                 f"refusing to clean {reservation_label} Agent-owned BPS ports while "
-                "active Run(s) exist: "
-                + ", ".join(active_runs)
+                "active Run(s) exist: " + ", ".join(active_runs)
             )
         selected_ports = (
-            status.agent_owned_ports
-            if status.state == PortReservationState.PARTIAL_AGENT
-            else None
+            status.agent_owned_ports if status.state == PortReservationState.PARTIAL_AGENT else None
         )
         try:
             if selected_ports is None:
@@ -213,8 +211,7 @@ def build_graph(
             if status.state == PortReservationState.PARTIAL_AGENT:
                 release_agent_reservation_if_inactive(status)
             raise RuntimeError(
-                "BPS reserve did not produce a complete Agent reservation: "
-                + status.state.value
+                "BPS reserve did not produce a complete Agent reservation: " + status.state.value
             )
         return status
 
@@ -258,9 +255,7 @@ def build_graph(
         dut_started = False
         try:
             reservation = reconcile_partial_reservation(actual_reservation_status())
-            if launcher.recovery_requires_reservation(
-                state["evaluation_id"], attempt_number
-            ):
+            if launcher.recovery_requires_reservation(state["evaluation_id"], attempt_number):
                 if reservation.state == PortReservationState.ALL_AGENT:
                     active_runs = services.bps.find_active_runs_for_ports()
                     if active_runs:
@@ -405,9 +400,7 @@ def build_graph(
             completion = services.bps.wait_for_completion(monitored_run_id, lambda: None)
             if not completion.terminal:
                 raise RuntimeError("BPS adapter did not confirm a terminal run state")
-            launcher.mark_terminal(
-                state["evaluation_id"], attempt.number, monitored_run_id
-            )
+            launcher.mark_terminal(state["evaluation_id"], attempt.number, monitored_run_id)
         except Exception as exc:
             attempt = _append_error(attempt, f"BPS monitoring failed: {exc}")
             run_id = attempt.bps_run_id
@@ -652,9 +645,7 @@ def build_graph(
         attempt = _attempts(state)[-1]
         assert attempt.evidence_path is not None
         evidence_path = Path(attempt.evidence_path)
-        evidence = EvidenceBundle.model_validate(
-            services.artifacts.read_json(evidence_path)
-        )
+        evidence = EvidenceBundle.model_validate(services.artifacts.read_json(evidence_path))
         try:
             verdict, raw_response = services.judge.adjudicate(evidence)
         except Exception as exc:

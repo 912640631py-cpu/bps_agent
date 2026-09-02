@@ -38,9 +38,7 @@ class PortReservationStatus(StrictModel):
     reservations: tuple[PortReservation, ...]
 
     @classmethod
-    def classify(
-        cls, reservations: tuple[PortReservation, ...]
-    ) -> PortReservationStatus:
+    def classify(cls, reservations: tuple[PortReservation, ...]) -> PortReservationStatus:
         if any(
             reservation.owner is not None and not reservation.owned_by_agent
             for reservation in reservations

@@ -55,7 +55,12 @@ class RunLaunchCoordinator:
             return None
         try:
             intent = LaunchIntent.model_validate(self._artifacts.read_json(path))
-        except (ValidationError, json.JSONDecodeError, OSError) as exc:
+        except (
+            ValidationError,
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            OSError,
+        ) as exc:
             raise LaunchReconciliationError("invalid BPS launch artifact") from exc
         if intent.evaluation_id != evaluation_id or intent.attempt_number != attempt_number:
             raise LaunchReconciliationError(
