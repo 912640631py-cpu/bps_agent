@@ -110,8 +110,7 @@ python -m bps_agent replay -e artifacts\EVALUATION_ID\attempt-01\evidence.json
 恢复运行时不能使用模板、端口、带宽、DUT 或模式覆盖参数。
 也可以在 YAML 中设置 `evaluation.mode: bps_only`；默认值为 `bps_and_dut`。
 `dut.collection_method` 默认是 `backend_ssh`，该模式必须显式配置 `dut.backend.host`。
-采样从 BPS 打流开始持续到流量结束；错过的周期会跳过并计入
-`missed_sample_count`，不会集中补采。当前 SSH 方式不读取、校验或持久化主机密钥。
+当前 SSH 方式不读取、校验或持久化主机密钥。
 设置为 `frontend_api` 时，CAPTCHA 由操作者输入且不会保存。
 
 `llm.reasoning_effort` 控制模型推理程度，默认为 `max`，可在 `demo.yaml` 中调整。
@@ -132,6 +131,12 @@ python -m bps_agent replay -e artifacts\EVALUATION_ID\attempt-01\evidence.json
 | 5 | 60 | 15% |
 | 6 | 30 | 7.5% |
 
+## 时序数据与 DUT 采样
+
+- **BPS 时序数据**：从 BPS 报告中提取 Tx/Rx、Concurrent Flows 和 Flow Rate，按最近采样点对齐到 1 秒时间轴。程序根据 Concurrent Flows 划分 Ramp-up、Stable 和 Ramp-down，并用 Stable 开始后的前 5 个样本冻结基线；Stable 阶段约 10% 的持续下降判为异常，约 20% 的持续下降判为严重异常，Ramp-down 中吞吐随负载下降视为正常变化。
+- **DUT 前端采集**：打流前后分别采集设备、接口和系统快照；打流结束并等待冷却后，一次性读取前端 API 已记录的 CPU、内存、会话和接口流量历史数据，校正设备时钟后切分为 Baseline、During 和 Recovery 三个阶段。打流期间仅维持登录会话，不由本程序定时轮询指标。
+- **DUT 后端采集**：打流期间由独立线程按 `dut.backend.interval_seconds` 定时通过 SSH 读取 CPU、内存、会话和指定接口流量。耗时过长而错过的周期直接跳过并计入 `missed_sample_count`；完整采样和失败记录写入 JSON，紧凑时序写入 CSV。
+
 ## 产物与判定
 
 每次 Attempt 的产物包括：
@@ -149,8 +154,6 @@ python -m bps_agent replay -e artifacts\EVALUATION_ID\attempt-01\evidence.json
 - `verdict.json`：解析后的裁决、provider response、模型参数以及 Evidence 路径和 SHA-256；
   不重复保存完整 Evidence 请求。
 - TOC、Section 解析结果和 Attempt 审计文件。
-
-性能时序按最近采样点对齐到 1 秒时间轴。Stable 阶段开始后的前 5 个对齐样本用于建立冻结 baseline，后续下降不会反向污染基线。Stable 负载下，吞吐下降超过约 10% 且持续至少 3 秒判为性能异常；下降超过约 20% 且持续至少 2 秒判为严重异常。Ramp-down 中吞吐与 Concurrent Flows 同步下降视为正常负载变化。
 
 最终 Outcome：
 
