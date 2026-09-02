@@ -13,6 +13,7 @@ from urllib.parse import urljoin
 import httpx
 
 from bps_agent.adapters.bps_protocol import BpsProtocolError, require_success_payload
+from bps_agent.errors import BpsError, ErrorCode
 from bps_agent.http_safety import require_same_origin
 from bps_agent.models.config import BpsConfig
 
@@ -42,7 +43,15 @@ class BpsReports:
         )
         if response.status_code in _RETRYABLE_REPORT_STATUSES:
             return None
-        return require_success_payload(response)
+        try:
+            return require_success_payload(response)
+        except BpsProtocolError as exc:
+            code = (
+                ErrorCode.BPS_AUTH_FAILED
+                if exc.code == ErrorCode.BPS_AUTH_FAILED.value
+                else ErrorCode.BPS_REPORT_ERROR
+            )
+            raise BpsError(str(exc), code=code) from exc
 
     def wait_for_report(self, run_id: str) -> Any:
         for attempt in range(self._config.report_attempts):
@@ -51,7 +60,10 @@ class BpsReports:
                 return contents
             if attempt + 1 < self._config.report_attempts:
                 time.sleep(self._config.report_poll_interval_seconds)
-        raise TimeoutError(f"BPS report for run {run_id} did not become ready")
+        raise BpsError(
+            f"BPS report for run {run_id} did not become ready",
+            code=ErrorCode.BPS_REPORT_ERROR,
+        )
 
     def _download(
         self,
@@ -68,56 +80,100 @@ class BpsReports:
                 require_same_origin(url, self._config.endpoint)
             except ValueError as exc:
                 raise BpsProtocolError(
-                    "BPS report download escaped the authenticated origin"
+                    "BPS report download escaped the authenticated origin",
+                    code=ErrorCode.BPS_PROTOCOL_ERROR,
                 ) from exc
-            with self._client.stream(
-                "GET", url, follow_redirects=False, timeout=timeout_seconds
-            ) as response:
-                if response.is_redirect:
-                    location = response.headers.get("location")
-                    if not location:
-                        raise BpsProtocolError("BPS report redirect omitted Location")
-                    url = urljoin(url, location)
-                    continue
-                response.raise_for_status()
-                if response.headers.get("content-type", "").casefold().startswith("text/html"):
-                    raise BpsProtocolError("BPS report download unexpectedly returned HTML")
-                declared = response.headers.get("content-length")
-                if declared and declared.isdecimal() and int(declared) > max_bytes:
-                    raise BpsProtocolError("BPS report exceeds configured size limit")
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                temporary: Path | None = None
-                try:
-                    with tempfile.NamedTemporaryFile(
-                        mode="wb",
-                        prefix=f".{destination.name}.",
-                        suffix=".part",
-                        dir=destination.parent,
-                        delete=False,
-                    ) as handle:
-                        temporary = Path(handle.name)
-                        size = 0
-                        prefix = bytearray()
-                        for chunk in response.iter_bytes():
-                            size += len(chunk)
-                            if size > max_bytes:
-                                raise BpsProtocolError("BPS report exceeds configured size limit")
-                            if len(prefix) < 1024:
-                                prefix.extend(chunk[: 1024 - len(prefix)])
-                            handle.write(chunk)
-                        if size == 0:
-                            raise BpsProtocolError("BPS report download was empty")
-                        if require_pdf and b"%PDF-" not in prefix:
-                            raise BpsProtocolError("BPS PDF export did not contain a PDF signature")
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                    os.replace(temporary, destination)
-                    temporary = None
-                    return destination
-                finally:
-                    if temporary is not None:
-                        temporary.unlink(missing_ok=True)
-        raise BpsProtocolError("too many BPS report redirects")
+            try:
+                with self._client.stream(
+                    "GET", url, follow_redirects=False, timeout=timeout_seconds
+                ) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise BpsProtocolError(
+                                "BPS report redirect omitted Location",
+                                code=ErrorCode.BPS_REPORT_ERROR,
+                            )
+                        url = urljoin(url, location)
+                        continue
+                    try:
+                        response.raise_for_status()
+                    except httpx.HTTPStatusError as exc:
+                        raise BpsError(
+                            f"BPS report download failed with HTTP {response.status_code}",
+                            code=(
+                                ErrorCode.BPS_AUTH_FAILED
+                                if response.status_code in {401, 403}
+                                else ErrorCode.BPS_REPORT_ERROR
+                            ),
+                        ) from exc
+                    if response.headers.get("content-type", "").casefold().startswith("text/html"):
+                        raise BpsProtocolError(
+                            "BPS report download unexpectedly returned HTML",
+                            code=ErrorCode.BPS_REPORT_ERROR,
+                        )
+                    declared = response.headers.get("content-length")
+                    if declared and declared.isdecimal() and int(declared) > max_bytes:
+                        raise BpsProtocolError(
+                            "BPS report exceeds configured size limit",
+                            code=ErrorCode.BPS_REPORT_ERROR,
+                        )
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    temporary: Path | None = None
+                    try:
+                        with tempfile.NamedTemporaryFile(
+                            mode="wb",
+                            prefix=f".{destination.name}.",
+                            suffix=".part",
+                            dir=destination.parent,
+                            delete=False,
+                        ) as handle:
+                            temporary = Path(handle.name)
+                            size = 0
+                            prefix = bytearray()
+                            for chunk in response.iter_bytes():
+                                size += len(chunk)
+                                if size > max_bytes:
+                                    raise BpsProtocolError(
+                                        "BPS report exceeds configured size limit",
+                                        code=ErrorCode.BPS_REPORT_ERROR,
+                                    )
+                                if len(prefix) < 1024:
+                                    prefix.extend(chunk[: 1024 - len(prefix)])
+                                handle.write(chunk)
+                            if size == 0:
+                                raise BpsProtocolError(
+                                    "BPS report download was empty",
+                                    code=ErrorCode.BPS_REPORT_ERROR,
+                                )
+                            if require_pdf and b"%PDF-" not in prefix:
+                                raise BpsProtocolError(
+                                    "BPS PDF export did not contain a PDF signature",
+                                    code=ErrorCode.BPS_REPORT_ERROR,
+                                )
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                        os.replace(temporary, destination)
+                        temporary = None
+                        return destination
+                    finally:
+                        if temporary is not None:
+                            temporary.unlink(missing_ok=True)
+            except httpx.TransportError as exc:
+                raise BpsError(
+                    "BPS report download endpoint is unreachable",
+                    code=ErrorCode.BPS_UNREACHABLE,
+                ) from exc
+            except OSError as exc:
+                raise BpsError(
+                    "could not save the BPS report",
+                    code=ErrorCode.BPS_REPORT_ERROR,
+                    hint="Check the report destination and available disk space.",
+                ) from exc
+        raise BpsProtocolError(
+            "too many BPS report redirects",
+            code=ErrorCode.BPS_REPORT_ERROR,
+        )
 
     def _export_report(
         self,
@@ -130,21 +186,29 @@ class BpsReports:
         timeout_seconds: float,
         include_subsections: bool,
     ) -> Path:
-        payload = require_success_payload(
-            self._request(
-                "POST",
-                "/bps/api/v2/core/reports/operations/exportReport",
-                json={
-                    "filepath": str(destination),
-                    "runid": run_id,
-                    "reportType": report_type,
-                    "sectionIds": ",".join(section_ids),
-                    "includeSubsections": include_subsections,
-                    "dataType": self._config.report_data_type,
-                },
-                timeout=timeout_seconds,
+        try:
+            payload = require_success_payload(
+                self._request(
+                    "POST",
+                    "/bps/api/v2/core/reports/operations/exportReport",
+                    json={
+                        "filepath": str(destination),
+                        "runid": run_id,
+                        "reportType": report_type,
+                        "sectionIds": ",".join(section_ids),
+                        "includeSubsections": include_subsections,
+                        "dataType": self._config.report_data_type,
+                    },
+                    timeout=timeout_seconds,
+                )
             )
-        )
+        except BpsProtocolError as exc:
+            code = (
+                ErrorCode.BPS_AUTH_FAILED
+                if exc.code == ErrorCode.BPS_AUTH_FAILED.value
+                else ErrorCode.BPS_REPORT_ERROR
+            )
+            raise BpsError(str(exc), code=code) from exc
         reference: str | None = None
         if isinstance(payload, str):
             reference = payload.strip().strip('"')
@@ -154,7 +218,10 @@ class BpsReports:
                     reference = payload[key].strip()
                     break
         if not reference:
-            raise BpsProtocolError("BPS export response omitted a download reference")
+            raise BpsProtocolError(
+                "BPS export response omitted a download reference",
+                code=ErrorCode.BPS_REPORT_ERROR,
+            )
         return self._download(
             reference,
             destination,

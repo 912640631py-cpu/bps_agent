@@ -9,10 +9,10 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 from uuid import uuid4
 
-from langgraph.checkpoint.sqlite import SqliteSaver
+from pydantic import ValidationError
 
 from bps_agent.adjudication import verdict_artifact
 from bps_agent.artifacts import ArtifactStore
@@ -25,6 +25,13 @@ from bps_agent.credentials import (
     CredentialResolver,
     CredentialStore,
 )
+from bps_agent.errors import (
+    AgentError,
+    CliUsageError,
+    CredentialError,
+    ErrorCode,
+    ReplayError,
+)
 from bps_agent.graph import build_graph
 from bps_agent.models.common import (
     DutCollectionMethod,
@@ -34,6 +41,7 @@ from bps_agent.models.common import (
 from bps_agent.models.config import RunOverrides
 from bps_agent.models.evaluation import AttemptRecord, EvidenceBundle
 from bps_agent.resume import (
+    checkpoint_store,
     has_unsafe_reservation,
     invoke_evaluation,
     load_resume_config,
@@ -98,25 +106,14 @@ def run_live(
     try:
         if stop_before_llm:
             print("Evidence-only mode: DeepSeek will not be contacted.")
-        else:
-            print(
-                f"Checking {config.llm.provider} provider compatibility with "
-                f"reasoning_effort={config.llm.reasoning_effort}..."
-            )
-        print("Authenticating to BPS...")
-        if config.evaluation.mode == EvaluationMode.BPS_ONLY:
-            print("BPS-only mode: DUT authentication and monitoring are disabled.")
-        else:
-            assert config.dut is not None
-            print(f"DUT collection enabled: {config.dut.collection_method.value}")
         runtime = build_runtime(
             config,
             credentials,
             captcha_reader=read_captcha,
             stop_before_llm=stop_before_llm,
+            progress=print,
         )
-        config.storage.checkpoint_db.parent.mkdir(parents=True, exist_ok=True)
-        with SqliteSaver.from_conn_string(str(config.storage.checkpoint_db)) as saver:
+        with checkpoint_store(config.storage.checkpoint_db) as saver:
             graph = build_graph(
                 runtime,
                 checkpointer=saver,
@@ -133,16 +130,23 @@ def run_live(
             if stop_before_llm and result.get("outcome") is None:
                 snapshot = graph.get_state(invocation_config)
                 if snapshot.next != ("adjudicate",):
-                    raise RuntimeError(
+                    raise AgentError(
                         "evidence-only run stopped at an unexpected graph position: "
-                        f"{snapshot.next!r}"
+                        f"{snapshot.next!r}",
+                        code=ErrorCode.INTERNAL_ERROR,
                     )
                 attempts = result.get("attempts", [])
                 if not attempts:
-                    raise RuntimeError("evidence-only run stopped without an Attempt")
+                    raise AgentError(
+                        "evidence-only run stopped without an Attempt",
+                        code=ErrorCode.INTERNAL_ERROR,
+                    )
                 attempt = AttemptRecord.model_validate(attempts[-1])
                 if not attempt.evidence_complete or not attempt.evidence_path:
-                    raise RuntimeError("evidence-only run stopped without complete Evidence")
+                    raise AgentError(
+                        "evidence-only run stopped without complete Evidence",
+                        code=ErrorCode.INTERNAL_ERROR,
+                    )
                 print(
                     json.dumps(
                         {
@@ -158,18 +162,22 @@ def run_live(
         outcome = str(result["outcome"])
         print(json.dumps({"evaluation_id": evaluation_id, "outcome": outcome}, ensure_ascii=False))
         if result.get("error"):
-            print(f"Error: {result['error']}", file=sys.stderr)
+            error_code = result.get("error_code")
+            error_message = (
+                "Unexpected internal error."
+                if error_code == ErrorCode.INTERNAL_ERROR.value
+                else str(result["error"])
+            )
+            if error_code:
+                print(f"[{error_code}] {error_message}", file=sys.stderr)
+            else:
+                print(f"Error: {error_message}", file=sys.stderr)
         verdict_fields = _verdict_console_fields(result)
         if verdict_fields is not None:
             print(json.dumps(verdict_fields, ensure_ascii=False, indent=2))
         if result.get("final_artifact"):
             print(f"Audit result: {result['final_artifact']}")
         return EXIT_CODES.get(outcome, 4)
-    except KeyboardInterrupt:
-        LOGGER.error(
-            "Interrupted. Inspect BPS run and reservation state before starting another Evaluation."
-        )
-        return 130
     finally:
         if result is not None and has_unsafe_reservation(result):
             LOGGER.error(
@@ -186,7 +194,26 @@ def replay(
 ) -> int:
     config = load_config(config_path)
     store = credential_store or CredentialStore()
-    evidence = EvidenceBundle.model_validate(json.loads(evidence_path.read_text(encoding="utf-8")))
+    try:
+        evidence = EvidenceBundle.model_validate(ArtifactStore.read_json(evidence_path))
+    except FileNotFoundError as exc:
+        raise ReplayError(
+            f"replay Evidence file was not found: {evidence_path}",
+            code=ErrorCode.REPLAY_EVIDENCE_NOT_FOUND,
+            hint="Check --evidence and ensure the file exists.",
+        ) from exc
+    except OSError as exc:
+        raise ReplayError(
+            f"could not read replay Evidence file: {evidence_path}",
+            code=ErrorCode.REPLAY_EVIDENCE_IO_ERROR,
+            hint="Check the Evidence file permissions.",
+        ) from exc
+    except (json.JSONDecodeError, UnicodeDecodeError, ValidationError) as exc:
+        raise ReplayError(
+            f"replay Evidence file is invalid: {evidence_path}",
+            code=ErrorCode.REPLAY_EVIDENCE_INVALID,
+            hint="Provide a valid UTF-8 Evidence Bundle JSON file.",
+        ) from exc
     token_name = config.llm.selected.token_env
     credentials = CredentialResolver(store).resolve(
         (
@@ -235,7 +262,16 @@ def manage_credentials(arguments: argparse.Namespace, store: CredentialStore) ->
     if command == "set":
         for name in names:
             prompt = f"{name}: "
-            value = getpass.getpass(prompt) if name in SECRET_CREDENTIALS else input(prompt).strip()
+            try:
+                value = (
+                    getpass.getpass(prompt) if name in SECRET_CREDENTIALS else input(prompt).strip()
+                )
+            except (EOFError, OSError) as exc:
+                raise CredentialError(
+                    f"{name} is required",
+                    code=ErrorCode.CREDENTIAL_MISSING,
+                    hint=f"Set {name} in the environment or use an interactive terminal.",
+                ) from exc
             store.set(name, value)
             print(f"Saved {name} in the system keyring.")
         return 0
@@ -246,13 +282,22 @@ def manage_credentials(arguments: argparse.Namespace, store: CredentialStore) ->
             print(f"{name}: {'deleted' if deleted else 'not stored'}")
         return 0
 
-    raise ValueError(f"unsupported credentials command: {command}")
+    raise CliUsageError(f"unsupported credentials command: {command}")
+
+
+class AgentArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> NoReturn:
+        raise CliUsageError(message, hint="Run --help to see valid command-line options.")
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="LangGraph BPS performance-test agent")
+    parser = AgentArgumentParser(description="LangGraph BPS performance-test agent")
     parser.add_argument("--verbose", action="store_true")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True,
+        parser_class=AgentArgumentParser,
+    )
     live = subparsers.add_parser("run", help="run against real BPS with optional DUT monitoring")
     live.add_argument(
         "--config",
@@ -318,7 +363,11 @@ def _parser() -> argparse.ArgumentParser:
     credentials = subparsers.add_parser(
         "credentials", help="manage credentials in the operating-system keyring"
     )
-    credential_commands = credentials.add_subparsers(dest="credential_command", required=True)
+    credential_commands = credentials.add_subparsers(
+        dest="credential_command",
+        required=True,
+        parser_class=AgentArgumentParser,
+    )
     credential_commands.add_parser("status", help="show presence without revealing values")
     set_credentials = credential_commands.add_parser("set", help="save credentials")
     set_credentials.add_argument("names", nargs="*")
@@ -336,10 +385,17 @@ def _configure_logging(verbose: bool) -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
+def _print_agent_error(error: AgentError) -> None:
+    print(f"[{error.code}] {error}", file=sys.stderr)
+    if error.hint:
+        print(f"\nAction: {error.hint}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
-    arguments = _parser().parse_args(argv)
-    _configure_logging(arguments.verbose)
+    verbose_requested = "--verbose" in (sys.argv[1:] if argv is None else argv)
     try:
+        arguments = _parser().parse_args(argv)
+        _configure_logging(arguments.verbose)
         if arguments.command == "credentials":
             return manage_credentials(arguments, CredentialStore())
         if arguments.command == "run":
@@ -364,6 +420,26 @@ def main(argv: list[str] | None = None) -> int:
                 ),
             )
         return replay(arguments.config, arguments.evidence)
-    except Exception as exc:
-        LOGGER.error("%s", exc)
+    except KeyboardInterrupt:
+        print(
+            "Interrupted by user. Inspect active BPS runs and reservations before retrying.",
+            file=sys.stderr,
+        )
+        return 130
+    except CliUsageError as exc:
+        _print_agent_error(exc)
+        return 64
+    except AgentError as exc:
+        _print_agent_error(exc)
+        return 4
+    except Exception:
+        if verbose_requested:
+            LOGGER.exception("Unexpected internal error")
+        _print_agent_error(
+            AgentError(
+                "Unexpected internal error.",
+                code=ErrorCode.INTERNAL_ERROR,
+                hint="Re-run with --verbose and inspect the traceback.",
+            )
+        )
         return 4

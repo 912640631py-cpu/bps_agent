@@ -6,6 +6,7 @@ import hashlib
 from pathlib import Path
 from typing import Any
 
+from bps_agent.errors import ArtifactError, ErrorCode
 from bps_agent.models.evaluation import VerdictDocument
 
 
@@ -18,7 +19,13 @@ def verdict_artifact(
     provider_exchange: dict[str, Any],
     evidence_path: Path,
 ) -> dict[str, Any]:
-    evidence_bytes = evidence_path.read_bytes()
+    try:
+        evidence_bytes = evidence_path.read_bytes()
+    except OSError as exc:
+        raise ArtifactError(
+            f"could not read Evidence artifact: {evidence_path}",
+            code=ErrorCode.ARTIFACT_IO_ERROR,
+        ) from exc
     provider_response = provider_exchange.get("response", provider_exchange)
     model_parameters: dict[str, Any] = {}
     if reasoning_effort is not None:

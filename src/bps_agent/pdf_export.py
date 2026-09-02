@@ -15,6 +15,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from bps_agent.artifacts import ArtifactStore
+from bps_agent.errors import ArtifactError, BpsError, CredentialError, ErrorCode
 from bps_agent.models.common import utc_now
 from bps_agent.models.config import BpsConfig
 
@@ -83,7 +84,10 @@ def run_pdf_job(job_path: Path) -> int:
         UnicodeDecodeError,
         OSError,
     ) as exc:
-        raise RuntimeError("invalid PDF export artifact") from exc
+        raise ArtifactError(
+            "invalid PDF export artifact",
+            code=ErrorCode.ARTIFACT_IO_ERROR,
+        ) from exc
     running = job.model_copy(update={"status": "running", "started_at": utc_now()})
     ArtifactStore.write_json(job_path, running)
     client = None
@@ -91,7 +95,10 @@ def run_pdf_job(job_path: Path) -> int:
         username = os.environ.get("BPS_USERNAME", "")
         password = os.environ.get("BPS_PASSWORD", "")
         if not username or not password:
-            raise RuntimeError("PDF worker omitted BPS credentials")
+            raise CredentialError(
+                "PDF worker omitted BPS credentials",
+                code=ErrorCode.CREDENTIAL_MISSING,
+            )
         from bps_agent.adapters.bps import BpsClient
 
         client = BpsClient(job.config, username=username, password=password)
@@ -157,7 +164,11 @@ def schedule_full_report_pdf(
         )
     except OSError as exc:
         ArtifactStore.write_json(job_path, job.failed(f"could not launch PDF worker: {exc}"))
-        raise
+        raise BpsError(
+            "could not launch BPS PDF worker",
+            code=ErrorCode.BPS_REPORT_ERROR,
+            hint="Check the local Python runtime and report artifact directory.",
+        ) from exc
     finally:
         worker_environment["BPS_USERNAME"] = ""
         worker_environment["BPS_PASSWORD"] = ""

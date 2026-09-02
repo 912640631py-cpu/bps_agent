@@ -9,12 +9,15 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from bps_agent.artifacts import ArtifactStore
+from bps_agent.errors import BpsError, ErrorCode
 from bps_agent.models.common import utc_now
 from bps_agent.ports import BpsPort
 
 
-class LaunchReconciliationError(RuntimeError):
+class LaunchReconciliationError(BpsError):
     """The external launch result cannot be identified without risking a duplicate run."""
+
+    default_code = ErrorCode.BPS_LAUNCH_ERROR.value
 
 
 class LaunchIntent(BaseModel):

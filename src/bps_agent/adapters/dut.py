@@ -19,6 +19,7 @@ import httpx
 from pydantic import ValidationError
 
 from bps_agent.artifacts import ArtifactStore
+from bps_agent.errors import DutError, ErrorCode
 from bps_agent.models.common import ObservationPhase
 from bps_agent.models.config import DutConfig
 from bps_agent.models.dut import (
@@ -156,21 +157,53 @@ def encrypt_login_password(password: str) -> str:
 
 def _json_object(response: httpx.Response, operation: str) -> dict[str, Any]:
     if response.is_redirect:
-        raise RuntimeError(f"{operation} returned a redirect")
-    response.raise_for_status()
+        raise DutError(
+            f"{operation} returned a redirect",
+            code=ErrorCode.DUT_PROTOCOL_ERROR,
+        )
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        code = (
+            ErrorCode.DUT_AUTH_FAILED
+            if response.status_code in {401, 403}
+            else ErrorCode.DUT_PROTOCOL_ERROR
+        )
+        raise DutError(
+            f"{operation} failed with HTTP {response.status_code}",
+            code=code,
+        ) from exc
     try:
         document = response.json()
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"{operation} did not return JSON") from exc
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise DutError(
+            f"{operation} did not return JSON",
+            code=ErrorCode.DUT_PROTOCOL_ERROR,
+        ) from exc
     if not isinstance(document, dict):
-        raise RuntimeError(f"{operation} returned non-object JSON")
+        raise DutError(
+            f"{operation} returned non-object JSON",
+            code=ErrorCode.DUT_PROTOCOL_ERROR,
+        )
     return document
 
 
-def _require_success(document: dict[str, Any], operation: str) -> None:
-    code = document.get("code")
-    if not isinstance(code, int) or isinstance(code, bool) or code not in _SUCCESS_CODES:
-        raise RuntimeError(f"{operation} returned unsuccessful device code {code!r}")
+def _require_success(
+    document: dict[str, Any],
+    operation: str,
+    *,
+    error_code: ErrorCode = ErrorCode.DUT_PROTOCOL_ERROR,
+) -> None:
+    device_code = document.get("code")
+    if (
+        not isinstance(device_code, int)
+        or isinstance(device_code, bool)
+        or device_code not in _SUCCESS_CODES
+    ):
+        raise DutError(
+            f"{operation} returned unsuccessful device code {device_code!r}",
+            code=error_code,
+        )
 
 
 def _session_value(document: dict[str, Any], *names: str) -> str:
@@ -182,7 +215,10 @@ def _session_value(document: dict[str, Any], *names: str) -> str:
             value = container.get(name)
             if isinstance(value, str) and value:
                 return value
-    raise RuntimeError("DUT login response omitted session material")
+    raise DutError(
+        "DUT login response omitted session material",
+        code=ErrorCode.DUT_AUTH_FAILED,
+    )
 
 
 class DutClient:
@@ -223,48 +259,86 @@ class DutClient:
         return f"{self._frontend.endpoint}{path}"
 
     def authenticate(self) -> None:
-        _json_object(
-            self._client.post(self._url("/api/system/account/login/checkLoginAuth")),
-            "DUT login preflight",
-        )
-        _json_object(
-            self._client.post(
-                self._url("/api/system/account/login/checkLoginAuth"),
+        try:
+            _json_object(
+                self._client.post(self._url("/api/system/account/login/checkLoginAuth")),
+                "DUT login preflight",
+            )
+            _json_object(
+                self._client.post(
+                    self._url("/api/system/account/login/checkLoginAuth"),
+                    headers={"authType": "web"},
+                ),
+                "DUT web login preflight",
+            )
+            try:
+                challenge = self._client.get(
+                    self._url("/api/system/account/code"),
+                    params={"num": secrets.randbelow(10) + 1},
+                )
+            except httpx.TransportError as exc:
+                raise DutError(
+                    "DUT CAPTCHA could not be retrieved",
+                    code=ErrorCode.DUT_CAPTCHA_FAILED,
+                ) from exc
+            if challenge.is_redirect:
+                raise DutError(
+                    "DUT CAPTCHA returned a redirect",
+                    code=ErrorCode.DUT_CAPTCHA_FAILED,
+                )
+            try:
+                challenge.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise DutError(
+                    f"DUT CAPTCHA request failed with HTTP {challenge.status_code}",
+                    code=ErrorCode.DUT_CAPTCHA_FAILED,
+                ) from exc
+            media_type = challenge.headers.get("content-type", "application/octet-stream").split(
+                ";", 1
+            )[0]
+            if not media_type.casefold().startswith("image/"):
+                raise DutError(
+                    "DUT CAPTCHA did not return an image",
+                    code=ErrorCode.DUT_CAPTCHA_FAILED,
+                )
+            try:
+                captcha = self._captcha_reader(challenge.content, media_type).strip()
+            except DutError:
+                raise
+            except (OSError, ValueError, EOFError) as exc:
+                raise DutError(
+                    "DUT CAPTCHA could not be completed",
+                    code=ErrorCode.DUT_CAPTCHA_FAILED,
+                ) from exc
+            if not captcha:
+                raise DutError(
+                    "DUT CAPTCHA must not be empty",
+                    code=ErrorCode.DUT_CAPTCHA_FAILED,
+                )
+            response = self._client.post(
+                self._url("/api/system/account/login/login"),
                 headers={"authType": "web"},
-            ),
-            "DUT web login preflight",
-        )
-        challenge = self._client.get(
-            self._url("/api/system/account/code"),
-            params={"num": secrets.randbelow(10) + 1},
-        )
-        if challenge.is_redirect:
-            raise RuntimeError("DUT CAPTCHA returned a redirect")
-        challenge.raise_for_status()
-        media_type = challenge.headers.get("content-type", "application/octet-stream").split(
-            ";", 1
-        )[0]
-        if not media_type.casefold().startswith("image/"):
-            raise RuntimeError("DUT CAPTCHA did not return an image")
-        captcha = self._captcha_reader(challenge.content, media_type).strip()
-        if not captcha:
-            raise RuntimeError("DUT CAPTCHA must not be empty")
-        response = self._client.post(
-            self._url("/api/system/account/login/login"),
-            headers={"authType": "web"},
-            json={
-                "username": self.username,
-                "password": encrypt_login_password(self._password),
-                "vcode": captcha,
-                "lang": "zh_CN",
-                "guid": str(uuid4()),
-            },
-        )
-        document = _json_object(response, "DUT login")
-        _require_success(document, "DUT login")
-        self._api_key = _session_value(document, "api_key", "apiKey")
-        self._security_key = _session_value(document, "security_key", "securityKey")
-        self._password = ""
+                json={
+                    "username": self.username,
+                    "password": encrypt_login_password(self._password),
+                    "vcode": captcha,
+                    "lang": "zh_CN",
+                    "guid": str(uuid4()),
+                },
+            )
+            document = _json_object(response, "DUT login")
+            _require_success(document, "DUT login", error_code=ErrorCode.DUT_AUTH_FAILED)
+            self._api_key = _session_value(document, "api_key", "apiKey")
+            self._security_key = _session_value(document, "security_key", "securityKey")
+            self._password = ""
+        except DutError:
+            raise
+        except httpx.TransportError as exc:
+            raise DutError(
+                "DUT endpoint is unreachable",
+                code=ErrorCode.DUT_UNREACHABLE,
+                hint="Check the DUT endpoint, network route, and TLS settings.",
+            ) from exc
 
     @staticmethod
     def _timestamp_ms() -> int:
@@ -272,7 +346,7 @@ class DutClient:
 
     def _headers(self, path: str, timestamp_ms: int) -> dict[str, str]:
         if not self._api_key or not self._security_key:
-            raise RuntimeError("DUT client is not authenticated")
+            raise DutError("DUT client is not authenticated", code=ErrorCode.DUT_AUTH_FAILED)
         signing_text = (
             f"security-key:{self._security_key};api-key:{self._api_key};"
             f"time:{timestamp_ms};rest-uri:{path};data:"
@@ -300,6 +374,7 @@ class DutClient:
                 query["period"] = self._frontend.period
             if parameters:
                 query.update(parameters)
+            response: httpx.Response | None = None
             try:
                 response = self._client.get(
                     self._url(path), params=query, headers=self._headers(path, timestamp)
@@ -313,14 +388,35 @@ class DutClient:
                 document = _json_object(response, f"DUT GET {path}")
                 _require_success(document, f"DUT GET {path}")
                 return document
-            except (httpx.NetworkError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
+            except DutError as exc:
+                if (
+                    response is not None
+                    and response.status_code >= 400
+                    and response.status_code not in {401, 403}
+                    and not response.is_redirect
+                ):
+                    raise DutError(
+                        f"DUT collection request failed while reading {path}",
+                        code=ErrorCode.DUT_COLLECTION_ERROR,
+                    ) from exc
+                raise
+            except httpx.TransportError as exc:
                 last_error = exc
                 if attempt + 1 >= self._frontend.read_attempts:
-                    raise
+                    raise DutError(
+                        f"DUT endpoint is unreachable while reading {path}",
+                        code=ErrorCode.DUT_UNREACHABLE,
+                    ) from exc
                 time.sleep(self._frontend.read_retry_backoff_seconds * (2**attempt))
         if last_error:
-            raise last_error
-        raise RuntimeError(f"DUT GET {path} exhausted retries")
+            raise DutError(
+                f"DUT endpoint is unreachable while reading {path}",
+                code=ErrorCode.DUT_UNREACHABLE,
+            ) from last_error
+        raise DutError(
+            f"DUT GET {path} exhausted retries",
+            code=ErrorCode.DUT_COLLECTION_ERROR,
+        )
 
     def keepalive(self) -> None:
         self._get("/api/dashboards/system/systemInfo")
@@ -425,9 +521,10 @@ class DutClient:
             )
         return tuple(observations)
 
-    def collect_supplemental(self) -> SupplementalSnapshot:
+    def collect_supplemental(self, *, strict: bool = False) -> SupplementalSnapshot:
         values: dict[str, Any] = {}
         errors: dict[str, str] = {}
+        first_error: DutError | None = None
         endpoints = {
             "interfaces": "/api/dashboards/system/interface",
             "hardware": "/api/dashboards/system/hardware",
@@ -436,8 +533,19 @@ class DutClient:
         for name, path in endpoints.items():
             try:
                 values[name] = self._get(path)
+            except DutError as exc:
+                if first_error is None:
+                    first_error = exc
+                errors[name] = str(exc)
             except Exception as exc:
                 errors[name] = str(exc)
+                if first_error is None:
+                    first_error = DutError(
+                        "DUT supplemental data collection failed",
+                        code=ErrorCode.DUT_COLLECTION_ERROR,
+                    )
+        if strict and first_error is not None:
+            raise first_error
         return SupplementalSnapshot(
             captured_at=datetime.now(UTC).isoformat(), values=values, errors=errors
         )
@@ -447,15 +555,18 @@ class DutClient:
         self._warnings = []
         self._traffic_started_at = None
         self._traffic_finished_at = None
-        self._before = self.collect_supplemental()
+        self._before = self.collect_supplemental(strict=True)
         if not self._before.is_complete:
-            raise RuntimeError("required pre-traffic DUT evidence is incomplete")
+            raise DutError(
+                "required pre-traffic DUT evidence is incomplete",
+                code=ErrorCode.DUT_COLLECTION_ERROR,
+            )
         self._before_path = attempt_dir / "dut-frontend-before.json"
         ArtifactStore.write_json(self._before_path, self._before)
 
     def traffic_started(self, started_at: str) -> None:
         if self._before is None:
-            raise RuntimeError("DUT Attempt was not prepared")
+            raise DutError("DUT Attempt was not prepared", code=ErrorCode.DUT_COLLECTION_ERROR)
         self._traffic_started_at = started_at
         self._traffic_finished_at = None
         self._keepalive_stop.clear()
@@ -479,7 +590,10 @@ class DutClient:
         self._stop_keepalive()
         self._before_path = attempt_dir / "dut-frontend-before.json"
         if not self._before_path.is_file():
-            raise RuntimeError("resumed frontend DUT Attempt omitted its pre-traffic snapshot")
+            raise DutError(
+                "resumed frontend DUT Attempt omitted its pre-traffic snapshot",
+                code=ErrorCode.DUT_COLLECTION_ERROR,
+            )
         try:
             self._before = SupplementalSnapshot.model_validate(
                 ArtifactStore.read_json(self._before_path)
@@ -490,7 +604,10 @@ class DutClient:
             UnicodeDecodeError,
             OSError,
         ) as exc:
-            raise RuntimeError("resumed frontend DUT artifact is invalid") from exc
+            raise DutError(
+                "resumed frontend DUT artifact is invalid",
+                code=ErrorCode.DUT_PROTOCOL_ERROR,
+            ) from exc
         self._warnings = []
         self._traffic_started_at = started_at
         self._traffic_finished_at = finished_at
@@ -520,13 +637,24 @@ class DutClient:
         finished_at = self._traffic_finished_at
         before = self._before
         if started_at is None or finished_at is None or before is None:
-            raise RuntimeError("DUT traffic window is incomplete")
+            raise DutError("DUT traffic window is incomplete", code=ErrorCode.DUT_COLLECTION_ERROR)
         time.sleep(self._frontend.cooldown_seconds)
         after = self.collect_supplemental()
         if not after.is_complete:
-            raise RuntimeError("required post-traffic DUT evidence is incomplete")
-        observations = self.collect_monitoring_window(started_at, finished_at, before, after)
-        compact = DutObservations.from_resource_observations(observations)
+            raise DutError(
+                "required post-traffic DUT evidence is incomplete",
+                code=ErrorCode.DUT_COLLECTION_ERROR,
+            )
+        try:
+            observations = self.collect_monitoring_window(started_at, finished_at, before, after)
+            compact = DutObservations.from_resource_observations(observations)
+        except DutError:
+            raise
+        except (KeyError, ValueError) as exc:
+            raise DutError(
+                "DUT monitoring data could not be collected",
+                code=ErrorCode.DUT_COLLECTION_ERROR,
+            ) from exc
         evidence = FrontendDutEvidence(
             endpoint=self._frontend.endpoint,
             interfaces=self.config.interfaces,

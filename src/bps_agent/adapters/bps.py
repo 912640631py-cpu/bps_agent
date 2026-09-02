@@ -15,6 +15,7 @@ import httpx
 
 from bps_agent.adapters.bps_protocol import BpsProtocolError, require_success_payload
 from bps_agent.adapters.bps_reports import BpsReports
+from bps_agent.errors import BpsError, ErrorCode
 from bps_agent.http_safety import require_same_origin
 from bps_agent.models.bps import PortReservation, PortReservationStatus, RunCompletion
 from bps_agent.models.config import BpsConfig
@@ -34,12 +35,12 @@ _EXPLICIT_TERMINAL_STATES = {
 }
 
 
-class PortOccupiedError(RuntimeError):
-    pass
+class PortOccupiedError(BpsError):
+    default_code = ErrorCode.BPS_PORT_OCCUPIED.value
 
 
-class PortReleaseError(RuntimeError):
-    pass
+class PortReleaseError(BpsError):
+    default_code = ErrorCode.BPS_RESERVATION_ERROR.value
 
 
 def _normalize_list(payload: Any, names: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -171,12 +172,23 @@ class BpsClient:
         try:
             require_same_origin(url, self.config.endpoint)
         except ValueError as exc:
-            raise BpsProtocolError("refusing to send BPS credentials to another origin") from exc
-        response = self._client.request(method, url, follow_redirects=False, **kwargs)
+            raise BpsProtocolError(
+                "refusing to send BPS credentials to another origin",
+                code=ErrorCode.BPS_PROTOCOL_ERROR,
+            ) from exc
+        try:
+            response = self._client.request(method, url, follow_redirects=False, **kwargs)
+        except httpx.TransportError as exc:
+            raise BpsError(
+                "BPS endpoint is unreachable",
+                code=ErrorCode.BPS_UNREACHABLE,
+                hint="Check the BPS endpoint, network route, and TLS settings.",
+            ) from exc
         if response.is_redirect:
             raise BpsProtocolError(
                 f"unexpected BPS API redirect: {response.status_code} "
-                f"{response.headers.get('location', '<missing>')}"
+                f"{response.headers.get('location', '<missing>')}",
+                code=ErrorCode.BPS_PROTOCOL_ERROR,
             )
         return response
 
@@ -189,8 +201,17 @@ class BpsClient:
                 timeout=30,
             )
         )
-        if not isinstance(auth, dict) or not auth.get("sessionId") or not auth.get("apiKey"):
-            raise BpsProtocolError("BPS authentication response omitted session material")
+        if not isinstance(auth, dict):
+            raise BpsProtocolError(
+                "BPS authentication response is not a JSON object",
+                code=ErrorCode.BPS_PROTOCOL_ERROR,
+            )
+        if not auth.get("sessionId") or not auth.get("apiKey"):
+            raise BpsError(
+                "BPS authentication was rejected",
+                code=ErrorCode.BPS_AUTH_FAILED,
+                hint="Check BPS_USERNAME and BPS_PASSWORD.",
+            )
         self._session_id = str(auth["sessionId"])
         self._api_key = str(auth["apiKey"])
         self._client.headers.update({"sessionId": self._session_id, "X-API-KEY": self._api_key})
@@ -206,6 +227,29 @@ class BpsClient:
                 timeout=30,
             )
         )
+
+    def preflight(self) -> None:
+        """Validate the configured template and bandwidth without reserving ports."""
+
+        metadata = self.find_template(self.config.template)
+        template_bandwidth = metadata.get("totalBandwidthMbps")
+        if (
+            not isinstance(template_bandwidth, (int, float))
+            or isinstance(template_bandwidth, bool)
+            or not math.isfinite(template_bandwidth)
+            or template_bandwidth <= 0
+        ):
+            raise BpsProtocolError(
+                "BPS template metadata omitted a valid totalBandwidthMbps",
+                code=ErrorCode.BPS_PROTOCOL_ERROR,
+            )
+        if self.config.total_bandwidth_mbps > float(template_bandwidth):
+            raise BpsError(
+                f"configured Total Bandwidth {self.config.total_bandwidth_mbps:g} Mbps "
+                f"exceeds template original value {float(template_bandwidth):g} Mbps",
+                code=ErrorCode.BPS_BANDWIDTH_INVALID,
+                hint="Lower total_bandwidth_mbps or choose a larger BPS template.",
+            )
 
     def find_template(self, name: str) -> dict[str, Any]:
         payload = require_success_payload(
@@ -223,9 +267,17 @@ class BpsClient:
         )
         candidates = _normalize_list(payload, ("items", "results", "data", "models"))
         exact = [item for item in candidates if str(item.get("name", "")) == name]
-        if len(exact) != 1:
+        if not exact:
             raise BpsProtocolError(
-                f"expected exactly one BPS template named {name!r}, found {len(exact)}"
+                f"expected exactly one BPS template named {name!r}, found 0",
+                code=ErrorCode.BPS_TEMPLATE_NOT_FOUND,
+                hint="Check the configured BPS template name.",
+            )
+        if len(exact) > 1:
+            raise BpsProtocolError(
+                f"expected exactly one BPS template named {name!r}, found {len(exact)}",
+                code=ErrorCode.BPS_TEMPLATE_AMBIGUOUS,
+                hint="Remove duplicate templates or choose an exact unique name.",
             )
         settings = _shared_component_settings(
             require_success_payload(
@@ -261,7 +313,19 @@ class BpsClient:
         )
         if response.status_code in {400, 409, 423}:
             raise PortOccupiedError(f"BPS ports are unavailable (HTTP {response.status_code})")
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if response.status_code in {401, 403}:
+                raise BpsError(
+                    "BPS rejected the configured credentials",
+                    code=ErrorCode.BPS_AUTH_FAILED,
+                    hint="Check BPS_USERNAME and BPS_PASSWORD.",
+                ) from exc
+            raise BpsError(
+                f"BPS port reservation failed with HTTP {response.status_code}",
+                code=ErrorCode.BPS_RESERVATION_ERROR,
+            ) from exc
 
     def _topology(self) -> dict[str, Any]:
         payload = require_success_payload(
@@ -377,11 +441,17 @@ class BpsClient:
     def release_ports(self, ports: tuple[int, ...] | None = None) -> None:
         selected_ports = self.config.ports if ports is None else ports
         if not selected_ports:
-            raise ValueError("at least one BPS port must be selected for release")
+            raise BpsError(
+                "at least one BPS port must be selected for release",
+                code=ErrorCode.BPS_RESERVATION_ERROR,
+            )
         if len(set(selected_ports)) != len(selected_ports) or not set(selected_ports).issubset(
             self.config.ports
         ):
-            raise ValueError("released BPS ports must be a unique subset of configured ports")
+            raise BpsError(
+                "released BPS ports must be a unique subset of configured ports",
+                code=ErrorCode.BPS_RESERVATION_ERROR,
+            )
         attempts = self.config.port_release_attempts
         last_failure = "unknown failure"
         last_cause: Exception | None = None
@@ -397,6 +467,11 @@ class BpsClient:
                     },
                     timeout=60,
                 )
+            except BpsError as exc:
+                if exc.code != ErrorCode.BPS_UNREACHABLE.value:
+                    raise
+                last_failure = exc.code
+                last_cause = exc
             except httpx.TransportError as exc:
                 last_failure = type(exc).__name__
                 last_cause = exc
@@ -405,6 +480,12 @@ class BpsClient:
                 if response.is_success:
                     return
                 last_failure = f"HTTP {response.status_code}"
+                if response.status_code in {401, 403}:
+                    raise BpsError(
+                        "BPS rejected the configured credentials",
+                        code=ErrorCode.BPS_AUTH_FAILED,
+                        hint="Check BPS_USERNAME and BPS_PASSWORD.",
+                    )
                 if response.status_code not in _RETRYABLE_PORT_RELEASE_STATUSES:
                     raise PortReleaseError(
                         f"BPS rejected port release without retry ({last_failure})"
@@ -417,9 +498,18 @@ class BpsClient:
         raise PortReleaseError(message)
 
     def set_total_bandwidth(self, percentage: float) -> None:
-        numeric_percentage = float(percentage)
+        try:
+            numeric_percentage = float(percentage)
+        except (TypeError, ValueError) as exc:
+            raise BpsError(
+                "BPS total bandwidth percentage must be numeric",
+                code=ErrorCode.BPS_BANDWIDTH_INVALID,
+            ) from exc
         if not 0 < numeric_percentage <= 100:
-            raise ValueError("BPS total bandwidth percentage must be between 0 and 100")
+            raise BpsError(
+                "BPS total bandwidth percentage must be between 0 and 100",
+                code=ErrorCode.BPS_BANDWIDTH_INVALID,
+            )
         param_value: int | float = (
             int(numeric_percentage) if numeric_percentage.is_integer() else numeric_percentage
         )
@@ -537,7 +627,10 @@ class BpsClient:
                     pass
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(f"timed out waiting for BPS run {run_id}")
+                raise BpsError(
+                    f"timed out waiting for BPS run {run_id}",
+                    code=ErrorCode.BPS_RUN_TIMEOUT,
+                )
             time.sleep(min(self.config.poll_interval_seconds, remaining))
 
     def wait_for_report(self, run_id: str) -> Any:

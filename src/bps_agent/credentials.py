@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import builtins
 import getpass
 import os
+import sys
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 import keyring
 from keyring.errors import KeyringError, PasswordDeleteError
+
+from bps_agent.errors import CredentialError, ErrorCode
 
 SERVICE_NAME = "nsfocus-bps-evaluation-agent"
 SUPPORTED_CREDENTIALS = (
@@ -31,8 +35,11 @@ SECRET_CREDENTIALS = frozenset(
     }
 )
 
+_ORIGINAL_INPUT = builtins.input
+_ORIGINAL_GETPASS = getpass.getpass
 
-class CredentialStoreError(RuntimeError):
+
+class CredentialStoreError(CredentialError):
     pass
 
 
@@ -52,7 +59,10 @@ class CredentialStore:
     @staticmethod
     def validate_name(name: str) -> str:
         if name not in SUPPORTED_CREDENTIALS:
-            raise ValueError(f"unsupported credential name: {name}")
+            raise CredentialStoreError(
+                f"unsupported credential name: {name}",
+                code=ErrorCode.CREDENTIAL_STORE_ERROR,
+            )
         return name
 
     def get(self, name: str) -> str | None:
@@ -61,18 +71,35 @@ class CredentialStore:
             value = keyring.get_password(self.service_name, name)
         except KeyringError as exc:
             raise CredentialStoreError(
-                f"cannot read {name} from the system keyring: {exc}"
+                f"cannot read {name} from the system keyring",
+                code=ErrorCode.CREDENTIAL_STORE_ERROR,
+            ) from exc
+        except Exception as exc:
+            raise CredentialStoreError(
+                f"cannot read {name} from the system keyring",
+                code=ErrorCode.CREDENTIAL_STORE_ERROR,
             ) from exc
         return value if value else None
 
     def set(self, name: str, value: str) -> None:
         name = self.validate_name(name)
         if not value:
-            raise ValueError(f"credential {name} must not be empty")
+            raise CredentialError(
+                f"credential {name} must not be empty",
+                code=ErrorCode.CREDENTIAL_MISSING,
+            )
         try:
             keyring.set_password(self.service_name, name, value)
         except KeyringError as exc:
-            raise CredentialStoreError(f"cannot save {name} to the system keyring: {exc}") from exc
+            raise CredentialStoreError(
+                f"cannot save {name} to the system keyring",
+                code=ErrorCode.CREDENTIAL_STORE_ERROR,
+            ) from exc
+        except Exception as exc:
+            raise CredentialStoreError(
+                f"cannot save {name} to the system keyring",
+                code=ErrorCode.CREDENTIAL_STORE_ERROR,
+            ) from exc
 
     def delete(self, name: str) -> bool:
         name = self.validate_name(name)
@@ -84,7 +111,13 @@ class CredentialStore:
             return False
         except KeyringError as exc:
             raise CredentialStoreError(
-                f"cannot delete {name} from the system keyring: {exc}"
+                f"cannot delete {name} from the system keyring",
+                code=ErrorCode.CREDENTIAL_STORE_ERROR,
+            ) from exc
+        except Exception as exc:
+            raise CredentialStoreError(
+                f"cannot delete {name} from the system keyring",
+                code=ErrorCode.CREDENTIAL_STORE_ERROR,
             ) from exc
         return True
 
@@ -115,20 +148,40 @@ class CredentialResolver:
                 continue
             value = self._environment.get(name) or self._store.get(name)
             if not value:
-                value = (
-                    getpass.getpass(requirement.prompt)
-                    if requirement.secret
-                    else input(requirement.prompt).strip()
-                )
+                if not _stdin_is_interactive():
+                    raise CredentialError(
+                        f"{name} is required",
+                        code=ErrorCode.CREDENTIAL_MISSING,
+                        hint=f"Set {name} in the environment or system keyring.",
+                    )
+                try:
+                    value = (
+                        getpass.getpass(requirement.prompt)
+                        if requirement.secret
+                        else input(requirement.prompt).strip()
+                    )
+                except (EOFError, OSError) as exc:
+                    raise CredentialError(
+                        f"{name} is required",
+                        code=ErrorCode.CREDENTIAL_MISSING,
+                        hint=f"Set {name} in the environment or system keyring.",
+                    ) from exc
                 if not value:
-                    raise ValueError(f"{name} is required")
+                    raise CredentialError(
+                        f"{name} is required",
+                        code=ErrorCode.CREDENTIAL_MISSING,
+                        hint=f"Set {name} in the environment or system keyring.",
+                    )
                 entered[name] = value
             resolved[name] = value
 
         if entered:
-            save = input(
-                "Save all newly entered credentials in the system keyring? [y/N]: "
-            ).strip()
+            try:
+                save = input(
+                    "Save all newly entered credentials in the system keyring? [y/N]: "
+                ).strip()
+            except (EOFError, OSError):
+                save = ""
             if save.casefold() in {"y", "yes"}:
                 for name, value in entered.items():
                     self._store.set(name, value)
@@ -136,3 +189,16 @@ class CredentialResolver:
                     "Saved newly entered credentials in the system keyring: " + ", ".join(entered)
                 )
         return resolved
+
+
+def _stdin_is_interactive() -> bool:
+    """Return whether prompting is safe for this process."""
+
+    # Test callers and embedders may provide a prompt callback while stdout/stdin
+    # itself is captured or redirected.  Treat an explicit callback as interactive.
+    if builtins.input is not _ORIGINAL_INPUT or getpass.getpass is not _ORIGINAL_GETPASS:
+        return True
+    try:
+        return bool(sys.stdin.isatty())
+    except (AttributeError, OSError):
+        return False

@@ -36,11 +36,13 @@ def _build_backend(
     credentials: dict[str, str],
     _captcha_reader: CaptchaReader,
 ) -> DutPort:
-    return DutBackendCollector(
+    adapter = DutBackendCollector(
         config,
         username=credentials["DUT_BACKEND_USERNAME"],
         password=credentials["DUT_BACKEND_PASSWORD"],
     )
+    adapter.preflight()
+    return adapter
 
 
 def _build_frontend(

@@ -17,6 +17,7 @@ import paramiko
 from pydantic import ValidationError
 
 from bps_agent.artifacts import ArtifactStore
+from bps_agent.errors import DutError, ErrorCode
 from bps_agent.models.config import DutBackendConfig, DutConfig
 from bps_agent.models.dut import (
     BackendDutCaptureArtifact,
@@ -35,8 +36,10 @@ _CHANNEL_READ_SIZE = 64 * 1024
 _CHANNEL_POLL_INTERVAL_SECONDS = 0.01
 
 
-class DutBackendError(RuntimeError):
+class DutBackendError(DutError):
     """The DUT backend did not return a valid metrics snapshot."""
+
+    default_code = ErrorCode.DUT_COLLECTION_ERROR.value
 
 
 def _iso_now() -> str:
@@ -111,7 +114,10 @@ def _remote_command(interfaces: tuple[str, ...]) -> str:
 def _extract_json(stdout: str) -> dict[str, Any]:
     text = stdout.strip()
     if not text:
-        raise DutBackendError("DUT backend returned empty stdout")
+        raise DutBackendError(
+            "DUT backend returned empty stdout",
+            code=ErrorCode.DUT_PROTOCOL_ERROR,
+        )
     try:
         document = json.loads(text)
     except json.JSONDecodeError:
@@ -120,10 +126,14 @@ def _extract_json(stdout: str) -> dict[str, Any]:
             document = json.loads(lines[-1])
         except (IndexError, json.JSONDecodeError) as line_error:
             raise DutBackendError(
-                f"DUT backend returned invalid JSON: {text[:500]!r}"
+                f"DUT backend returned invalid JSON: {text[:500]!r}",
+                code=ErrorCode.DUT_PROTOCOL_ERROR,
             ) from line_error
     if not isinstance(document, dict):
-        raise DutBackendError("DUT backend JSON root is not an object")
+        raise DutBackendError(
+            "DUT backend JSON root is not an object",
+            code=ErrorCode.DUT_PROTOCOL_ERROR,
+        )
     return document
 
 
@@ -132,7 +142,10 @@ def _parse_snapshot(stdout: str, interfaces: tuple[str, ...]) -> BackendDutSnaps
         snapshot = BackendDutSnapshot.model_validate(_extract_json(stdout))
         return snapshot.require_interfaces(interfaces)
     except (ValidationError, ValueError) as exc:
-        raise DutBackendError(f"DUT backend returned an invalid metrics snapshot: {exc}") from exc
+        raise DutBackendError(
+            f"DUT backend returned an invalid metrics snapshot: {exc}",
+            code=ErrorCode.DUT_PROTOCOL_ERROR,
+        ) from exc
 
 
 def _read_channel_output(
@@ -207,20 +220,43 @@ class DutSshBackendClient:
         client = paramiko.SSHClient()
         # This temporary lab mode deliberately does not load or persist host keys.
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(
-            hostname=backend.host,
-            port=backend.port,
-            username=self.username,
-            password=self._password,
-            timeout=backend.connect_timeout_seconds,
-            banner_timeout=backend.connect_timeout_seconds,
-            auth_timeout=backend.connect_timeout_seconds,
-            look_for_keys=False,
-            allow_agent=False,
-        )
-        transport = client.get_transport()
-        if transport is not None:
-            transport.set_keepalive(15)
+        try:
+            client.connect(
+                hostname=backend.host,
+                port=backend.port,
+                username=self.username,
+                password=self._password,
+                timeout=backend.connect_timeout_seconds,
+                banner_timeout=backend.connect_timeout_seconds,
+                auth_timeout=backend.connect_timeout_seconds,
+                look_for_keys=False,
+                allow_agent=False,
+            )
+        except paramiko.AuthenticationException as exc:
+            client.close()
+            raise DutBackendError(
+                "DUT backend SSH authentication failed",
+                code=ErrorCode.DUT_AUTH_FAILED,
+                hint="Check DUT_BACKEND_USERNAME and DUT_BACKEND_PASSWORD.",
+            ) from exc
+        except (paramiko.SSHException, TimeoutError, OSError) as exc:
+            client.close()
+            raise DutBackendError(
+                "DUT backend SSH endpoint is unreachable",
+                code=ErrorCode.DUT_UNREACHABLE,
+                hint="Check the DUT backend host, port, and network route.",
+            ) from exc
+        try:
+            transport = client.get_transport()
+            if transport is not None:
+                transport.set_keepalive(15)
+        except (paramiko.SSHException, OSError) as exc:
+            client.close()
+            raise DutBackendError(
+                "DUT backend SSH endpoint is unreachable",
+                code=ErrorCode.DUT_UNREACHABLE,
+                hint="Check the DUT backend host, port, and network route.",
+            ) from exc
         self._client = client
 
     def close(self) -> None:
@@ -269,7 +305,8 @@ class DutSshBackendClient:
                 if exit_status != 0:
                     detail = stderr_text or stdout_text.strip() or "no diagnostic output"
                     raise DutBackendError(
-                        f"remote PHP collector exited with status {exit_status}: {detail[:1000]}"
+                        f"remote PHP collector exited with status {exit_status}: {detail[:1000]}",
+                        code=ErrorCode.DUT_COLLECTION_ERROR,
                     )
                 return _parse_snapshot(stdout_text, interfaces)
             except (
@@ -290,8 +327,11 @@ class DutSshBackendClient:
                     )
                     time.sleep(delay)
         assert last_error is not None
+        if isinstance(last_error, DutBackendError):
+            raise last_error
         raise DutBackendError(
-            f"failed to collect DUT backend metrics: {last_error}"
+            f"failed to collect DUT backend metrics: {last_error}",
+            code=ErrorCode.DUT_COLLECTION_ERROR,
         ) from last_error
 
 
@@ -397,6 +437,23 @@ class DutBackendCollector:
         self._lock = threading.Lock()
         self._worker_failure: str | None = None
 
+    def preflight(self) -> None:
+        """Verify SSH access and one typed metrics sample before traffic starts."""
+
+        try:
+            self._client.connect()
+            self._client.read_snapshot(self.config.interfaces)
+        except DutError:
+            raise
+        except Exception as exc:
+            raise DutBackendError(
+                "DUT backend preflight failed",
+                code=ErrorCode.DUT_COLLECTION_ERROR,
+            ) from exc
+        finally:
+            with suppress(Exception):
+                self._client.close()
+
     def prepare_attempt(self, attempt_dir: Path) -> None:
         self._stop_worker()
         self._raise_worker_failure()
@@ -415,7 +472,10 @@ class DutBackendCollector:
 
     def traffic_started(self, started_at: str) -> None:
         if self._attempt_dir is None:
-            raise RuntimeError("DUT backend Attempt was not prepared")
+            raise DutError(
+                "DUT backend Attempt was not prepared",
+                code=ErrorCode.DUT_COLLECTION_ERROR,
+            )
         self._traffic_started_at = started_at
         self._traffic_finished_at = None
         self._start_worker()
@@ -444,7 +504,10 @@ class DutBackendCollector:
         self._stop_worker()
         self._raise_worker_failure()
         if not raw_path.is_file():
-            raise RuntimeError("resumed backend DUT Attempt omitted dut-metrics.json")
+            raise DutError(
+                "resumed backend DUT Attempt omitted dut-metrics.json",
+                code=ErrorCode.DUT_COLLECTION_ERROR,
+            )
         try:
             document = BackendDutCaptureArtifact.model_validate(ArtifactStore.read_json(raw_path))
         except (
@@ -453,11 +516,20 @@ class DutBackendCollector:
             UnicodeDecodeError,
             OSError,
         ) as exc:
-            raise RuntimeError("resumed backend DUT metrics artifact is invalid") from exc
+            raise DutError(
+                "resumed backend DUT metrics artifact is invalid",
+                code=ErrorCode.DUT_PROTOCOL_ERROR,
+            ) from exc
         if document.target.host != self._backend.host or document.target.port != self._backend.port:
-            raise RuntimeError("resumed backend DUT target differs from the checkpoint")
+            raise DutError(
+                "resumed backend DUT target differs from the checkpoint",
+                code=ErrorCode.DUT_COLLECTION_ERROR,
+            )
         if document.interfaces != self.config.interfaces:
-            raise RuntimeError("resumed backend DUT interfaces differ from the checkpoint")
+            raise DutError(
+                "resumed backend DUT interfaces differ from the checkpoint",
+                code=ErrorCode.DUT_COLLECTION_ERROR,
+            )
         self._attempt_dir = attempt_dir
         self._raw_path = raw_path
         self._csv_path = attempt_dir / "dut-metrics.csv"
@@ -533,7 +605,8 @@ class DutBackendCollector:
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=self._backend.worker_stop_timeout_seconds)
             if thread.is_alive():
-                self._client.close()
+                with suppress(Exception):
+                    self._client.close()
                 thread.join(timeout=min(1.0, self._backend.worker_stop_timeout_seconds))
                 message = (
                     "DUT backend collector worker did not stop within "
@@ -586,9 +659,15 @@ class DutBackendCollector:
         started_at = self._traffic_started_at
         finished_at = self._traffic_finished_at
         if started_at is None or finished_at is None:
-            raise RuntimeError("DUT backend traffic window is incomplete")
+            raise DutError(
+                "DUT backend traffic window is incomplete",
+                code=ErrorCode.DUT_COLLECTION_ERROR,
+            )
         if self._raw_path is None or self._csv_path is None:
-            raise RuntimeError("DUT backend artifact paths are unavailable")
+            raise DutError(
+                "DUT backend artifact paths are unavailable",
+                code=ErrorCode.DUT_COLLECTION_ERROR,
+            )
         metrics_csv = render_metrics_csv(self._samples, self.config.interfaces)
         ArtifactStore.write_text(self._csv_path, metrics_csv)
         self._write_checkpoint()

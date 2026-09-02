@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from pydantic import ValidationError
 
+from bps_agent.errors import ConfigError, ErrorCode
 from bps_agent.models.common import EvaluationMode
 from bps_agent.models.config import AppConfig, RunOverrides
 
@@ -19,18 +21,51 @@ def load_config(
     config_path = path.resolve()
     try:
         document: Any = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ConfigError(
+            f"configuration file was not found: {config_path}",
+            code=ErrorCode.CONFIG_NOT_FOUND,
+            hint="Check --config and ensure the file exists.",
+        ) from exc
+    except UnicodeDecodeError as exc:
+        raise ConfigError(
+            f"configuration file is not valid UTF-8: {config_path}",
+            code=ErrorCode.CONFIG_INVALID,
+            hint="Save the configuration as UTF-8 YAML.",
+        ) from exc
     except OSError as exc:
-        raise ValueError(f"cannot read configuration {config_path}: {exc}") from exc
+        raise ConfigError(
+            f"cannot read configuration {config_path}",
+            code=ErrorCode.CONFIG_INVALID,
+            hint="Check configuration file permissions.",
+        ) from exc
     except yaml.YAMLError as exc:
-        raise ValueError(f"invalid YAML in {config_path}: {exc}") from exc
+        raise ConfigError(
+            f"invalid YAML in {config_path}",
+            code=ErrorCode.CONFIG_INVALID,
+            hint="Fix the YAML syntax and try again.",
+        ) from exc
     if not isinstance(document, dict):
-        raise ValueError("configuration root must be a YAML mapping")
+        raise ConfigError(
+            "configuration root must be a YAML mapping",
+            code=ErrorCode.CONFIG_INVALID,
+        )
     if mode_override is not None:
         evaluation = document.setdefault("evaluation", {})
         if not isinstance(evaluation, dict):
-            raise ValueError("evaluation configuration must be a YAML mapping")
+            raise ConfigError(
+                "evaluation configuration must be a YAML mapping",
+                code=ErrorCode.CONFIG_INVALID,
+            )
         evaluation["mode"] = mode_override.value
-    config = AppConfig.model_validate(document)
+    try:
+        config = AppConfig.model_validate(document)
+    except ValidationError as exc:
+        raise ConfigError(
+            f"invalid configuration in {config_path}",
+            code=ErrorCode.CONFIG_INVALID,
+            hint="Review the configuration fields and values.",
+        ) from exc
     storage = config.storage.resolved_relative_to(config_path.parent)
     return config.model_copy(update={"storage": storage})
 
@@ -45,7 +80,7 @@ def apply_overrides(
     if overrides.template is not None:
         cleaned = overrides.template.strip()
         if not cleaned:
-            raise ValueError("--template must not be empty")
+            raise ConfigError("--template must not be empty", code=ErrorCode.CONFIG_INVALID)
         document["bps"]["template"] = cleaned
     if overrides.ports is not None:
         document["bps"]["ports"] = overrides.ports
@@ -62,7 +97,10 @@ def apply_overrides(
         overrides.dut_interval_seconds,
     )
     if any(value is not None for value in dut_values) and document.get("dut") is None:
-        raise ValueError("DUT overrides require a dut section in the configuration")
+        raise ConfigError(
+            "DUT overrides require a dut section in the configuration",
+            code=ErrorCode.CONFIG_INVALID,
+        )
     if overrides.dut_collection_method is not None:
         document["dut"]["collection_method"] = overrides.dut_collection_method.value
     if any(
@@ -82,4 +120,11 @@ def apply_overrides(
         document["dut"]["interfaces"] = overrides.dut_interfaces
     if overrides.dut_interval_seconds is not None:
         document["dut"]["backend"]["interval_seconds"] = overrides.dut_interval_seconds
-    return AppConfig.model_validate(document)
+    try:
+        return AppConfig.model_validate(document)
+    except ValidationError as exc:
+        raise ConfigError(
+            "CLI overrides produced an invalid configuration",
+            code=ErrorCode.CONFIG_INVALID,
+            hint="Check the override values and the base configuration.",
+        ) from exc

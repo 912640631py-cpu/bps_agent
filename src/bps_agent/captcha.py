@@ -7,6 +7,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from bps_agent.errors import DutError, ErrorCode
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -33,10 +35,25 @@ def read_captcha(image: bytes, media_type: str) -> str:
             )
         except OSError as exc:
             LOGGER.warning("Could not open CAPTCHA image automatically: %s", exc)
-        value = input("DUT CAPTCHA: ").strip()
+        try:
+            value = input("DUT CAPTCHA: ").strip()
+        except EOFError as exc:
+            raise DutError(
+                "DUT CAPTCHA input was interrupted",
+                code=ErrorCode.DUT_CAPTCHA_FAILED,
+                hint="Run CAPTCHA authentication from an interactive terminal.",
+            ) from exc
         if not value:
-            raise ValueError("DUT CAPTCHA must not be empty")
+            raise DutError(
+                "DUT CAPTCHA must not be empty",
+                code=ErrorCode.DUT_CAPTCHA_FAILED,
+            )
         return value
+    except OSError as exc:
+        raise DutError(
+            "DUT CAPTCHA image could not be prepared",
+            code=ErrorCode.DUT_CAPTCHA_FAILED,
+        ) from exc
     finally:
         if path is not None:
             path.unlink(missing_ok=True)

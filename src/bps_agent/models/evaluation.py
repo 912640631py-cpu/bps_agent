@@ -87,6 +87,7 @@ class AttemptRecord(StrictModel):
     evidence_complete: bool = False
     port_reservation_state: PortReservationState = PortReservationState.NONE
     terminal_confirmed: bool = False
+    error_code: str | None = None
     errors: tuple[str, ...] = ()
 
     @model_validator(mode="after")

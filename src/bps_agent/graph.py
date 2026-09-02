@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
+from pydantic import ValidationError
 
 from bps_agent.adjudication import verdict_artifact
+from bps_agent.errors import AgentError, ArtifactError, BpsError, ConfigError, ErrorCode
 from bps_agent.launch import LaunchReconciliationError, RunLaunchCoordinator
 from bps_agent.models.bps import PortReservationState, PortReservationStatus
 from bps_agent.models.common import (
@@ -49,6 +52,7 @@ class EvaluationState(TypedDict):
     template_metadata: dict[str, Any]
     attempts: list[dict[str, Any]]
     outcome: str | None
+    error_code: str | None
     error: str | None
     final_artifact: str | None
 
@@ -63,6 +67,7 @@ def initial_state(evaluation_id: str, config: AppConfig) -> EvaluationState:
         "template_metadata": {},
         "attempts": [],
         "outcome": None,
+        "error_code": None,
         "error": None,
         "final_artifact": None,
     }
@@ -78,8 +83,32 @@ def _replace_last(state: EvaluationState, attempt: AttemptRecord) -> list[dict[s
     return attempts
 
 
-def _append_error(attempt: AttemptRecord, message: str) -> AttemptRecord:
-    return attempt.model_copy(update={"errors": (*attempt.errors, message)})
+def _exception_code(exc: BaseException) -> str:
+    if isinstance(exc, AgentError):
+        return exc.code
+    return ErrorCode.INTERNAL_ERROR.value
+
+
+def _append_error(
+    attempt: AttemptRecord,
+    message: str,
+    *,
+    error_code: str | None = None,
+) -> AttemptRecord:
+    return attempt.model_copy(
+        update={
+            "errors": (*attempt.errors, message),
+            "error_code": error_code or attempt.error_code,
+        }
+    )
+
+
+def _record_exception(attempt: AttemptRecord, prefix: str, exc: BaseException) -> AttemptRecord:
+    return _append_error(
+        attempt,
+        f"{prefix}: {exc}",
+        error_code=_exception_code(exc),
+    )
 
 
 def _has_minimum_monitoring(observations: DutObservations) -> bool:
@@ -110,7 +139,10 @@ def _template_total_bandwidth_mbps(metadata: dict[str, Any]) -> float:
         or not math.isfinite(value)
         or value <= 0
     ):
-        raise ValueError("BPS template metadata omitted a valid totalBandwidthMbps")
+        raise BpsError(
+            "BPS template metadata omitted a valid totalBandwidthMbps",
+            code=ErrorCode.BPS_PROTOCOL_ERROR,
+        )
     return float(value)
 
 
@@ -120,7 +152,10 @@ def _attempt_bandwidth_target(
     attempt_number: int,
 ) -> tuple[float, float]:
     if not 1 <= attempt_number <= len(ATTEMPT_BANDWIDTH_FACTORS):
-        raise ValueError(f"unsupported Attempt number: {attempt_number}")
+        raise BpsError(
+            f"unsupported Attempt number: {attempt_number}",
+            code=ErrorCode.BPS_BANDWIDTH_INVALID,
+        )
     factor = ATTEMPT_BANDWIDTH_FACTORS[attempt_number - 1]
     target_mbps = round(configured_mbps * factor, 6)
     percentage = round(target_mbps / template_total_bandwidth_mbps * 100, 6)
@@ -138,9 +173,15 @@ def build_graph(
     dut_enabled = cfg.evaluation.mode == EvaluationMode.BPS_AND_DUT
     dut_config = cfg.dut
     if dut_enabled and services.dut is None:
-        raise ValueError("bps_and_dut mode requires a DUT adapter")
+        raise ConfigError(
+            "bps_and_dut mode requires a DUT adapter",
+            code=ErrorCode.CONFIG_INVALID,
+        )
     if dut_enabled and dut_config is None:
-        raise ValueError("bps_and_dut mode requires DUT configuration")
+        raise ConfigError(
+            "bps_and_dut mode requires DUT configuration",
+            code=ErrorCode.CONFIG_INVALID,
+        )
 
     def actual_reservation_status() -> PortReservationStatus:
         return services.bps.port_reservation_status()
@@ -148,9 +189,11 @@ def build_graph(
     def reject_foreign_reservation(status: PortReservationStatus) -> None:
         if not status.has_foreign_reservation:
             return
-        raise RuntimeError(
+        raise BpsError(
             "configured BPS ports are reserved by another account: "
-            + ", ".join(status.foreign_owners)
+            + ", ".join(status.foreign_owners),
+            code=ErrorCode.BPS_PORT_OCCUPIED,
+            hint="Release the ports from the other BPS account before retrying.",
         )
 
     def attempt_reservation_update(status: PortReservationStatus) -> dict[str, Any]:
@@ -170,9 +213,10 @@ def build_graph(
                 if status.state == PortReservationState.PARTIAL_AGENT
                 else "reserved"
             )
-            raise RuntimeError(
+            raise BpsError(
                 f"refusing to clean {reservation_label} Agent-owned BPS ports while "
-                "active Run(s) exist: " + ", ".join(active_runs)
+                "active Run(s) exist: " + ", ".join(active_runs),
+                code=ErrorCode.BPS_RESERVATION_ERROR,
             )
         selected_ports = (
             status.agent_owned_ports if status.state == PortReservationState.PARTIAL_AGENT else None
@@ -191,8 +235,9 @@ def build_graph(
         reconciled = actual_reservation_status()
         reject_foreign_reservation(reconciled)
         if reconciled.state != PortReservationState.NONE:
-            raise RuntimeError(
-                "BPS ports remained reserved after cleanup: " + reconciled.state.value
+            raise BpsError(
+                "BPS ports remained reserved after cleanup: " + reconciled.state.value,
+                code=ErrorCode.BPS_RESERVATION_ERROR,
             )
         return reconciled
 
@@ -210,8 +255,9 @@ def build_graph(
         if not status.is_fully_agent_owned:
             if status.state == PortReservationState.PARTIAL_AGENT:
                 release_agent_reservation_if_inactive(status)
-            raise RuntimeError(
-                "BPS reserve did not produce a complete Agent reservation: " + status.state.value
+            raise BpsError(
+                "BPS reserve did not produce a complete Agent reservation: " + status.state.value,
+                code=ErrorCode.BPS_RESERVATION_ERROR,
             )
         return status
 
@@ -223,13 +269,15 @@ def build_graph(
             metadata = services.bps.find_template(cfg.bps.template)
             template_bandwidth_mbps = _template_total_bandwidth_mbps(metadata)
             if cfg.bps.total_bandwidth_mbps > template_bandwidth_mbps:
-                raise ValueError(
+                raise BpsError(
                     f"configured Total Bandwidth {cfg.bps.total_bandwidth_mbps:g} Mbps "
-                    f"exceeds template original value {template_bandwidth_mbps:g} Mbps"
+                    f"exceeds template original value {template_bandwidth_mbps:g} Mbps",
+                    code=ErrorCode.BPS_BANDWIDTH_INVALID,
                 )
         except Exception as exc:
             return {
                 "outcome": EvaluationOutcome.INCONCLUSIVE.value,
+                "error_code": _exception_code(exc),
                 "error": f"BPS template preflight failed: {exc}",
             }
         services.artifacts.write_evaluation_json(evaluation_id, "template.json", metadata)
@@ -253,17 +301,20 @@ def build_graph(
         reservation = PortReservationStatus.classify(())
         run_id: str | None = None
         dut_started = False
+        reservation_may_exist = False
         try:
             reservation = reconcile_partial_reservation(actual_reservation_status())
             if launcher.recovery_requires_reservation(state["evaluation_id"], attempt_number):
                 if reservation.state == PortReservationState.ALL_AGENT:
                     active_runs = services.bps.find_active_runs_for_ports()
                     if active_runs:
-                        raise RuntimeError(
+                        raise BpsError(
                             "refusing to send a prepared BPS launch while active Run(s) exist: "
-                            + ", ".join(active_runs)
+                            + ", ".join(active_runs),
+                            code=ErrorCode.BPS_RESERVATION_ERROR,
                         )
                 elif reservation.state == PortReservationState.NONE:
+                    reservation_may_exist = True
                     reservation = reserve_all_ports()
             launch = launcher.recover(
                 state["evaluation_id"],
@@ -280,6 +331,7 @@ def build_graph(
                     services.dut.prepare_attempt(
                         services.artifacts.attempt_dir(state["evaluation_id"], attempt_number)
                     )
+                reservation_may_exist = True
                 reservation = reserve_all_ports()
                 services.bps.set_total_bandwidth(bandwidth_percent)
                 launch = launcher.start(
@@ -328,12 +380,12 @@ def build_graph(
             )
             return {"attempts": [*state["attempts"], attempt.model_dump(mode="json")]}
         except LaunchReconciliationError as exc:
-            attempt = _append_error(attempt, f"BPS launch reconciliation failed: {exc}")
+            attempt = _record_exception(attempt, "BPS launch reconciliation failed", exc)
             try:
                 reservation = actual_reservation_status()
             except Exception as reservation_exc:
-                attempt = _append_error(
-                    attempt, f"BPS reservation reconciliation failed: {reservation_exc}"
+                attempt = _record_exception(
+                    attempt, "BPS reservation reconciliation failed", reservation_exc
                 )
             attempt = attempt.model_copy(update=attempt_reservation_update(reservation))
             services.artifacts.write_attempt_json(
@@ -342,20 +394,27 @@ def build_graph(
             return {
                 "attempts": [*state["attempts"], attempt.model_dump(mode="json")],
                 "outcome": EvaluationOutcome.INCONCLUSIVE.value,
+                "error_code": attempt.error_code,
                 "error": attempt.errors[-1],
             }
         except Exception as exc:
+            error_code = _exception_code(exc)
             if run_id is not None:
                 try:
                     services.bps.stop_run(run_id)
                     completion = services.bps.wait_for_completion(run_id, lambda: None)
                     if not completion.terminal:
-                        raise RuntimeError("stopped run did not reach a confirmed terminal state")
+                        raise BpsError(
+                            "stopped run did not reach a confirmed terminal state",
+                            code=ErrorCode.BPS_RUN_TIMEOUT,
+                        )
                     if dut_started and services.dut is not None:
                         services.dut.traffic_finished(utc_now())
                 except Exception as cleanup_exc:
                     exc = RuntimeError(f"{exc}; BPS run cleanup failed: {cleanup_exc}")
-            if reservation.state in {
+                    if isinstance(cleanup_exc, AgentError):
+                        error_code = cleanup_exc.code
+            if reservation_may_exist or reservation.state in {
                 PortReservationState.ALL_AGENT,
                 PortReservationState.PARTIAL_AGENT,
             }:
@@ -363,8 +422,11 @@ def build_graph(
                     reservation = release_agent_reservation_if_inactive(reservation)
                 except Exception as cleanup_exc:
                     exc = RuntimeError(f"{exc}; pre-run port cleanup failed: {cleanup_exc}")
+                    if isinstance(cleanup_exc, AgentError):
+                        error_code = cleanup_exc.code
             return {
                 "outcome": EvaluationOutcome.INCONCLUSIVE.value,
+                "error_code": error_code,
                 "error": f"Attempt start failed: {exc}",
             }
 
@@ -377,14 +439,15 @@ def build_graph(
             attempt = attempt.model_copy(update=attempt_reservation_update(reservation))
             reservation = reconcile_partial_reservation(reservation)
         except Exception as exc:
-            recovery_error = f"BPS reservation recovery failed: {exc}"
-            attempt = _append_error(attempt, recovery_error)
+            attempt = _record_exception(attempt, "BPS reservation recovery failed", exc)
+            recovery_error = attempt.errors[-1]
             services.artifacts.write_attempt_json(
                 state["evaluation_id"], attempt.number, "attempt.json", attempt
             )
             return {
                 "attempts": _replace_last(state, attempt),
                 "outcome": EvaluationOutcome.INCONCLUSIVE.value,
+                "error_code": attempt.error_code,
                 "error": recovery_error,
             }
         attempt = attempt.model_copy(update=attempt_reservation_update(reservation))
@@ -399,20 +462,26 @@ def build_graph(
                 )
             completion = services.bps.wait_for_completion(monitored_run_id, lambda: None)
             if not completion.terminal:
-                raise RuntimeError("BPS adapter did not confirm a terminal run state")
+                raise BpsError(
+                    "BPS adapter did not confirm a terminal run state",
+                    code=ErrorCode.BPS_RUN_TIMEOUT,
+                )
             launcher.mark_terminal(state["evaluation_id"], attempt.number, monitored_run_id)
         except Exception as exc:
-            attempt = _append_error(attempt, f"BPS monitoring failed: {exc}")
+            attempt = _record_exception(attempt, "BPS monitoring failed", exc)
             run_id = attempt.bps_run_id
             assert run_id is not None
             try:
                 services.bps.stop_run(run_id)
                 completion = services.bps.wait_for_completion(run_id, lambda: None)
                 if not completion.terminal:
-                    raise RuntimeError("stopped run did not reach a confirmed terminal state")
+                    raise BpsError(
+                        "stopped run did not reach a confirmed terminal state",
+                        code=ErrorCode.BPS_RUN_TIMEOUT,
+                    )
             except Exception as recovery_exc:
-                recovery_error = f"manual recovery required: {recovery_exc}"
-                attempt = _append_error(attempt, recovery_error)
+                attempt = _record_exception(attempt, "manual recovery required", recovery_exc)
+                recovery_error = attempt.errors[-1]
                 attempts = _replace_last(state, attempt)
                 services.artifacts.write_attempt_json(
                     state["evaluation_id"], attempt.number, "attempt.json", attempt
@@ -420,6 +489,7 @@ def build_graph(
                 return {
                     "attempts": attempts,
                     "outcome": EvaluationOutcome.INCONCLUSIVE.value,
+                    "error_code": attempt.error_code,
                     "error": recovery_error,
                 }
 
@@ -429,7 +499,7 @@ def build_graph(
             try:
                 services.dut.traffic_finished(traffic_finished_at)
             except Exception as exc:
-                attempt = _append_error(attempt, f"DUT collection stop failed: {exc}")
+                attempt = _record_exception(attempt, "DUT collection stop failed", exc)
         attempt = attempt.model_copy(
             update={
                 "traffic_finished_at": traffic_finished_at,
@@ -440,8 +510,12 @@ def build_graph(
         try:
             reservation = release_agent_reservation_if_inactive()
         except Exception as exc:
-            release_error = f"BPS port release failed after confirmed terminal state: {exc}"
-            attempt = _append_error(attempt, release_error)
+            attempt = _record_exception(
+                attempt,
+                "BPS port release failed after confirmed terminal state",
+                exc,
+            )
+            release_error = attempt.errors[-1]
             attempts = _replace_last(state, attempt)
             services.artifacts.write_attempt_json(
                 state["evaluation_id"], attempt.number, "attempt.json", attempt
@@ -449,6 +523,7 @@ def build_graph(
             return {
                 "attempts": attempts,
                 "outcome": EvaluationOutcome.INCONCLUSIVE.value,
+                "error_code": attempt.error_code,
                 "error": release_error,
             }
         attempt = attempt.model_copy(update=attempt_reservation_update(reservation))
@@ -469,7 +544,10 @@ def build_graph(
         performance_analysis: PerformanceTimeseriesAnalysis | None = None
         try:
             if not attempt.traffic_started_at or not attempt.traffic_finished_at:
-                raise RuntimeError("BPS traffic time window is incomplete")
+                raise BpsError(
+                    "BPS traffic time window is incomplete",
+                    code=ErrorCode.BPS_REPORT_ERROR,
+                )
             if dut_enabled:
                 assert services.dut is not None
                 services.dut.restore_attempt(
@@ -509,7 +587,10 @@ def build_graph(
             attempt = attempt.model_copy(update={"report_toc_path": str(toc_path)})
             report_sections = extract_report_sections(report_toc)
             if not report_sections:
-                raise RuntimeError("current BPS Run TOC contains no recognizable titled sections")
+                raise BpsError(
+                    "current BPS Run TOC contains no recognizable titled sections",
+                    code=ErrorCode.BPS_REPORT_ERROR,
+                )
             selection = resolve_minimal_analysis_sections(report_sections)
             performance_selection = resolve_performance_timeseries_sections(report_sections)
             services.artifacts.write_attempt_json(
@@ -528,19 +609,22 @@ def build_graph(
                 ),
             )
             if selection.required_missing:
-                raise RuntimeError(
+                raise BpsError(
                     "current BPS Run TOC is missing required report sections: "
-                    + "; ".join(selection.required_missing)
+                    + "; ".join(selection.required_missing),
+                    code=ErrorCode.BPS_REPORT_ERROR,
                 )
             if performance_selection.required_missing:
-                raise RuntimeError(
+                raise BpsError(
                     "current BPS Run TOC is missing required performance time-series sections: "
-                    + "; ".join(performance_selection.required_missing)
+                    + "; ".join(performance_selection.required_missing),
+                    code=ErrorCode.BPS_REPORT_ERROR,
                 )
             if performance_selection.ambiguous_required:
-                raise RuntimeError(
+                raise BpsError(
                     "current BPS Run TOC has ambiguous performance time-series sections: "
-                    f"{performance_selection.ambiguous_required}"
+                    f"{performance_selection.ambiguous_required}",
+                    code=ErrorCode.BPS_REPORT_ERROR,
                 )
             if selection.ambiguous_required:
                 LOGGER.warning(
@@ -568,7 +652,13 @@ def build_graph(
                 }
             )
             performance_analysis = analyze_performance_timeseries(performance_path)
-            report_text = report_path.read_text(encoding="utf-8-sig", errors="replace")
+            try:
+                report_text = report_path.read_text(encoding="utf-8-sig", errors="replace")
+            except OSError as exc:
+                raise BpsError(
+                    "could not read the exported BPS report",
+                    code=ErrorCode.BPS_REPORT_ERROR,
+                ) from exc
             pdf_destination = attempt_dir / "bps-report-full.pdf"
             full_section_ids = tuple(
                 section.section_id for section in report_sections if section.parent_id is None
@@ -582,7 +672,7 @@ def build_graph(
             except Exception as exc:
                 LOGGER.warning("Optional full PDF report export could not be scheduled: %s", exc)
         except Exception as exc:
-            attempt = _append_error(attempt, f"evidence collection failed: {exc}")
+            attempt = _record_exception(attempt, "evidence collection failed", exc)
 
         bps_complete = bool(
             attempt.bps_run_id
@@ -626,7 +716,17 @@ def build_graph(
             )
             attempt = attempt.model_copy(update={"evidence_path": str(evidence_path)})
         elif not attempt.errors:
-            attempt = _append_error(attempt, "required Evidence Bundle fields are incomplete")
+            fallback_code = (
+                ErrorCode.DUT_COLLECTION_ERROR.value
+                if dut_enabled
+                and (dut_evidence is None or not _dut_evidence_complete(dut_evidence))
+                else ErrorCode.BPS_REPORT_ERROR.value
+            )
+            attempt = _append_error(
+                attempt,
+                "required Evidence Bundle fields are incomplete",
+                error_code=fallback_code,
+            )
 
         services.artifacts.write_attempt_json(
             state["evaluation_id"], attempt.number, "attempt.json", attempt
@@ -636,6 +736,7 @@ def build_graph(
             update.update(
                 {
                     "outcome": EvaluationOutcome.INCONCLUSIVE.value,
+                    "error_code": attempt.error_code,
                     "error": attempt.errors[-1],
                 }
             )
@@ -645,17 +746,36 @@ def build_graph(
         attempt = _attempts(state)[-1]
         assert attempt.evidence_path is not None
         evidence_path = Path(attempt.evidence_path)
-        evidence = EvidenceBundle.model_validate(services.artifacts.read_json(evidence_path))
         try:
+            try:
+                evidence = EvidenceBundle.model_validate(
+                    services.artifacts.read_json(evidence_path)
+                )
+            except (
+                ValidationError,
+                json.JSONDecodeError,
+                UnicodeDecodeError,
+                OSError,
+            ) as exc:
+                raise ArtifactError(
+                    "Evidence artifact is invalid",
+                    code=ErrorCode.ARTIFACT_IO_ERROR,
+                ) from exc
             verdict, raw_response = services.judge.adjudicate(evidence)
         except Exception as exc:
-            attempt = _append_error(attempt, f"LLM adjudication failed: {exc}")
+            prefix = (
+                "Evidence artifact load failed"
+                if isinstance(exc, ArtifactError)
+                else "LLM adjudication failed"
+            )
+            attempt = _record_exception(attempt, prefix, exc)
             services.artifacts.write_attempt_json(
                 state["evaluation_id"], attempt.number, "attempt.json", attempt
             )
             return {
                 "attempts": _replace_last(state, attempt),
                 "outcome": EvaluationOutcome.INCONCLUSIVE.value,
+                "error_code": attempt.error_code,
                 "error": attempt.errors[-1],
             }
         verdict_path = services.artifacts.write_attempt_json(
@@ -726,12 +846,17 @@ def build_graph(
                 outcome = EvaluationOutcome.NOT_PASSED.value
             else:
                 outcome = EvaluationOutcome.INCONCLUSIVE.value
+        error_code = state["error_code"]
+        if error_code is None and outcome == EvaluationOutcome.INCONCLUSIVE.value:
+            last = attempts[-1] if attempts else None
+            error_code = last.error_code if last is not None else ErrorCode.INTERNAL_ERROR.value
         summary = {
             "evaluation_id": state["evaluation_id"],
             "outcome": outcome,
             "provider": services.judge.provider_name,
             "model": services.judge.model_name,
             "attempts": [item.model_dump(mode="json") for item in attempts],
+            "error_code": error_code,
             "error": state["error"],
             "finished_at": utc_now(),
         }

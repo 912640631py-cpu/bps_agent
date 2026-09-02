@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
 
+from bps_agent.errors import BpsError, ErrorCode
 from bps_agent.models.common import PerformanceAssessment, PerformancePhase
 from bps_agent.models.performance import (
     PerformanceAnalysisThresholds,
@@ -29,8 +30,8 @@ _TABLE_COLUMNS = {
 _SOURCE_TABLES = tuple(_TABLE_COLUMNS)
 
 
-class PerformanceTimeseriesError(RuntimeError):
-    pass
+class PerformanceTimeseriesError(BpsError):
+    default_code = ErrorCode.BPS_REPORT_ERROR.value
 
 
 @dataclass(frozen=True)
@@ -56,7 +57,7 @@ def _number(value: str) -> float:
     return number
 
 
-def _parse_tables(path: Path) -> dict[str, tuple[_Point, ...]]:
+def _parse_tables_unchecked(path: Path) -> dict[str, tuple[_Point, ...]]:
     collected: dict[str, list[_Point]] = {title: [] for title in _SOURCE_TABLES}
     seen_sections: set[str] = set()
     current_title: str | None = None
@@ -118,6 +119,15 @@ def _parse_tables(path: Path) -> dict[str, tuple[_Point, ...]]:
             raise PerformanceTimeseriesError(f"{title} timestamps must be unique")
         parsed[title] = tuple(ordered)
     return parsed
+
+
+def _parse_tables(path: Path) -> dict[str, tuple[_Point, ...]]:
+    try:
+        return _parse_tables_unchecked(path)
+    except PerformanceTimeseriesError:
+        raise
+    except (OSError, UnicodeDecodeError) as exc:
+        raise PerformanceTimeseriesError("cannot read performance time-series CSV") from exc
 
 
 def _nearest(

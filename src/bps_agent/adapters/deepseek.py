@@ -8,6 +8,13 @@ from typing import Any
 
 import httpx
 
+from bps_agent.errors import (
+    ErrorCode,
+    ProviderCompatibilityError,
+    ProviderError,
+    ProviderRequestError,
+    ProviderResponseError,
+)
 from bps_agent.models.common import ReasoningEffort
 from bps_agent.models.config import ProviderConfig
 from bps_agent.models.evaluation import EvidenceBundle, VerdictDocument
@@ -29,6 +36,14 @@ _COMPATIBILITY_REJECTION_MARKERS = (
     "unrecognized",
     "unsupported",
 )
+
+__all__ = [
+    "DeepSeekJudge",
+    "ProviderCompatibilityError",
+    "ProviderError",
+    "ProviderRequestError",
+    "ProviderResponseError",
+]
 _SYSTEM_PROMPT = """你是网络设备性能测试裁决专家。
 请只依据给定 Evidence Bundle 判断本次性能测试是否通过。
 你拥有测试 Verdict 的最终裁决权。
@@ -41,22 +56,6 @@ _SYSTEM_PROMPT = """你是网络设备性能测试裁决专家。
 evaluation_mode 为 bps_only 时没有 DUT 证据是正常情况，不得因此判定失败或要求 DUT 指标。
 backend_ssh 的 DUT 证据以 metrics_csv 提供连续采样；结合成功/失败采样计数判断证据可靠性。
 不要把基础设施错误当作 DUT 性能失败。"""
-
-
-class ProviderError(RuntimeError):
-    pass
-
-
-class ProviderCompatibilityError(ProviderError):
-    pass
-
-
-class ProviderRequestError(ProviderError):
-    pass
-
-
-class ProviderResponseError(ProviderError):
-    pass
 
 
 class DeepSeekJudge:
@@ -103,8 +102,12 @@ class DeepSeekJudge:
         for attempt in range(self.config.attempts):
             try:
                 response = self._client.post(self._endpoint, headers=self._headers, json=payload)
-            except httpx.HTTPError as exc:
-                last_error = ProviderRequestError(f"LLM request transport failed: {exc}")
+            except httpx.TransportError as exc:
+                last_error = ProviderRequestError(
+                    "LLM request transport failed: provider is unreachable",
+                    code=ErrorCode.LLM_UNREACHABLE,
+                    hint="Check the provider endpoint, network route, and TLS settings.",
+                )
                 last_cause = exc
             else:
                 if response.is_redirect:
@@ -121,9 +124,17 @@ class DeepSeekJudge:
                 try:
                     response.raise_for_status()
                 except httpx.HTTPStatusError as exc:
+                    error_code = (
+                        ErrorCode.LLM_AUTH_FAILED
+                        if response.status_code in {401, 403}
+                        else ErrorCode.LLM_RATE_LIMITED
+                        if response.status_code == 429
+                        else ErrorCode.LLM_REQUEST_ERROR
+                    )
                     last_error = ProviderRequestError(
                         f"LLM request failed with HTTP {response.status_code}: "
-                        f"{self._provider_error(response)}"
+                        f"{self._provider_error(response)}",
+                        code=error_code,
                     )
                     last_cause = exc
                     if response.status_code not in _RETRYABLE_STATUS:
@@ -135,7 +146,12 @@ class DeepSeekJudge:
                             raise ValueError("LLM response envelope is not a JSON object")
                         parsed = json.loads(self._content(document))
                         verdict = VerdictDocument.model_validate(parsed)
-                    except (json.JSONDecodeError, RuntimeError, ValueError) as exc:
+                    except (
+                        json.JSONDecodeError,
+                        UnicodeDecodeError,
+                        RuntimeError,
+                        ValueError,
+                    ) as exc:
                         last_error = ProviderResponseError(f"LLM response was invalid: {exc}")
                         last_cause = exc
                     else:
@@ -176,7 +192,10 @@ class DeepSeekJudge:
         if message is not None:
             parts.append(f"message={str(message)[:500]}")
         if not parts:
-            text = response.text.strip()
+            try:
+                text = response.text.strip()
+            except UnicodeDecodeError:
+                text = "provider returned invalid UTF-8 error details"
             parts.append(text[:500] if text else "provider returned no error details")
         return ", ".join(parts)
 

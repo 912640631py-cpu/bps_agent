@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
@@ -12,6 +13,7 @@ from bps_agent.adapters.deepseek import DeepSeekJudge
 from bps_agent.artifacts import ArtifactStore
 from bps_agent.credentials import CredentialRequirement
 from bps_agent.dut_runtime import CaptchaReader, dut_runtime_spec
+from bps_agent.errors import AgentError, ArtifactError, ErrorCode
 from bps_agent.models.common import EvaluationMode
 from bps_agent.models.config import AppConfig
 from bps_agent.models.evaluation import EvidenceBundle
@@ -36,7 +38,10 @@ class EvidenceOnlyJudge:
     model_name = "not-called"
 
     def adjudicate(self, evidence: EvidenceBundle) -> tuple[Any, dict[str, Any]]:
-        raise RuntimeError("LLM adjudication is disabled for this evidence-only run")
+        raise AgentError(
+            "LLM adjudication is disabled for this evidence-only run",
+            code=ErrorCode.INTERNAL_ERROR,
+        )
 
     def close(self) -> None:
         return None
@@ -97,26 +102,52 @@ def build_runtime(
     *,
     captcha_reader: CaptchaReader,
     stop_before_llm: bool = False,
+    progress: Callable[[str], None] | None = None,
 ) -> RuntimeResources:
     judge: DeepSeekJudge | EvidenceOnlyJudge = EvidenceOnlyJudge()
     bps: BpsClient | None = None
     dut: DutPort | None = None
+    announce = progress or (lambda _message: None)
     try:
         if not stop_before_llm:
+            announce(
+                f"Checking {config.llm.provider} provider compatibility with "
+                f"reasoning_effort={config.llm.reasoning_effort}..."
+            )
             configured_judge = build_judge(config, credentials)
             judge = configured_judge
             configured_judge.validate_compatibility()
+        else:
+            announce("DeepSeek compatibility check skipped (evidence-only mode).")
         bps = BpsClient(
             config.bps,
             username=credentials["BPS_USERNAME"],
             password=credentials["BPS_PASSWORD"],
         )
+        announce("Authenticating to BPS...")
         bps.authenticate()
+        announce("Validating BPS template and bandwidth...")
+        preflight = getattr(bps, "preflight", None)
+        if callable(preflight):
+            preflight()
         if config.evaluation.mode == EvaluationMode.BPS_AND_DUT:
             assert config.dut is not None
+            announce(f"Checking DUT ({config.dut.collection_method.value})...")
             dut = dut_runtime_spec(config.dut.collection_method).build_adapter(
                 config.dut, credentials, captcha_reader
             )
+        else:
+            announce("BPS-only mode: DUT checks skipped.")
+        announce("Checking local storage...")
+        try:
+            config.storage.artifact_dir.mkdir(parents=True, exist_ok=True)
+            config.storage.checkpoint_db.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ArtifactError(
+                "local storage is not writable",
+                code=ErrorCode.ARTIFACT_IO_ERROR,
+                hint="Check artifact and checkpoint paths and their permissions.",
+            ) from exc
         return RuntimeResources(
             config=config,
             bps=bps,
