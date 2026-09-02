@@ -292,7 +292,7 @@ class AgentArgumentParser(argparse.ArgumentParser):
 
 def _parser() -> argparse.ArgumentParser:
     parser = AgentArgumentParser(description="LangGraph BPS performance-test agent")
-    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("-v", "--verbose", action="store_true")
     subparsers = parser.add_subparsers(
         dest="command",
         required=True,
@@ -300,17 +300,20 @@ def _parser() -> argparse.ArgumentParser:
     )
     live = subparsers.add_parser("run", help="run against real BPS with optional DUT monitoring")
     live.add_argument(
+        "-c",
         "--config",
         type=Path,
         default=Path("config/demo.yaml"),
         help="configuration file (default: config/demo.yaml)",
     )
-    live.add_argument("--resume", metavar="EVALUATION_ID")
+    live.add_argument("-r", "--resume", metavar="EVALUATION_ID")
     live.add_argument(
+        "-t",
         "--template",
         help="override the exact BPS template name from the configuration",
     )
     live.add_argument(
+        "-p",
         "--ports",
         type=int,
         nargs="+",
@@ -318,48 +321,55 @@ def _parser() -> argparse.ArgumentParser:
         help="override the BPS port numbers from the configuration",
     )
     live.add_argument(
+        "-b",
         "--total-bandwidth-mbps",
         type=float,
         help="override the initial BPS Total Bandwidth target in Mbps",
     )
     live.add_argument(
+        "-bo",
         "--bps-only",
         action="store_true",
         default=None,
         help="skip DUT credentials, login, keepalive, and monitoring",
     )
     live.add_argument(
+        "-m",
         "--dut-collection-method",
         type=DutCollectionMethod,
         choices=tuple(DutCollectionMethod),
         help="override the DUT Collection Method",
     )
-    live.add_argument("--dut-host", help="override the DUT backend SSH host")
-    live.add_argument("--dut-port", type=int, help="override the DUT backend SSH port")
+    live.add_argument("-dh", "--dut-host", help="override the DUT backend SSH host")
+    live.add_argument("-dp", "--dut-port", type=int, help="override the DUT backend SSH port")
     live.add_argument(
+        "-i",
         "--dut-interface",
         action="append",
         dest="dut_interfaces",
         help="override a DUT interface; repeat for multiple interfaces",
     )
     live.add_argument(
+        "-s",
         "--dut-interval-seconds",
         type=float,
         help="override the DUT backend sampling interval",
     )
     live.add_argument(
+        "-sb",
         "--stop-before-llm",
         action="store_true",
         help="collect complete live evidence, then stop before contacting the LLM",
     )
     replay_parser = subparsers.add_parser("replay", help="re-adjudicate saved evidence")
     replay_parser.add_argument(
+        "-c",
         "--config",
         type=Path,
         default=Path("config/demo.yaml"),
         help="configuration file (default: config/demo.yaml)",
     )
-    replay_parser.add_argument("--evidence", type=Path, required=True)
+    replay_parser.add_argument("-e", "--evidence", type=Path, required=True)
     credentials = subparsers.add_parser(
         "credentials", help="manage credentials in the operating-system keyring"
     )
@@ -392,7 +402,9 @@ def _print_agent_error(error: AgentError) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    verbose_requested = "--verbose" in (sys.argv[1:] if argv is None else argv)
+    verbose_requested = any(
+        option in (sys.argv[1:] if argv is None else argv) for option in ("-v", "--verbose")
+    )
     try:
         arguments = _parser().parse_args(argv)
         _configure_logging(arguments.verbose)

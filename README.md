@@ -52,25 +52,56 @@ python -m bps_agent credentials delete
 python -m bps_agent run
 
 # 临时覆盖模板、端口和首次流量目标
-python -m bps_agent run --template TEMPLATE --ports 4 5 --total-bandwidth-mbps 300
+python -m bps_agent run -t TEMPLATE -p 4 5 -b 300
 
 # 临时覆盖 DUT SSH 后端目标、接口和采样间隔
-python -m bps_agent run --dut-collection-method backend_ssh `
-  --dut-host 10.66.246.133 --dut-port 50023 `
-  --dut-interface T1/1 --dut-interface T1/2 --dut-interval-seconds 10
+python -m bps_agent run -m backend_ssh `
+  -dh 10.66.246.133 -dp 50023 `
+  -i T1/1 -i T1/2 -s 10
 
 # 完成实机测试和 Evidence，在调用 LLM 前停止
-python -m bps_agent run --stop-before-llm
+python -m bps_agent run -sb
 
 # 只使用 BPS，不登录或读取 DUT
-python -m bps_agent run --bps-only
+python -m bps_agent run -bo
 
 # 恢复已有 Evaluation
-python -m bps_agent run --resume EVALUATION_ID
+python -m bps_agent run -r EVALUATION_ID
 
 # 使用已有 Evidence 重新裁决
-python -m bps_agent replay --evidence artifacts\EVALUATION_ID\attempt-01\evidence.json
+python -m bps_agent replay -e artifacts\EVALUATION_ID\attempt-01\evidence.json
 ```
+
+`run` 参数：
+
+| Short | Long | Description |
+| --- | --- | --- |
+| `-c FILE` | `--config FILE` | 配置文件 |
+| `-r ID` | `--resume ID` | 恢复已有 Evaluation |
+| `-t NAME` | `--template NAME` | BPS Template |
+| `-p PORT...` | `--ports PORT...` | BPS 测试端口 |
+| `-b MBPS` | `--total-bandwidth-mbps MBPS` | 首次目标带宽 |
+| `-bo` | `--bps-only` | 跳过 DUT |
+| `-m METHOD` | `--dut-collection-method METHOD` | DUT 采集方式 |
+| `-dh HOST` | `--dut-host HOST` | DUT host |
+| `-dp PORT` | `--dut-port PORT` | DUT SSH port |
+| `-i IFACE` | `--dut-interface IFACE` | DUT interface，可重复 |
+| `-s SEC` | `--dut-interval-seconds SEC` | DUT 采样周期 |
+| `-sb` | `--stop-before-llm` | Evidence-only 模式 |
+
+`replay` 参数：
+
+| Short | Long | Description |
+| --- | --- | --- |
+| `-c FILE` | `--config FILE` | 配置文件 |
+| `-e FILE` | `--evidence FILE` | Evidence JSON |
+
+全局参数放在子命令之前，例如 `python -m bps_agent -v run`：
+
+| Short | Long | Description |
+| --- | --- | --- |
+| `-v` | `--verbose` | Debug/详细日志 |
+| `-h` | `--help` | 显示帮助 |
 
 恢复运行时不能使用模板、端口、带宽、DUT 或模式覆盖参数。
 也可以在 YAML 中设置 `evaluation.mode: bps_only`；默认值为 `bps_and_dut`。
@@ -123,6 +154,20 @@ python -m bps_agent replay --evidence artifacts\EVALUATION_ID\attempt-01\evidenc
 - `DEGRADED_PASS`：首次目标未通过，但某个降载 Attempt 被判定为 `pass`。
 - `NOT_PASSED`：六次 Attempt 均返回 `retry`。
 - `INCONCLUSIVE`：证据不完整或外部接口失败。
+
+CLI 退出码是稳定接口：
+
+| Exit Code | 含义 |
+| ---: | --- |
+| `0` | `PASSED`，目标带宽首次通过 |
+| `1` | `DEGRADED_PASS`，降载后通过 |
+| `2` | `NOT_PASSED`，所有尝试均未通过 |
+| `3` | `INCONCLUSIVE`，Evaluation 已执行但无法可靠裁决 |
+| `4` | 配置、凭据、BPS/DUT/LLM、存储等运行错误 |
+| `64` | CLI 参数使用错误 |
+| `130` | 用户通过 Ctrl+C 中断 |
+
+退出码只表示大的结果类别，具体故障原因由 `[ERROR_CODE]` 输出说明。自动化脚本应优先依据退出码判断 Evaluation 结果。
 
 ## 开发检查
 
