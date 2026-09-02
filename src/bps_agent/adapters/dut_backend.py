@@ -449,7 +449,7 @@ class DutBackendCollector:
             raise RuntimeError("resumed backend DUT Attempt omitted dut-metrics.json")
         try:
             document = BackendDutCaptureArtifact.model_validate(ArtifactStore.read_json(raw_path))
-        except ValidationError as exc:
+        except (ValidationError, json.JSONDecodeError, OSError) as exc:
             raise RuntimeError("resumed backend DUT metrics artifact is invalid") from exc
         if document.target.host != self._backend.host or document.target.port != self._backend.port:
             raise RuntimeError("resumed backend DUT target differs from the checkpoint")

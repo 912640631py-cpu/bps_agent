@@ -215,6 +215,22 @@ def test_resume_loads_runtime_configuration_from_checkpoint(app_config: AppConfi
     assert restored == app_config
 
 
+def test_resume_rejects_invalid_checkpoint(app_config: AppConfig) -> None:
+    builder = StateGraph(_CheckpointConfigState)
+    builder.add_node("finish", lambda _state: {})
+    builder.add_edge(START, "finish")
+    builder.add_edge("finish", END)
+    invocation = {"configurable": {"thread_id": "invalid-checkpoint"}}
+    with SqliteSaver.from_conn_string(str(app_config.storage.checkpoint_db)) as saver:
+        builder.compile(checkpointer=saver).invoke(
+            {"config": {"not": "an AppConfig"}},
+            config=invocation,
+        )
+
+    with pytest.raises(ValueError, match="invalid checkpoint"):
+        load_resume_config(app_config, "invalid-checkpoint")
+
+
 def test_console_verdict_contains_the_complete_parsed_document() -> None:
     attempt = AttemptRecord(
         number=1,

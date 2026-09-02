@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import subprocess
@@ -76,7 +77,7 @@ class PdfExportJob(BaseModel):
 def run_pdf_job(job_path: Path) -> int:
     try:
         job = PdfExportJob.model_validate(ArtifactStore.read_json(job_path))
-    except ValidationError as exc:
+    except (ValidationError, json.JSONDecodeError, OSError) as exc:
         raise RuntimeError("invalid PDF export artifact") from exc
     running = job.model_copy(update={"status": "running", "started_at": utc_now()})
     ArtifactStore.write_json(job_path, running)

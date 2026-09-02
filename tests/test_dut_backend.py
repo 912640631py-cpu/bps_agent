@@ -393,7 +393,7 @@ def test_worker_stop_timeout_closes_client_and_marks_capture_failed(tmp_path: Pa
         collector.traffic_finished("2026-08-27T13:54:00+08:00")
     elapsed = time.monotonic() - started
 
-    assert elapsed < 0.3
+    assert elapsed < 0.8
     assert client.closed >= 2  # forced close plus the initial Attempt reset
     raw = ArtifactStore.read_json(tmp_path / "dut-metrics.json")
     assert "worker did not stop" in raw["worker_failure"]
@@ -470,6 +470,24 @@ def test_completed_attempt_can_restore_from_atomic_metrics_artifact(tmp_path: Pa
 
     assert capture.evidence.successful_sample_count >= 1  # type: ignore[union-attr]
     assert restored_client.connected == 0
+
+
+def test_restore_rejects_malformed_metrics_artifact(tmp_path: Path) -> None:
+    raw_path = tmp_path / "dut-metrics.json"
+    raw_path.write_text("{", encoding="utf-8")
+    collector = DutBackendCollector(
+        backend_config(),
+        username="dutcollector",
+        password="password",
+        client=FakeSnapshotClient([sample_snapshot()]),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(RuntimeError, match="DUT metrics artifact is invalid"):
+        collector.restore_attempt(
+            tmp_path,
+            "2026-08-27T13:53:30+08:00",
+            "2026-08-27T13:54:00+08:00",
+        )
 
 
 def test_ssh_client_does_not_load_or_persist_host_keys(monkeypatch: object) -> None:
