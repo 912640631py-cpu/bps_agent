@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from bps_agent.artifacts import ArtifactStore
 from bps_agent.models.common import utc_now
@@ -19,7 +19,6 @@ class LaunchReconciliationError(RuntimeError):
 class LaunchIntent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal["1"] = "1"
     evaluation_id: str
     attempt_number: int
     template: str
@@ -53,7 +52,10 @@ class RunLaunchCoordinator:
         path = self._path(evaluation_id, attempt_number)
         if not path.is_file():
             return None
-        intent = LaunchIntent.model_validate(self._artifacts.read_json(path))
+        try:
+            intent = LaunchIntent.model_validate(self._artifacts.read_json(path))
+        except ValidationError as exc:
+            raise LaunchReconciliationError("invalid BPS launch artifact") from exc
         if intent.evaluation_id != evaluation_id or intent.attempt_number != attempt_number:
             raise LaunchReconciliationError(
                 "BPS launch journal identity does not match the Attempt"

@@ -24,7 +24,6 @@ def verdict_artifact(
     if reasoning_effort is not None:
         model_parameters["reasoning_effort"] = reasoning_effort
     return {
-        "schema_version": "1",
         "provider": provider,
         "model": model,
         "model_parameters": model_parameters,

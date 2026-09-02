@@ -42,7 +42,22 @@ def make_deepseek_judge(
     )
 
 
-def test_bps_run_contract_never_forces_reservation() -> None:
+def make_bps_client(
+    config: BpsConfig,
+    handler: Callable[[httpx.Request], httpx.Response],
+    *,
+    username: str = "user",
+    password: str = "password",
+) -> BpsClient:
+    return BpsClient(
+        config,
+        username=username,
+        password=password,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+
+def test_bps_run_contract_never_forces_reservation(bps_config: BpsConfig) -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -82,19 +97,7 @@ def test_bps_run_contract_never_forces_reservation() -> None:
             return httpx.Response(200, json={"runId": "1873"})
         raise AssertionError(f"unexpected request: {request.method} {path}")
 
-    http = httpx.Client(transport=httpx.MockTransport(handler))
-    client = BpsClient(
-        BpsConfig(
-            endpoint="https://bps.example.test",
-            template="template",
-            slot=4,
-            ports=(4, 5),
-            group=10,
-        ),
-        username="user",
-        password="password",
-        client=http,
-    )
+    client = make_bps_client(bps_config, handler)
 
     client.authenticate()
     template = client.find_template("template")
@@ -132,7 +135,7 @@ def test_bps_run_contract_never_forces_reservation() -> None:
     )
 
 
-def test_bps_queries_actual_reservation_owners_and_active_runs() -> None:
+def test_bps_queries_actual_reservation_owners_and_active_runs(bps_config: BpsConfig) -> None:
     topology = {
         "runningTest": [
             {
@@ -161,18 +164,7 @@ def test_bps_queries_actual_reservation_owners_and_active_runs() -> None:
         assert request.url.path == "/bps/api/v2/core/topology"
         return httpx.Response(200, json=topology)
 
-    client = BpsClient(
-        BpsConfig(
-            endpoint="https://bps.example.test",
-            template="template",
-            slot=4,
-            ports=(4, 5),
-            group=10,
-        ),
-        username="agent-user",
-        password="password",
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
+    client = make_bps_client(bps_config, handler, username="agent-user")
 
     status = client.port_reservation_status()
 
@@ -184,19 +176,8 @@ def test_bps_queries_actual_reservation_owners_and_active_runs() -> None:
     assert client.find_active_runs_for_ports() == ("TEST-1922",)
 
 
-def test_bps_total_bandwidth_rejects_invalid_percentage() -> None:
-    client = BpsClient(
-        BpsConfig(
-            endpoint="https://bps.example.test",
-            template="template",
-            slot=4,
-            ports=(4, 5),
-            group=10,
-        ),
-        username="user",
-        password="password",
-        client=httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(200))),
-    )
+def test_bps_total_bandwidth_rejects_invalid_percentage(bps_config: BpsConfig) -> None:
+    client = make_bps_client(bps_config, lambda _: httpx.Response(200))
 
     for invalid in (0.0, -1.0, 100.1):
         with pytest.raises(ValueError, match="between 0 and 100"):
@@ -221,7 +202,10 @@ def test_bps_total_bandwidth_rejects_invalid_percentage() -> None:
         ),
     ],
 )
-def test_bps_template_preflight_rejects_unusable_bandwidth_json(result: str) -> None:
+def test_bps_template_preflight_rejects_unusable_bandwidth_json(
+    result: str,
+    bps_config: BpsConfig,
+) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/testmodel/operations/search"):
             return httpx.Response(200, json=[{"name": "template"}])
@@ -229,18 +213,7 @@ def test_bps_template_preflight_rejects_unusable_bandwidth_json(result: str) -> 
             return httpx.Response(200, json={"result": result})
         raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
 
-    client = BpsClient(
-        BpsConfig(
-            endpoint="https://bps.example.test",
-            template="template",
-            slot=4,
-            ports=(4, 5),
-            group=10,
-        ),
-        username="user",
-        password="password",
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
+    client = make_bps_client(bps_config, handler)
 
     with pytest.raises(RuntimeError):
         client.find_template("template")
@@ -382,7 +355,7 @@ def test_deepseek_contract_sends_configured_reasoning_effort() -> None:
     assert captured["body"]["reasoning_effort"] == "high"
 
 
-def test_deepseek_retries_invalid_json_at_most_three_times() -> None:
+def test_deepseek_retries_invalid_json_at_most_three_times(no_deepseek_sleep: None) -> None:
     calls = 0
 
     def handler(_request: httpx.Request) -> httpx.Response:
@@ -409,7 +382,7 @@ def test_deepseek_wraps_non_retryable_http_status(status_code: int) -> None:
         judge.validate_compatibility()
 
 
-def test_deepseek_wraps_invalid_response_after_retries() -> None:
+def test_deepseek_wraps_invalid_response_after_retries(no_deepseek_sleep: None) -> None:
     calls = 0
 
     def handler(_request: httpx.Request) -> httpx.Response:
@@ -424,7 +397,7 @@ def test_deepseek_wraps_invalid_response_after_retries() -> None:
     assert calls == 2
 
 
-def test_deepseek_wraps_transport_failure_after_retries() -> None:
+def test_deepseek_wraps_transport_failure_after_retries(no_deepseek_sleep: None) -> None:
     calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -489,7 +462,9 @@ def test_deepseek_classifies_bad_requests_by_call_phase(
     assert all(fragment in str(captured.value) for fragment in message_fragments)
 
 
-def test_bps_completion_requires_report_when_run_was_never_observed() -> None:
+def test_bps_completion_requires_report_when_run_was_never_observed(
+    bps_config: BpsConfig,
+) -> None:
     report_checks = 0
     polls = 0
 
@@ -504,21 +479,14 @@ def test_bps_completion_requires_report_when_run_was_never_observed() -> None:
             return httpx.Response(200, json={"sections": ["3.2"]})
         raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
 
-    client = BpsClient(
-        BpsConfig(
-            endpoint="https://bps.example.test",
-            template="template",
-            slot=4,
-            ports=(4, 5),
-            group=10,
-            poll_interval_seconds=0.001,
-            run_timeout_seconds=1,
-            registration_grace_seconds=0,
-        ),
-        username="user",
-        password="password",
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    config = bps_config.model_copy(
+        update={
+            "poll_interval_seconds": 0.001,
+            "run_timeout_seconds": 1,
+            "registration_grace_seconds": 0,
+        }
     )
+    client = make_bps_client(config, handler)
 
     def on_poll() -> None:
         nonlocal polls
@@ -531,7 +499,9 @@ def test_bps_completion_requires_report_when_run_was_never_observed() -> None:
     assert report_checks == polls == 2
 
 
-def test_bps_reconciliation_filters_running_runs_by_template_and_group() -> None:
+def test_bps_reconciliation_filters_running_runs_by_template_and_group(
+    bps_config: BpsConfig,
+) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path.endswith("/topology/runningTest")
         return httpx.Response(
@@ -543,23 +513,14 @@ def test_bps_reconciliation_filters_running_runs_by_template_and_group() -> None
             ],
         )
 
-    client = BpsClient(
-        BpsConfig(
-            endpoint="https://bps.example.test",
-            template="template",
-            slot=4,
-            ports=(4, 5),
-            group=10,
-        ),
-        username="user",
-        password="password",
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
+    client = make_bps_client(bps_config, handler)
 
     assert client.find_running_runs(template="template", group=10) == ("11",)
 
 
-def test_bps_temporary_disappearance_does_not_complete_without_ready_report() -> None:
+def test_bps_temporary_disappearance_does_not_complete_without_ready_report(
+    bps_config: BpsConfig,
+) -> None:
     running_responses: list[list[dict[str, Any]]] = [
         [{"id": "TEST-1873", "completed": False}],
         [],
@@ -577,21 +538,14 @@ def test_bps_temporary_disappearance_does_not_complete_without_ready_report() ->
             return httpx.Response(503, json={"message": "not ready"})
         raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
 
-    client = BpsClient(
-        BpsConfig(
-            endpoint="https://bps.example.test",
-            template="template",
-            slot=4,
-            ports=(4, 5),
-            group=10,
-            poll_interval_seconds=0.001,
-            run_timeout_seconds=1,
-            registration_grace_seconds=0,
-        ),
-        username="user",
-        password="password",
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    config = bps_config.model_copy(
+        update={
+            "poll_interval_seconds": 0.001,
+            "run_timeout_seconds": 1,
+            "registration_grace_seconds": 0,
+        }
     )
+    client = make_bps_client(config, handler)
 
     completion = client.wait_for_completion("1873", lambda: None)
 
@@ -600,7 +554,7 @@ def test_bps_temporary_disappearance_does_not_complete_without_ready_report() ->
     assert running_responses == []
 
 
-def test_bps_seen_run_disappearance_requires_ready_report() -> None:
+def test_bps_seen_run_disappearance_requires_ready_report(bps_config: BpsConfig) -> None:
     running_responses: list[list[dict[str, Any]]] = [
         [{"id": "TEST-1873", "completed": False}],
         [],
@@ -618,21 +572,14 @@ def test_bps_seen_run_disappearance_requires_ready_report() -> None:
             return report_responses.pop(0)
         raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
 
-    client = BpsClient(
-        BpsConfig(
-            endpoint="https://bps.example.test",
-            template="template",
-            slot=4,
-            ports=(4, 5),
-            group=10,
-            poll_interval_seconds=0.001,
-            run_timeout_seconds=1,
-            registration_grace_seconds=0,
-        ),
-        username="user",
-        password="password",
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    config = bps_config.model_copy(
+        update={
+            "poll_interval_seconds": 0.001,
+            "run_timeout_seconds": 1,
+            "registration_grace_seconds": 0,
+        }
     )
+    client = make_bps_client(config, handler)
 
     completion = client.wait_for_completion("1873", lambda: None)
 
@@ -640,7 +587,7 @@ def test_bps_seen_run_disappearance_requires_ready_report() -> None:
     assert report_responses == []
 
 
-def test_bps_port_release_retries_a_transient_bad_request() -> None:
+def test_bps_port_release_retries_a_transient_bad_request(bps_config: BpsConfig) -> None:
     statuses = [400, 204]
     requests: list[httpx.Request] = []
 
@@ -648,20 +595,10 @@ def test_bps_port_release_retries_a_transient_bad_request() -> None:
         requests.append(request)
         return httpx.Response(statuses.pop(0), json={"message": "run cleanup pending"})
 
-    client = BpsClient(
-        BpsConfig(
-            endpoint="https://bps.example.test",
-            template="template",
-            slot=4,
-            ports=(4, 5),
-            group=10,
-            port_release_attempts=2,
-            port_release_retry_backoff_seconds=0,
-        ),
-        username="user",
-        password="password",
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    config = bps_config.model_copy(
+        update={"port_release_attempts": 2, "port_release_retry_backoff_seconds": 0}
     )
+    client = make_bps_client(config, handler)
 
     client.release_ports()
 
@@ -669,25 +606,14 @@ def test_bps_port_release_retries_a_transient_bad_request() -> None:
     assert statuses == []
 
 
-def test_bps_port_release_can_target_only_agent_owned_subset() -> None:
+def test_bps_port_release_can_target_only_agent_owned_subset(bps_config: BpsConfig) -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         return httpx.Response(204)
 
-    client = BpsClient(
-        BpsConfig(
-            endpoint="https://bps.example.test",
-            template="template",
-            slot=4,
-            ports=(4, 5),
-            group=10,
-        ),
-        username="user",
-        password="password",
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
+    client = make_bps_client(bps_config, handler)
 
     client.release_ports((4,))
 
@@ -696,7 +622,9 @@ def test_bps_port_release_can_target_only_agent_owned_subset() -> None:
     }
 
 
-def test_bps_port_release_reports_retry_exhaustion_separately() -> None:
+def test_bps_port_release_reports_retry_exhaustion_separately(
+    bps_config: BpsConfig,
+) -> None:
     calls = 0
 
     def handler(_request: httpx.Request) -> httpx.Response:
@@ -704,20 +632,10 @@ def test_bps_port_release_reports_retry_exhaustion_separately() -> None:
         calls += 1
         return httpx.Response(400, json={"message": "run cleanup pending"})
 
-    client = BpsClient(
-        BpsConfig(
-            endpoint="https://bps.example.test",
-            template="template",
-            slot=4,
-            ports=(4, 5),
-            group=10,
-            port_release_attempts=3,
-            port_release_retry_backoff_seconds=0,
-        ),
-        username="user",
-        password="password",
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    config = bps_config.model_copy(
+        update={"port_release_attempts": 3, "port_release_retry_backoff_seconds": 0}
     )
+    client = make_bps_client(config, handler)
 
     with pytest.raises(PortReleaseError, match=r"after 3 attempts.*HTTP 400"):
         client.release_ports()
@@ -725,7 +643,10 @@ def test_bps_port_release_reports_retry_exhaustion_separately() -> None:
     assert calls == 3
 
 
-def test_bps_export_report_uses_runtime_section_selection(tmp_path: Path) -> None:
+def test_bps_export_report_uses_runtime_section_selection(
+    tmp_path: Path,
+    bps_config: BpsConfig,
+) -> None:
     captured: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -740,18 +661,7 @@ def test_bps_export_report_uses_runtime_section_selection(tmp_path: Path) -> Non
             )
         raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
 
-    client = BpsClient(
-        BpsConfig(
-            endpoint="https://bps.example.test",
-            template="template",
-            slot=4,
-            ports=(4, 5),
-            group=10,
-        ),
-        username="user",
-        password="password",
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
+    client = make_bps_client(bps_config, handler)
 
     destination = client.export_report("1873", tmp_path / "report.csv", ("3.2", "7.19"))
 
@@ -760,7 +670,10 @@ def test_bps_export_report_uses_runtime_section_selection(tmp_path: Path) -> Non
     assert captured["body"]["includeSubsections"] is False
 
 
-def test_bps_exports_complete_pdf_with_pdf_limits(tmp_path: Path) -> None:
+def test_bps_exports_complete_pdf_with_pdf_limits(
+    tmp_path: Path,
+    bps_config: BpsConfig,
+) -> None:
     captured: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -775,20 +688,10 @@ def test_bps_exports_complete_pdf_with_pdf_limits(tmp_path: Path) -> None:
             )
         raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
 
-    client = BpsClient(
-        BpsConfig(
-            endpoint="https://bps.example.test",
-            template="template",
-            slot=4,
-            ports=(4, 5),
-            group=10,
-            pdf_report_timeout_seconds=900,
-            max_pdf_report_bytes=1024 * 1024,
-        ),
-        username="user",
-        password="password",
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    config = bps_config.model_copy(
+        update={"pdf_report_timeout_seconds": 900, "max_pdf_report_bytes": 1024 * 1024}
     )
+    client = make_bps_client(config, handler)
 
     destination = client.export_full_report_pdf(
         "1873",

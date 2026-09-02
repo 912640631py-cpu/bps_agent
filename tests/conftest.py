@@ -20,6 +20,11 @@ def bps_config() -> BpsConfig:
 
 
 @pytest.fixture
+def no_deepseek_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("bps_agent.adapters.deepseek.time.sleep", lambda _seconds: None)
+
+
+@pytest.fixture
 def app_config(tmp_path: Path) -> AppConfig:
     document: dict[str, Any] = {
         "bps": {

@@ -16,18 +16,13 @@ from bps_agent.models.common import (
     VerdictValue,
 )
 from bps_agent.models.config import AssessmentConfig
-from bps_agent.models.dut import (
-    DutEvidence,
-)
+from bps_agent.models.dut import DutEvidence
 from bps_agent.models.performance import PerformanceTimeseriesAnalysis
-
-CHECKPOINT_SCHEMA_VERSION = "1"
 
 
 class VerdictDocument(BaseModel):
     model_config = ConfigDict(extra="allow")
     verdict: VerdictValue
-    schema_version: str = "dev-1"
 
 
 class EvidenceBundle(StrictModel):

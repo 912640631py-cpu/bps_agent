@@ -57,9 +57,9 @@ def sample_snapshot() -> BackendDutSnapshot:
     return BackendDutSnapshot.model_validate(sample_snapshot_document())
 
 
-def test_backend_snapshot_ignores_device_version_additions() -> None:
+def test_backend_snapshot_ignores_unknown_device_fields() -> None:
     document = sample_snapshot_document()
-    document["device_version_field"] = {"future": True}
+    document["device_extra_field"] = {"future": True}
     document["cpu"]["latest"]["new_counter"] = 99
     document["traffic"]["T1/1"]["packet_rate"] = 123
 
@@ -67,7 +67,7 @@ def test_backend_snapshot_ignores_device_version_additions() -> None:
 
     assert snapshot.cpu.latest is not None
     assert snapshot.cpu.latest.mgt == 11
-    assert "device_version_field" not in snapshot.model_dump()
+    assert "device_extra_field" not in snapshot.model_dump()
     assert "new_counter" not in snapshot.cpu.latest.model_dump()
     assert snapshot.traffic["T1/1"] is not None
     assert "packet_rate" not in snapshot.traffic["T1/1"].model_dump()
@@ -470,45 +470,6 @@ def test_completed_attempt_can_restore_from_atomic_metrics_artifact(tmp_path: Pa
 
     assert capture.evidence.successful_sample_count >= 1  # type: ignore[union-attr]
     assert restored_client.connected == 0
-
-
-@pytest.mark.parametrize("artifact_version", [None, "0"])
-def test_restore_rejects_unsupported_metrics_artifact_schema(
-    tmp_path: Path,
-    artifact_version: str | None,
-) -> None:
-    first_client = FakeSnapshotClient([sample_snapshot()])
-    first = DutBackendCollector(
-        backend_config(),
-        username="dutcollector",
-        password="password",
-        client=first_client,  # type: ignore[arg-type]
-    )
-    started_at = "2026-08-27T13:53:30+08:00"
-    finished_at = "2026-08-27T13:54:00+08:00"
-    first.prepare_attempt(tmp_path)
-    first.traffic_started(started_at)
-    assert first_client.ready.wait(1)
-    first.traffic_finished(finished_at)
-    first.finalize_attempt()
-    first.close()
-
-    raw_path = tmp_path / "dut-metrics.json"
-    document = ArtifactStore.read_json(raw_path)
-    if artifact_version is None:
-        document.pop("schema_version")
-    else:
-        document["schema_version"] = artifact_version
-    ArtifactStore.write_json(raw_path, document)
-
-    restored = DutBackendCollector(
-        backend_config(),
-        username="dutcollector",
-        password="password",
-        client=FakeSnapshotClient([sample_snapshot()]),  # type: ignore[arg-type]
-    )
-    with pytest.raises(RuntimeError, match="metrics artifact is invalid"):
-        restored.restore_attempt(tmp_path, started_at, finished_at)
 
 
 def test_ssh_client_does_not_load_or_persist_host_keys(monkeypatch: object) -> None:

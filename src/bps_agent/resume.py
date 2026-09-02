@@ -11,7 +11,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 
 from bps_agent.models.bps import PortReservationState
 from bps_agent.models.config import AppConfig, RunOverrides
-from bps_agent.models.evaluation import CHECKPOINT_SCHEMA_VERSION, AttemptRecord
+from bps_agent.models.evaluation import AttemptRecord
 from bps_agent.ports import BpsPort
 
 LOGGER = logging.getLogger(__name__)
@@ -29,20 +29,22 @@ def load_resume_config(current_config: AppConfig, resume_id: str) -> AppConfig:
         checkpoint_tuple = saver.get_tuple(invocation_config)
     if checkpoint_tuple is None:
         raise ValueError(f"no checkpoint exists for Evaluation Run {resume_id}")
-    channel_values = checkpoint_tuple.checkpoint.get("channel_values")
+    checkpoint = checkpoint_tuple.checkpoint
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"invalid checkpoint for Evaluation Run {resume_id}")
+    channel_values = checkpoint.get("channel_values")
     if not isinstance(channel_values, dict):
-        raise ValueError(f"checkpoint for Evaluation Run {resume_id} has invalid state")
-    version = channel_values.get("schema_version")
-    if version != CHECKPOINT_SCHEMA_VERSION:
-        raise ValueError(f"Unsupported checkpoint version: {version!r}")
+        raise ValueError(f"invalid checkpoint for Evaluation Run {resume_id}")
     checkpoint_config = channel_values.get("config")
     if not isinstance(checkpoint_config, dict):
-        raise ValueError(f"checkpoint for Evaluation Run {resume_id} omitted its configuration")
+        raise ValueError(
+            f"invalid checkpoint for Evaluation Run {resume_id}: missing configuration"
+        )
     try:
         restored = AppConfig.model_validate(checkpoint_config)
     except ValueError as exc:
         raise ValueError(
-            f"checkpoint for Evaluation Run {resume_id} contains an invalid configuration"
+            f"invalid checkpoint for Evaluation Run {resume_id}: invalid configuration"
         ) from exc
     if restored.storage.checkpoint_db.resolve() != checkpoint_db.resolve():
         raise ValueError(

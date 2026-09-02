@@ -64,7 +64,6 @@ class PerformanceDiagnosticEvent(StrictModel):
 
 
 class PerformanceTimeseriesAnalysis(StrictModel):
-    schema_version: str = "1"
     assessment: PerformanceAssessment
     summary: str
     source_tables: tuple[str, ...]

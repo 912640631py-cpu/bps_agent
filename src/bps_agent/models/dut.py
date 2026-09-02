@@ -12,7 +12,7 @@ from bps_agent.models.common import DutCollectionMethod, ObservationPhase, Stric
 
 
 class ExternalDutPayloadModel(BaseModel):
-    """Typed fields consumed by the Agent; device-version additions are ignored."""
+    """Typed fields consumed by the Agent; unknown device fields are ignored."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -258,7 +258,6 @@ class BackendDutTarget(StrictModel):
 
 
 class BackendDutCaptureArtifact(StrictModel):
-    schema_version: Literal["1"]
     target: BackendDutTarget
     interfaces: tuple[str, ...]
     traffic_started_at: str | None = None

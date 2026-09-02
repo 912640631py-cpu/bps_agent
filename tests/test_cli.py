@@ -22,17 +22,12 @@ from bps_agent.models.common import (
     VerdictValue,
 )
 from bps_agent.models.config import AppConfig, RunOverrides
-from bps_agent.models.evaluation import (
-    CHECKPOINT_SCHEMA_VERSION,
-    AttemptRecord,
-    VerdictDocument,
-)
+from bps_agent.models.evaluation import AttemptRecord, VerdictDocument
 from bps_agent.resume import load_resume_config, validate_resume_request
 from bps_agent.runtime import build_judge
 
 
 class _CheckpointConfigState(TypedDict):
-    schema_version: str
     config: dict[str, Any]
 
 
@@ -196,7 +191,7 @@ def test_resume_loads_runtime_configuration_from_checkpoint(app_config: AppConfi
     checkpoint_config = app_config.model_dump(mode="json")
     with SqliteSaver.from_conn_string(str(app_config.storage.checkpoint_db)) as saver:
         builder.compile(checkpointer=saver).invoke(
-            {"schema_version": CHECKPOINT_SCHEMA_VERSION, "config": checkpoint_config},
+            {"config": checkpoint_config},
             config=invocation,
         )
 
@@ -220,29 +215,6 @@ def test_resume_loads_runtime_configuration_from_checkpoint(app_config: AppConfi
     assert restored == app_config
 
 
-@pytest.mark.parametrize("checkpoint_version", [None, "0"])
-def test_resume_rejects_unsupported_checkpoint_schema(
-    app_config: AppConfig,
-    checkpoint_version: str | None,
-) -> None:
-    builder = StateGraph(_CheckpointConfigState)
-    builder.add_node("finish", lambda _state: {})
-    builder.add_edge(START, "finish")
-    builder.add_edge("finish", END)
-    thread_id = f"unsupported-schema-{checkpoint_version}"
-    state: dict[str, Any] = {"config": app_config.model_dump(mode="json")}
-    if checkpoint_version is not None:
-        state["schema_version"] = checkpoint_version
-    with SqliteSaver.from_conn_string(str(app_config.storage.checkpoint_db)) as saver:
-        builder.compile(checkpointer=saver).invoke(
-            state,  # type: ignore[arg-type]
-            config={"configurable": {"thread_id": thread_id}},
-        )
-
-    with pytest.raises(ValueError, match="Unsupported checkpoint version"):
-        load_resume_config(app_config, thread_id)
-
-
 def test_console_verdict_contains_the_complete_parsed_document() -> None:
     attempt = AttemptRecord(
         number=1,
@@ -261,7 +233,6 @@ def test_console_verdict_contains_the_complete_parsed_document() -> None:
     assert selected == {
         "parsed": {
             "verdict": "pass",
-            "schema_version": "dev-1",
             "summary": "test passed",
             "observations": ["BPS criteria passed", "DUT remained healthy"],
             "risks": ["fixture risk"],

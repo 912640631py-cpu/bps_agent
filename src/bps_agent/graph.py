@@ -28,7 +28,6 @@ from bps_agent.models.dut import (
     FrontendDutEvidence,
 )
 from bps_agent.models.evaluation import (
-    CHECKPOINT_SCHEMA_VERSION,
     AttemptRecord,
     EvidenceBundle,
 )
@@ -44,7 +43,6 @@ from bps_agent.runtime import RuntimeResources
 LOGGER = logging.getLogger(__name__)
 
 class EvaluationState(TypedDict):
-    schema_version: str
     evaluation_id: str
     config: dict[str, Any]
     template_metadata: dict[str, Any]
@@ -59,7 +57,6 @@ EvaluationServices = RuntimeResources
 
 def initial_state(evaluation_id: str, config: AppConfig) -> EvaluationState:
     return {
-        "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "evaluation_id": evaluation_id,
         "config": config.model_dump(mode="json"),
         "template_metadata": {},

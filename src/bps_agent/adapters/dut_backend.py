@@ -558,7 +558,6 @@ class DutBackendCollector:
 
     def _result_document(self) -> BackendDutCaptureArtifact:
         return BackendDutCaptureArtifact(
-            schema_version="1",
             target=BackendDutTarget(host=self._backend.host, port=self._backend.port),
             interfaces=self.config.interfaces,
             traffic_started_at=self._traffic_started_at,

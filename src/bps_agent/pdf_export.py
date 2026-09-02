@@ -11,7 +11,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from bps_agent.artifacts import ArtifactStore
 from bps_agent.models.common import utc_now
@@ -39,7 +39,6 @@ _WORKER_SYSTEM_ENVIRONMENT = frozenset(
 class PdfExportJob(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal["1"] = "1"
     status: Literal["pending", "running", "succeeded", "failed"]
     config: BpsConfig
     run_id: str
@@ -75,7 +74,10 @@ class PdfExportJob(BaseModel):
 
 
 def run_pdf_job(job_path: Path) -> int:
-    job = PdfExportJob.model_validate(ArtifactStore.read_json(job_path))
+    try:
+        job = PdfExportJob.model_validate(ArtifactStore.read_json(job_path))
+    except ValidationError as exc:
+        raise RuntimeError("invalid PDF export artifact") from exc
     running = job.model_copy(update={"status": "running", "started_at": utc_now()})
     ArtifactStore.write_json(job_path, running)
     client = None
